@@ -459,6 +459,7 @@ class DevBridgeServer(
                 .put("codexThreadId", pending.codexThreadId ?: JSONObject.NULL)
                 .put("reasoningEffort", pending.reasoningEffort)
                 .put("fastMode", pending.fastMode)
+                .put("continuation", pending.isContinuation)
                 .put("request", pending.request)
         }
         write(writer, response)
@@ -490,6 +491,7 @@ class DevBridgeServer(
                 .put("codexThreadId", claimed.codexThreadId ?: JSONObject.NULL)
                 .put("reasoningEffort", claimed.reasoningEffort)
                 .put("fastMode", claimed.fastMode)
+                .put("continuation", claimed.isContinuation)
                 .put("request", claimed.request)
                 .put("message", "Phone request claimed by the desktop Codex companion."),
         )

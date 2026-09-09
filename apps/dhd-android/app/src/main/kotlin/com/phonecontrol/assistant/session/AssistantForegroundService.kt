@@ -41,6 +41,12 @@ class AssistantForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_TOGGLE_PAUSE -> coordinator.togglePause()
+            ACTION_CONTINUE -> {
+                if (!coordinator.continueStopped()) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelfResult(startId)
+                }
+            }
             ACTION_STOP -> {
                 coordinator.stop("Stopped from the notification.")
                 removeAttentionNotification(this)
@@ -158,6 +164,7 @@ class AssistantForegroundService : Service() {
     companion object {
         const val ACTION_START = "com.phonecontrol.assistant.action.START"
         const val ACTION_TOGGLE_PAUSE = "com.phonecontrol.assistant.action.TOGGLE_PAUSE"
+        const val ACTION_CONTINUE = "com.phonecontrol.assistant.action.CONTINUE"
         const val ACTION_STOP = "com.phonecontrol.assistant.action.STOP"
         const val EXTRA_REQUEST = "com.phonecontrol.assistant.extra.REQUEST"
         const val EXTRA_CONVERSATION_ID = "com.phonecontrol.assistant.extra.CONVERSATION_ID"

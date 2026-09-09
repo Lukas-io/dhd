@@ -196,11 +196,12 @@ export class CodexAppServerClient {
   } | null = null;
   private activeThreadId: string | null = null;
   private activeDhdThreadId: string | null = null;
-  // A thread loaded from an older companion process may carry an obsolete
-  // dynamic-tool contract. Establish one current DHD thread before allowing
-  // thread reuse or resume.
+  // Only trust the loaded-thread cache after this companion has established
+  // the current DHD tool contract. Persisted ids from a previous process must
+  // still go through thread/resume below.
   private hasCurrentDhdThread = false;
   private activeTurnId: string | null = null;
+  private interruptRequested = false;
   private activeTiming: PhaseTimer | null = null;
   private userMessageLogged = false;
   private activeModel = resolveCodexModel();
@@ -272,12 +273,25 @@ export class CodexAppServerClient {
     reasoningEffort: string = resolveCodexEffort(),
     fastMode = false,
     onAgentMessageDelta?: (update: AgentMessageStreamUpdate) => void,
+    onThreadReady?: (threadId: string) => Promise<void>,
+    isContinuation = false,
   ): Promise<TurnResult> {
     const logger = timing ?? new PhaseTimer("codex-turn");
     this.activeTiming = logger;
     this.userMessageLogged = false;
+    this.interruptRequested = false;
     try {
       await this.start(logger);
+      const completion = new Promise<TurnResult>((resolve, reject) => {
+        this.turnCompletion = {
+          resolve,
+          reject,
+          agentMessages: new Map(),
+          nextAgentMessageOrder: 0,
+          phoneToolFailures: [],
+          onAgentMessageDelta,
+        };
+      });
 
       const model = resolveCodexModel();
       const serviceTier = serviceTierForFastMode(fastMode);
@@ -296,25 +310,35 @@ export class CodexAppServerClient {
       ) {
         await this.unsubscribeThread(this.activeDhdThreadId, logger);
       }
-      const mayReuseExistingThread = Boolean(
-        existingThreadId && this.hasCurrentDhdThread,
-      );
       if (
-        mayReuseExistingThread &&
         existingThreadId &&
+        this.hasCurrentDhdThread &&
         this.loadedThreadIds.has(existingThreadId)
       ) {
         threadId = existingThreadId;
         logger.log("thread:reuse_loaded", `threadId=${threadId}`);
-      } else if (mayReuseExistingThread && existingThreadId) {
+      } else if (existingThreadId) {
         logger.log("resume:start", `threadId=${existingThreadId}`);
-        const threadResponse = await this.request("thread/resume", {
-          ...threadParams,
-          threadId: existingThreadId,
-        });
-        threadId = extractThreadId(threadResponse.result) || existingThreadId;
-        logger.log("resume:complete", `threadId=${threadId}`);
-      } else {
+        try {
+          const threadResponse = await this.request("thread/resume", {
+            ...threadParams,
+            threadId: existingThreadId,
+          });
+          threadId = extractThreadId(threadResponse.result) || existingThreadId;
+          logger.log("resume:complete", `threadId=${threadId}`);
+        } catch (error) {
+          // A persisted thread may have been deleted or may belong to an
+          // older App Server contract. Only an explicit resume failure is
+          // allowed to rotate the thread; a new companion process must not
+          // discard a valid stored context merely because it has no local
+          // loaded-thread cache.
+          console.error(
+            `[codex-app-server] could not resume stored thread ${existingThreadId}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          logger.log("resume:failed", `threadId=${existingThreadId}`);
+        }
+      }
+      if (!threadId) {
         if (existingThreadId) {
           logger.log(
             "thread:fresh_contract",
@@ -331,6 +355,8 @@ export class CodexAppServerClient {
       this.activeThreadId = threadId;
       this.activeDhdThreadId = threadId;
       this.loadedThreadIds.add(threadId);
+      this.hasCurrentDhdThread = true;
+      await onThreadReady?.(threadId);
       if (!existingThreadId && threadTitle?.trim()) {
         // Naming is best-effort: older App Server builds may not expose this
         // convenience method, but a failed name update must not lose a turn.
@@ -346,17 +372,10 @@ export class CodexAppServerClient {
         }
       }
 
-      const completion = new Promise<TurnResult>((resolve, reject) => {
-        this.turnCompletion = {
-          resolve,
-          reject,
-          agentMessages: new Map(),
-          nextAgentMessageOrder: 0,
-          phoneToolFailures: [],
-          onAgentMessageDelta,
-        };
-      });
       try {
+        if (this.interruptRequested) {
+          throw new Error("Codex App Server turn was interrupted.");
+        }
         logger.log("turn/start:start", `threadId=${threadId}`);
         const turnStartResponse = await this.request("turn/start", {
           threadId,
@@ -364,7 +383,7 @@ export class CodexAppServerClient {
           effort: normalizeCodexEffort(reasoningEffort),
           serviceTier,
           cwd: this.runtimeCwd,
-          input: [{ type: "text", text: phoneRequest }],
+          input: isContinuation ? [] : [{ type: "text", text: phoneRequest }],
         });
         // `turn/start` returns the initial turn object. The notification is
         // also tracked below, but capturing this response makes user-driven
@@ -376,6 +395,10 @@ export class CodexAppServerClient {
           "turn/start.response",
         );
         logger.log("turn/start:complete", `turnId=${this.activeTurnId ?? "?"}`);
+        if (this.interruptRequested) {
+          await this.interrupt();
+          throw new Error("Codex App Server turn was interrupted.");
+        }
       } catch (error) {
         this.turnCompletion?.reject(
           error instanceof Error ? error : new Error(String(error)),
@@ -387,7 +410,6 @@ export class CodexAppServerClient {
       // completion under App Server/user control; only individual RPC and
       // bridge requests retain bounded transport timeouts.
       const result = await completion;
-      this.hasCurrentDhdThread = true;
       return result;
     } catch (error) {
       // A failed/interrupted turn may still be active inside App Server. Restart
@@ -398,6 +420,7 @@ export class CodexAppServerClient {
     } finally {
       this.activeThreadId = null;
       this.activeTurnId = null;
+      this.interruptRequested = false;
       this.activeTiming = null;
       this.userMessageLogged = false;
       if (this.turnCompletion) {
@@ -440,7 +463,9 @@ export class CodexAppServerClient {
   /** Interrupt the active turn, for example after the phone-side Stop action. */
   async interrupt(): Promise<void> {
     const threadId = this.activeThreadId;
-    if (!threadId || !this.isTurnInFlight) return;
+    if (!this.isTurnInFlight) return;
+    this.interruptRequested = true;
+    if (!threadId) return;
     const turnId = this.activeTurnId;
     await this.request("turn/interrupt", {
       threadId,
@@ -579,7 +604,10 @@ export class CodexAppServerClient {
       const threadId = extractThreadId(message.params);
       if (threadId) {
         this.loadedThreadIds.delete(threadId);
-        if (this.activeDhdThreadId === threadId) this.activeDhdThreadId = null;
+        if (this.activeDhdThreadId === threadId) {
+          this.activeDhdThreadId = null;
+          this.hasCurrentDhdThread = false;
+        }
       }
     } else if (message.method === "thread/status/changed") {
       const params = extractRecord(message.params);
@@ -588,8 +616,10 @@ export class CodexAppServerClient {
         const threadId = extractThreadId(message.params);
         if (threadId) {
           this.loadedThreadIds.delete(threadId);
-          if (this.activeDhdThreadId === threadId)
+          if (this.activeDhdThreadId === threadId) {
             this.activeDhdThreadId = null;
+            this.hasCurrentDhdThread = false;
+          }
         }
       }
     }
@@ -717,7 +747,10 @@ export class CodexAppServerClient {
     timing: PhaseTimer,
   ): Promise<void> {
     if (!this.loadedThreadIds.has(threadId)) {
-      if (this.activeDhdThreadId === threadId) this.activeDhdThreadId = null;
+      if (this.activeDhdThreadId === threadId) {
+        this.activeDhdThreadId = null;
+        this.hasCurrentDhdThread = false;
+      }
       return;
     }
     timing.log("thread/unsubscribe:start", `threadId=${threadId}`);
@@ -732,7 +765,10 @@ export class CodexAppServerClient {
       );
     } finally {
       this.loadedThreadIds.delete(threadId);
-      if (this.activeDhdThreadId === threadId) this.activeDhdThreadId = null;
+      if (this.activeDhdThreadId === threadId) {
+        this.activeDhdThreadId = null;
+        this.hasCurrentDhdThread = false;
+      }
     }
   }
 
@@ -1613,7 +1649,8 @@ async function processPendingRequest(
   }
 
   const request = typeof claimed.request === "string" ? claimed.request : "";
-  if (!request) {
+  const isContinuation = claimed.continuation === true;
+  if (!request && !isContinuation) {
     console.error(
       "[phone-assistant-companion] claimed request was empty; releasing it",
     );
@@ -1621,7 +1658,9 @@ async function processPendingRequest(
     return;
   }
 
-  console.error(`[phone-assistant-companion] claimed ${sessionId}: ${request}`);
+  console.error(
+    `[phone-assistant-companion] claimed ${sessionId}: ${isContinuation ? "continuation" : request}`,
+  );
   activeCodexTurn = { sessionId, client: codexClient };
   const agentMessageStreamer = new AgentMessageStreamer(
     sessionId,
@@ -1651,6 +1690,26 @@ async function processPendingRequest(
       reasoningEffort,
       fastMode,
       (update) => agentMessageStreamer.push(update),
+      async (threadId) => {
+        // Bind a newly created thread before the first turn can finish. If
+        // the user stops mid-task, the interrupted turn still leaves enough
+        // durable identity for Continue to resume the same Codex context.
+        if (!conversationId || (existingThreadId && threadId === existingThreadId)) {
+          return;
+        }
+        const bound = await requestBridge({
+          type: "bind_codex_thread",
+          requestId: randomUUID(),
+          conversationId,
+          codexThreadId: threadId,
+        });
+        if (bound.ok !== true) {
+          throw new Error(
+            `The phone did not bind Codex thread ${threadId}: ${String(bound.message ?? "unknown error")}`,
+          );
+        }
+      },
+      isContinuation,
     );
     if (result.phoneToolFailures.length > 0) {
       const failedTools = [
@@ -1663,23 +1722,6 @@ async function processPendingRequest(
       console.error(
         `[phone-assistant-companion] ${result.phoneToolFailures.length} phone tool call(s) reported an error; preserving the Codex response and conversation context`,
       );
-    }
-    if (
-      conversationId &&
-      result.threadId &&
-      result.threadId !== existingThreadId
-    ) {
-      const bound = await requestBridge({
-        type: "bind_codex_thread",
-        requestId: randomUUID(),
-        conversationId,
-        codexThreadId: result.threadId,
-      });
-      if (bound.ok !== true) {
-        throw new Error(
-          `The phone did not bind Codex thread ${result.threadId}: ${String(bound.message ?? "unknown error")}`,
-        );
-      }
     }
     console.error(
       `[phone-assistant-companion] Codex turn reached terminal status; closing phone session` +

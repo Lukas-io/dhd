@@ -175,14 +175,15 @@ and warms the same connection in the background, so opening DHD can hide a
 desktop companion restart or crash recovery. Sending a request while warmup is
 in progress simply awaits the same idempotent startup operation.
 
-The first request after each companion process starts creates a fresh DHD thread
-even when the phone supplies a stored thread id. This establishes the current
-DHD tool contract instead of reviving a thread created by an older companion
-version. Successful later requests reuse that newly established loaded thread;
-`thread/resume` is used only for a current-contract thread that is not loaded
-in the active connection. At a three-hour DHD inactivity rotation, the
-companion sends `thread/unsubscribe` for the superseded loaded thread before
-starting the replacement, preventing old subscriptions from accumulating.
+When the phone supplies a stored thread id, a new companion process first tries
+`thread/resume` with the current DHD dynamic-tool contract. This preserves the
+Codex context after a worker restart or a user Stop. If the remote thread
+explicitly cannot be resumed, the companion starts a replacement thread and
+persists its id before `turn/start` so a later Stop can still be continued.
+Successful later requests reuse a loaded thread; at a three-hour DHD
+inactivity rotation, the companion sends `thread/unsubscribe` for the
+superseded loaded thread before starting the replacement, preventing old
+subscriptions from accumulating.
 
 The App Server child starts in a dedicated user runtime directory rather than
 the Phone Control repository: `%USERPROFILE%\\.dhd\\codex-runtime` by default.
@@ -332,16 +333,21 @@ not create a new user-facing conversation or restart the phone session. The
 companion claims queued instructions from the phone, sends `turn/steer` with the
 active `threadId`, `expectedTurnId`, and text input, then acknowledges delivery.
 The steer appears in the local timeline beside the run it modified. Stop remains
-the urgent control: it ends the phone session and the companion propagates a
-`turn/interrupt` to Codex. A tap or swipe already in progress may finish before
-the interrupt is observed, so use Stop when the phone needs immediate attention.
+the urgent control: it ends the current phone session and the companion
+propagates a `turn/interrupt` to Codex. The local conversation and remote thread
+are retained. The Android composer swaps Stop for a **Play** button; Play starts
+a new `turn/start` in that same Codex context with an empty input array, so no
+synthetic user message is added. Typing in the composer swaps Play back to
+**Send**, and that text becomes a normal new turn in the same context. A tap or
+swipe already in progress may finish before the
+interrupt is observed, so use Stop when the phone needs immediate attention.
 
 DHD presents one assistant timeline rather than user-facing chat threads. The
 phone stores requests and tool activity locally and only renders the most recent
 24 hours by default. The companion reuses the stored Codex thread for requests
 within three hours of the last local activity. At or after three hours idle,
 the phone removes that stored remote thread id before handoff, so the next
-request starts a new Codex App Server thread without deleting the local history.
+request starts a new Codex App Server thread and clears the old local history.
 
 This route uses the Codex CLI/App Server's ChatGPT-managed login stored in the
 DHD Codex home and the user's subscription. It does not copy cookies, call
