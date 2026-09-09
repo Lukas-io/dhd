@@ -13,6 +13,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -56,9 +57,14 @@ class DhdAdbController(context: Context) {
     private val mdns = DhdAdbMdns(appContext)
     private val commandMutex = Mutex()
     private val maintenanceBootstrap = DhdMaintenanceBootstrap(appContext, preferences)
+    private val maintenanceRecoveryPolicy = DhdMaintenanceRecoveryPolicy()
     private val key by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { DhdAdbKey.from(appContext) }
     private val _status = MutableStateFlow(DeveloperModeStatus())
     private val started = AtomicBoolean(false)
+    private val maintenanceProbeGate = AtomicBoolean(false)
+    private val maintenanceRecoveryGate = AtomicBoolean(false)
+    private val maintenanceRetryGate = AtomicBoolean(false)
+    private val connectDiscoveryGate = AtomicBoolean(false)
     private var discoveryTimeoutJob: Job? = null
     private var pairingJob: Job? = null
     private var maintenanceProbeJob: Job? = null
@@ -102,6 +108,11 @@ class DhdAdbController(context: Context) {
         maintenanceRetryJob?.cancel()
         maintenanceRetryJob = null
         maintenanceRetryAttempt = 0
+        maintenanceProbeGate.set(false)
+        maintenanceRecoveryGate.set(false)
+        maintenanceRetryGate.set(false)
+        connectDiscoveryGate.set(false)
+        maintenanceRecoveryPolicy.reset()
         mdns.stop()
         endpoint = null
         pairingEndpoint = null
@@ -189,6 +200,11 @@ class DhdAdbController(context: Context) {
         maintenanceRetryJob?.cancel()
         maintenanceRetryJob = null
         maintenanceRetryAttempt = 0
+        maintenanceProbeGate.set(false)
+        maintenanceRecoveryGate.set(false)
+        maintenanceRetryGate.set(false)
+        connectDiscoveryGate.set(false)
+        maintenanceRecoveryPolicy.reset()
         mdns.stop()
         endpoint = null
         pairingEndpoint = null
@@ -205,6 +221,7 @@ class DhdAdbController(context: Context) {
     internal fun cancelPairing() {
         discoveryTimeoutJob?.cancel()
         pairingJob?.cancel()
+        connectDiscoveryGate.set(false)
         mdns.stop()
         endpoint = null
         pairingEndpoint = null
@@ -290,14 +307,23 @@ class DhdAdbController(context: Context) {
 
     private fun beginMaintenanceProbe() {
         if (!started.get() || Build.VERSION.SDK_INT < Build.VERSION_CODES.R || !isPaired()) return
-        maintenanceProbeJob?.cancel()
+        if (!maintenanceProbeGate.compareAndSet(false, true)) return
         maintenanceProbeJob = scope.launch {
-            val check = maintenanceBootstrap.client().checkCompatibility()
-            Log.i(TAG, "Maintenance probe compatible=${check.compatible} endpointKnown=${endpoint != null}: ${check.detail}")
-            if (check.compatible) {
-                publishReady()
-            } else {
-                scheduleMaintenanceRecovery()
+            try {
+                val check = commandMutex.withLock {
+                    maintenanceBootstrap.client().checkCompatibility()
+                }
+                if (!currentCoroutineContext().isActive) return@launch
+                Log.i(TAG, "Maintenance probe compatible=${check.compatible} endpointKnown=${endpoint != null}: ${check.detail}")
+                if (check.compatible) {
+                    maintenanceRecoveryPolicy.recordHealthy()
+                    publishReady()
+                } else {
+                    handleMaintenanceUnavailable("DHD's maintenance service is unavailable (${check.detail}).")
+                }
+            } finally {
+                maintenanceProbeGate.set(false)
+                maintenanceProbeJob = null
             }
         }
     }
@@ -307,7 +333,10 @@ class DhdAdbController(context: Context) {
         maintenanceMonitorJob = scope.launch {
             while (isActive && started.get()) {
                 delay(MAINTENANCE_HEALTH_INTERVAL_MS)
-                val check = maintenanceBootstrap.client().checkCompatibility()
+                val check = commandMutex.withLock {
+                    maintenanceBootstrap.client().checkCompatibility()
+                }
+                if (!currentCoroutineContext().isActive) return@launch
                 if (!check.compatible) {
                     handleMaintenanceUnavailable("DHD's maintenance service stopped (${check.detail}).")
                     return@launch
@@ -321,6 +350,8 @@ class DhdAdbController(context: Context) {
         maintenanceRetryJob?.cancel()
         maintenanceRetryJob = null
         maintenanceRetryAttempt = 0
+        maintenanceRetryGate.set(false)
+        maintenanceRecoveryPolicy.recordHealthy()
         publish(
             DeveloperConnectionState.READY,
             paired = true,
@@ -332,6 +363,16 @@ class DhdAdbController(context: Context) {
     private fun handleMaintenanceUnavailable(detail: String) {
         if (!started.get() || !isPaired()) return
         maintenanceMonitorJob?.cancel()
+        if (!maintenanceRecoveryPolicy.recordUnavailable()) {
+            Log.w(TAG, "Maintenance unavailable once; deferring ADB bootstrap and scheduling a local re-check: $detail")
+            publish(
+                DeveloperConnectionState.CONNECTING,
+                paired = true,
+                message = "DHD maintenance check failed once. Rechecking locally before restarting it; pairing is saved.",
+            )
+            scheduleMaintenanceRetry()
+            return
+        }
         Log.w(TAG, "Maintenance unavailable endpointKnown=${endpoint != null}: $detail")
         publish(
             DeveloperConnectionState.CONNECTING,
@@ -342,34 +383,45 @@ class DhdAdbController(context: Context) {
     }
 
     private fun scheduleMaintenanceRecovery() {
-        if (!started.get() || !isPaired() || maintenanceRecoveryJob?.isActive == true) return
+        if (!started.get() || !isPaired()) return
+        if (discoveryTimeoutJob?.isActive == true || !maintenanceRecoveryGate.compareAndSet(false, true)) return
         Log.i(TAG, "Starting maintenance recovery endpointKnown=${endpoint != null}")
         publish(
             DeveloperConnectionState.CONNECTING,
             paired = true,
-            message = "Restarting DHD's maintenance service…",
-        )
-        maintenanceRecoveryJob = scope.launch {
-            val recovered = commandMutex.withLock {
-                val currentEndpoint = endpoint ?: return@withLock false
-                try {
-                    bootstrapMaintenance(currentEndpoint)
-                    true
-                } catch (error: CancellationException) {
-                    throw error
-                } catch (error: Throwable) {
-                    Log.w(TAG, "Maintenance service recovery failed", error)
-                    false
-                }
-            }
-            if (!started.get()) return@launch
-            if (recovered) {
-                Log.i(TAG, "Maintenance recovery succeeded using the known ADB endpoint.")
-                publishReady()
+            message = if (endpoint != null) {
+                "Checking DHD's local maintenance service before restarting it…"
             } else {
-                Log.w(TAG, "Known-endpoint maintenance recovery failed; starting ADB service discovery.")
-                endpoint = null
-                beginConnectDiscovery()
+                "Waiting for Wi-Fi/ADB to reconnect before checking DHD's maintenance service…"
+            },
+        )
+        maintenanceRecoveryPolicy.reset()
+        maintenanceRecoveryJob = scope.launch {
+            try {
+                val recovered = commandMutex.withLock {
+                    val currentEndpoint = endpoint ?: return@withLock false
+                    try {
+                        bootstrapMaintenance(currentEndpoint)
+                        true
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Throwable) {
+                        Log.w(TAG, "Maintenance service recovery failed", error)
+                        false
+                    }
+                }
+                if (!currentCoroutineContext().isActive || !started.get()) return@launch
+                if (recovered) {
+                    Log.i(TAG, "Maintenance recovery succeeded using the known ADB endpoint.")
+                    publishReady()
+                } else {
+                    Log.w(TAG, "Known-endpoint maintenance recovery failed; starting ADB service discovery.")
+                    endpoint = null
+                    beginConnectDiscovery()
+                }
+            } finally {
+                maintenanceRecoveryGate.set(false)
+                maintenanceRecoveryJob = null
             }
         }
     }
@@ -387,6 +439,7 @@ class DhdAdbController(context: Context) {
 
     private fun beginConnectDiscovery() {
         if (!started.get() || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        if (!connectDiscoveryGate.compareAndSet(false, true)) return
         discoveryTimeoutJob?.cancel()
         pairingJob?.cancel()
         pairingEndpoint = null
@@ -396,7 +449,7 @@ class DhdAdbController(context: Context) {
         publish(
             DeveloperConnectionState.CONNECTING,
             paired = isPaired(),
-            message = "Waiting for Wireless Debugging…",
+            message = "Waiting for Wi-Fi and Wireless Debugging's ADB service…",
         )
 
         val completed = AtomicBoolean(false)
@@ -404,11 +457,12 @@ class DhdAdbController(context: Context) {
             delay(CONNECT_DISCOVERY_TIMEOUT_MS)
             if (completed.compareAndSet(false, true)) {
                 mdns.stop()
-                Log.w(TAG, "ADB connect-service discovery timed out; Wireless Debugging may be off or not advertising yet.")
+                connectDiscoveryGate.set(false)
+                Log.w(TAG, "ADB connect-service discovery timed out; Wi-Fi or Wireless Debugging may be unavailable temporarily.")
                 publish(
-                    DeveloperConnectionState.WIRELESS_DEBUGGING_OFF,
+                    DeveloperConnectionState.CONNECTING,
                     paired = isPaired(),
-                    message = WIRELESS_DEBUGGING_MESSAGE,
+                    message = "Waiting for Wi-Fi/Wireless Debugging's ADB service; DHD will keep retrying without restarting a healthy daemon.",
                 )
                 scheduleMaintenanceRetry()
             }
@@ -430,6 +484,7 @@ class DhdAdbController(context: Context) {
                 if (completed.compareAndSet(false, true)) {
                     discoveryTimeoutJob?.cancel()
                     mdns.stop()
+                    connectDiscoveryGate.set(false)
                     Log.w(TAG, "ADB connect-service discovery failed: ${rootMessage(error)}")
                     publish(
                         DeveloperConnectionState.ERROR,
@@ -443,42 +498,46 @@ class DhdAdbController(context: Context) {
     }
 
     private suspend fun verifyConnection(discovered: DhdAdbEndpoint) = commandMutex.withLock {
-        if (endpoint != discovered) return@withLock
-        publish(
-            DeveloperConnectionState.CONNECTING,
-            paired = isPaired(),
-            message = "Connecting to DHD's local ADB service…",
-        )
-        var adbConnected = false
         try {
-            DhdAdbClient(discovered.host, discovered.port, key).use { adb ->
-                adb.connect()
-                adbConnected = true
-                maintenanceBootstrap.ensureStarted(adb)
+            if (endpoint != discovered) return@withLock
+            publish(
+                DeveloperConnectionState.CONNECTING,
+                paired = isPaired(),
+                message = "Connecting to DHD's local ADB service…",
+            )
+            var adbConnected = false
+            try {
+                DhdAdbClient(discovered.host, discovered.port, key).use { adb ->
+                    adb.connect()
+                    adbConnected = true
+                    maintenanceBootstrap.ensureStarted(adb)
+                }
+                Log.i(TAG, "ADB connection and maintenance bootstrap succeeded on local port ${discovered.port}.")
+                publishReady()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Log.w(TAG, "ADB/maintenance verification failed adbConnected=$adbConnected: ${rootMessage(error)}", error)
+                if (adbConnected) {
+                    publish(
+                        DeveloperConnectionState.CONNECTING,
+                        paired = true,
+                        message = "ADB is reachable, but DHD's maintenance service could not start. Retrying; pairing is still saved.",
+                    )
+                    scheduleMaintenanceRetry()
+                } else {
+                    mdns.stop()
+                    endpoint = null
+                    preferences.edit().putBoolean(KEY_PAIRED, false).apply()
+                    publish(
+                        DeveloperConnectionState.PAIRING_REQUIRED,
+                        paired = false,
+                        message = "DHD is not authorized by Wireless Debugging. Pair DHD once, then it will reconnect automatically.",
+                    )
+                }
             }
-            Log.i(TAG, "ADB connection and maintenance bootstrap succeeded on local port ${discovered.port}.")
-            publishReady()
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: Throwable) {
-            Log.w(TAG, "ADB/maintenance verification failed adbConnected=$adbConnected: ${rootMessage(error)}", error)
-            if (adbConnected) {
-                publish(
-                    DeveloperConnectionState.CONNECTING,
-                    paired = true,
-                    message = "ADB is reachable, but DHD's maintenance service could not start. Retrying; pairing is still saved.",
-                )
-                scheduleMaintenanceRetry()
-            } else {
-                mdns.stop()
-                endpoint = null
-                preferences.edit().putBoolean(KEY_PAIRED, false).apply()
-                publish(
-                    DeveloperConnectionState.PAIRING_REQUIRED,
-                    paired = false,
-                    message = "DHD is not authorized by Wireless Debugging. Pair DHD once, then it will reconnect automatically.",
-                )
-            }
+        } finally {
+            connectDiscoveryGate.set(false)
         }
     }
 
@@ -615,7 +674,7 @@ class DhdAdbController(context: Context) {
      * attempt and required Activity.onStart() to call refresh() again.
      */
     private fun scheduleMaintenanceRetry() {
-        if (!started.get() || !isPaired() || maintenanceRetryJob?.isActive == true) return
+        if (!started.get() || !isPaired() || !maintenanceRetryGate.compareAndSet(false, true)) return
         val delayMs = MAINTENANCE_RETRY_DELAYS_MS[
             maintenanceRetryAttempt.coerceAtMost(MAINTENANCE_RETRY_DELAYS_MS.lastIndex)
         ]
@@ -623,11 +682,15 @@ class DhdAdbController(context: Context) {
             .coerceAtMost(MAINTENANCE_RETRY_DELAYS_MS.lastIndex)
         Log.i(TAG, "Scheduling maintenance retry in ${delayMs}ms (attempt=$maintenanceRetryAttempt).")
         maintenanceRetryJob = scope.launch {
-            delay(delayMs)
-            maintenanceRetryJob = null
-            if (!started.get() || !isPaired()) return@launch
-            if (_status.value.state != DeveloperConnectionState.READY) {
-                beginMaintenanceProbe()
+            try {
+                delay(delayMs)
+                if (!currentCoroutineContext().isActive || !started.get() || !isPaired()) return@launch
+                if (_status.value.state != DeveloperConnectionState.READY) {
+                    beginMaintenanceProbe()
+                }
+            } finally {
+                maintenanceRetryGate.set(false)
+                maintenanceRetryJob = null
             }
         }
     }
@@ -658,8 +721,6 @@ class DhdAdbController(context: Context) {
         const val PAIRING_DISCOVERY_TIMEOUT_MS = 30_000L
         const val MAINTENANCE_HEALTH_INTERVAL_MS = 15_000L
         val MAINTENANCE_RETRY_DELAYS_MS = longArrayOf(5_000L, 15_000L, 30_000L)
-        const val WIRELESS_DEBUGGING_MESSAGE =
-            "DHD could not find Wireless debugging's ADB service. If it is off, turn it on; DHD will keep retrying. Pairing is already saved."
         const val PAIRING_SEARCHING_MESSAGE =
             "Open Wireless debugging → Pair device with pairing code. DHD is listening for the pairing service."
         const val PAIRING_SERVICE_FOUND_MESSAGE =
