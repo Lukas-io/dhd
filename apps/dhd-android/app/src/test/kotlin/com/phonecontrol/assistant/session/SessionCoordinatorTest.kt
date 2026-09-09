@@ -46,6 +46,33 @@ class SessionCoordinatorTest {
     }
 
     @Test
+    fun `stopped run can continue in the same conversation with its settings`() {
+        val coordinator = coordinator()
+
+        assertTrue(
+            coordinator.start(
+                request = "Find a restaurant",
+                conversationId = "dhd-assistant",
+                reasoningEffort = ReasoningEffort.EXTRA_HIGH.codexValue,
+                fastMode = true,
+            ),
+        )
+        assertTrue(coordinator.stop("Stopped by the user."))
+        val stopped = coordinator.state.value as SessionState.Stopped
+        assertTrue(coordinator.continueStopped())
+
+        val continued = coordinator.state.value as SessionState.Running
+        assertEquals("dhd-assistant", continued.conversationId)
+        assertEquals("Find a restaurant", continued.request)
+        assertEquals(ReasoningEffort.EXTRA_HIGH.codexValue, continued.reasoningEffort)
+        assertTrue(continued.fastMode)
+        assertTrue(continued.isContinuation)
+        assertEquals(stopped.workedDurationMs, continued.elapsedBeforeStartMs)
+        assertTrue(coordinator.pendingRequest()?.isContinuation == true)
+        assertEquals("Find a restaurant", coordinator.pendingRequest()?.request)
+    }
+
+    @Test
     fun `executes action and updates timeline`() = runTest {
         val coordinator = coordinator()
         coordinator.start("Buy dinner")

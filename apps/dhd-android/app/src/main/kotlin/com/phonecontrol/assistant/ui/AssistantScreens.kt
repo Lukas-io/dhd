@@ -168,6 +168,7 @@ fun AssistantScreen(
     fastMode: Boolean,
     onSetFastMode: (Boolean) -> Unit,
     onStopSession: () -> Unit,
+    onContinueSession: () -> Unit = {},
     onAcknowledgeAttention: () -> Boolean,
     onSteerRequest: (String) -> Boolean,
     onOpenSettings: () -> Unit,
@@ -227,9 +228,18 @@ fun AssistantScreen(
         steerDraftFastMode = null
     }
     val recentCutoff = System.currentTimeMillis() - RECENT_HISTORY_WINDOW_MS
+    val continuationRunId = state.continuationSessionIdOrNullForUi()
+    val activeTaskRunIds = if (active && activeSessionId != null) {
+        groupTimeline(timeline, continuationRunId)
+            .firstOrNull { activeSessionId in it.runIds }
+            ?.runIds
+            ?: setOf(activeSessionId)
+    } else {
+        emptySet()
+    }
     val recentTimeline = timeline.filter { item ->
         item.timestampEpochMs >= recentCutoff ||
-            (active && item.belongsTo(state.sessionIdOrNullForUi()))
+            (active && item.belongsTo(activeTaskRunIds))
     }
 
     Scaffold(
@@ -456,6 +466,8 @@ fun AssistantScreen(
                                 }
                             },
                             onStop = onStopSession,
+                            canContinue = state is SessionState.Stopped,
+                            onContinue = onContinueSession,
                         )
                     }
                 }
@@ -587,8 +599,9 @@ private fun PromptSuggestionChip(
     }
 }
 
-private data class TaskGroup(
+internal data class TaskGroup(
     val id: String,
+    val runIds: Set<String>,
     val userMessage: TimelineItem.Message?,
     val steerMessages: List<TimelineItem.Message>,
     val activities: List<TimelineItem.Activity>,
@@ -597,6 +610,7 @@ private data class TaskGroup(
 )
 
 private class TaskGroupBuilder(val id: String) {
+    val runIds = linkedSetOf<String>()
     var userMessage: TimelineItem.Message? = null
     val steerMessages = mutableListOf<TimelineItem.Message>()
     val activities = mutableListOf<TimelineItem.Activity>()
@@ -609,6 +623,7 @@ private class TaskGroupBuilder(val id: String) {
 
     fun build(): TaskGroup = TaskGroup(
         id = id,
+        runIds = runIds.toSet(),
         userMessage = userMessage,
         steerMessages = steerMessages.toList(),
         activities = activities.toList(),
@@ -617,7 +632,10 @@ private class TaskGroupBuilder(val id: String) {
     )
 }
 
-private fun groupTimeline(timeline: List<TimelineItem>): List<TaskGroup> {
+internal fun groupTimeline(
+    timeline: List<TimelineItem>,
+    continuationRunId: String? = null,
+): List<TaskGroup> {
     val builders = linkedMapOf<String, TaskGroupBuilder>()
     timeline.forEach { item ->
         val key = when (item) {
@@ -625,6 +643,7 @@ private fun groupTimeline(timeline: List<TimelineItem>): List<TaskGroup> {
             is TimelineItem.Activity -> item.runId
         }
         val builder = builders.getOrPut(key) { TaskGroupBuilder(key) }
+        builder.runIds += key
         builder.addTimestamp(item.timestampEpochMs)
         when (item) {
             is TimelineItem.Message -> {
@@ -644,8 +663,48 @@ private fun groupTimeline(timeline: List<TimelineItem>): List<TaskGroup> {
             }
         }
     }
-    return builders.values.map(TaskGroupBuilder::build).sortedBy { it.timestampEpochMs }
+    val rawGroups = builders.values.map(TaskGroupBuilder::build).sortedBy { it.timestampEpochMs }
+    val groups = mutableListOf<TaskGroup>()
+
+    rawGroups.forEach { group ->
+        // A Continue run deliberately has no user-message row. Fold those
+        // hidden runs into the latest visible task so an interrupted task
+        // keeps one activity trace after it resumes. The actual run IDs stay
+        // in the group for active-state and preview matching.
+        if (group.userMessage == null) {
+            val parentIndex = groups.indexOfLast { it.userMessage != null }
+            if (parentIndex >= 0) {
+                groups[parentIndex] = groups[parentIndex].merge(group)
+                return@forEach
+            }
+        }
+        groups += group
+    }
+
+    // Before the resumed turn emits its first event, it has no timeline item
+    // of its own. Associate the active continuation with the latest task now
+    // so the thinking animation is visible immediately after Continue.
+    if (continuationRunId != null && groups.isNotEmpty() &&
+        groups.none { continuationRunId in it.runIds }
+    ) {
+        val parentIndex = groups.indexOfLast { it.userMessage != null }
+            .takeIf { it >= 0 }
+            ?: groups.lastIndex
+        groups[parentIndex] = groups[parentIndex].copy(
+            runIds = groups[parentIndex].runIds + continuationRunId,
+        )
+    }
+
+    return groups
 }
+
+private fun TaskGroup.merge(other: TaskGroup): TaskGroup = copy(
+    runIds = runIds + other.runIds,
+    steerMessages = steerMessages + other.steerMessages,
+    activities = activities + other.activities,
+    assistantMessages = assistantMessages + other.assistantMessages,
+    timestampEpochMs = minOf(timestampEpochMs, other.timestampEpochMs),
+)
 
 private fun TimelineItem.Activity.isDhdActionActivity(): Boolean =
     !status.equals("confirmation", ignoreCase = true)
@@ -670,7 +729,10 @@ private fun ConversationTimeline(
     contentPadding: PaddingValues = PaddingValues(vertical = 12.dp),
 ) {
     val listState = rememberLazyListState()
-    val groups = remember(timeline) { groupTimeline(timeline) }
+    val continuationRunId = state.continuationSessionIdOrNullForUi()
+    val groups = remember(timeline, continuationRunId) {
+        groupTimeline(timeline, continuationRunId)
+    }
 
     // Keep following the live answer until the user starts a real list drag.
     // Content growth can temporarily make the list report that it is no longer
@@ -696,7 +758,9 @@ private fun ConversationTimeline(
         previewState?.let { preview ->
             preview.belongsToRun(state.sessionIdOrNullForUi()) &&
                 !preview.isExpanded(expandedPreviewSessionKey) &&
-                groups.any { preview.belongsToGroup(it.id) }
+                groups.any { group ->
+                    group.runIds.any { runId -> preview.belongsToGroup(runId) }
+                }
         } == true
     LaunchedEffect(
         groups.lastOrNull()?.id,
@@ -739,7 +803,8 @@ private fun ConversationTimeline(
                     onPreviewSurfaceDestroyed = onPreviewSurfaceDestroyed,
                     onOpenPreview = onOpenPreview,
                     expandedPreviewSessionKey = expandedPreviewSessionKey,
-                    active = state.isActive() && state.sessionIdOrNullForUi() == group.id,
+                    active = state.isActive() &&
+                        state.sessionIdOrNullForUi()?.let(group.runIds::contains) == true,
                 )
             }
         }
@@ -767,12 +832,16 @@ private fun TaskGroupCard(
 ) {
     var traceExpanded by rememberSaveable(group.id) { mutableStateOf(false) }
 
-    val durationSeconds = remember(group) {
-        val start = group.userMessage?.timestampEpochMs ?: group.timestampEpochMs
-        val end = group.assistantMessages.lastOrNull()?.timestampEpochMs
-            ?: group.activities.lastOrNull()?.timestampEpochMs
-            ?: start
-        maxOf(1L, (end - start) / 1000L)
+    val terminalDurationMs = state.workedDurationMsOrNullForUi()
+        ?.takeIf { state.sessionIdOrNullForUi()?.let(group.runIds::contains) == true }
+    val durationSeconds = remember(group, terminalDurationMs) {
+        terminalDurationMs?.let { maxOf(1L, it / 1_000L) } ?: run {
+            val start = group.userMessage?.timestampEpochMs ?: group.timestampEpochMs
+            val end = group.assistantMessages.lastOrNull()?.timestampEpochMs
+                ?: group.activities.lastOrNull()?.timestampEpochMs
+                ?: start
+            maxOf(1L, (end - start) / 1000L)
+        }
     }
 
     Column(
@@ -794,7 +863,8 @@ private fun TaskGroupCard(
             }
         }
         val previewVisibleForGroup = taskPreviewState?.let { preview ->
-            preview.belongsToGroup(group.id) && !preview.isExpanded(expandedPreviewSessionKey)
+            group.runIds.any { runId -> preview.belongsToGroup(runId) } &&
+                !preview.isExpanded(expandedPreviewSessionKey)
         } == true
         if (active && previewVisibleForGroup) {
             LiveDisplayPreview(
@@ -813,6 +883,7 @@ private fun TaskGroupCard(
                     currentPurpose = state.currentPurpose,
                     attentionReason = state.attentionReason,
                     startedAtEpochMs = state.startedAtEpochMs,
+                    elapsedBeforeStartMs = state.elapsedBeforeStartMs,
                     developerStatus = developerStatus,
                     companionConnected = companionConnected,
                     onOpenSettings = onOpenSettings,
@@ -871,6 +942,7 @@ private fun RunningStatusIndicator(
     currentPurpose: String,
     attentionReason: String?,
     startedAtEpochMs: Long,
+    elapsedBeforeStartMs: Long,
     developerStatus: DeveloperModeStatus,
     companionConnected: Boolean,
     onOpenSettings: () -> Unit,
@@ -879,7 +951,7 @@ private fun RunningStatusIndicator(
     onStopSession: () -> Unit,
     onAcknowledgeAttention: () -> Boolean,
 ) {
-    val elapsedSeconds = rememberElapsedSeconds(startedAtEpochMs)
+    val elapsedSeconds = rememberElapsedSeconds(startedAtEpochMs, elapsedBeforeStartMs)
     val developerConnectionNeedsAction = developerStatus.state in setOf(
         DeveloperConnectionState.PAIRING_REQUIRED,
         DeveloperConnectionState.PAIRING_SEARCHING,
@@ -923,6 +995,7 @@ private fun RunningStatusIndicator(
 
     ShimmerThinkingIndicator(
         startedAtEpochMs = startedAtEpochMs,
+        elapsedBeforeStartMs = elapsedBeforeStartMs,
         elapsedSeconds = elapsedSeconds,
     )
 }
@@ -930,6 +1003,7 @@ private fun RunningStatusIndicator(
 @Composable
 private fun ShimmerThinkingIndicator(
     startedAtEpochMs: Long,
+    elapsedBeforeStartMs: Long,
     elapsedSeconds: Long,
 ) {
     val colors = LocalAssistantColors.current
@@ -1176,18 +1250,41 @@ private fun RecoveryCard(
 }
 
 @Composable
-private fun rememberElapsedSeconds(startedAtEpochMs: Long): Long {
-    var elapsedSeconds by remember(startedAtEpochMs) {
-        mutableStateOf(((System.currentTimeMillis() - startedAtEpochMs) / 1_000L).coerceAtLeast(0L))
+private fun rememberElapsedSeconds(
+    startedAtEpochMs: Long,
+    elapsedBeforeStartMs: Long = 0L,
+): Long {
+    val normalizedElapsedBeforeStartMs = elapsedBeforeStartMs.coerceAtLeast(0L)
+    var elapsedSeconds by remember(startedAtEpochMs, normalizedElapsedBeforeStartMs) {
+        mutableStateOf(
+            accumulatedElapsedSeconds(
+                startedAtEpochMs,
+                normalizedElapsedBeforeStartMs,
+                System.currentTimeMillis(),
+            ),
+        )
     }
-    LaunchedEffect(startedAtEpochMs) {
+    LaunchedEffect(startedAtEpochMs, normalizedElapsedBeforeStartMs) {
         while (true) {
-            elapsedSeconds = ((System.currentTimeMillis() - startedAtEpochMs) / 1_000L).coerceAtLeast(0L)
+            elapsedSeconds = accumulatedElapsedSeconds(
+                startedAtEpochMs,
+                normalizedElapsedBeforeStartMs,
+                System.currentTimeMillis(),
+            )
             delay(1_000L)
         }
     }
     return elapsedSeconds
 }
+
+internal fun accumulatedElapsedSeconds(
+    startedAtEpochMs: Long,
+    elapsedBeforeStartMs: Long,
+    nowEpochMs: Long,
+): Long = (
+    elapsedBeforeStartMs.coerceAtLeast(0L) +
+        (nowEpochMs - startedAtEpochMs).coerceAtLeast(0L)
+    ) / 1_000L
 
 private fun thinkingDetail(currentPurpose: String, elapsedSeconds: Long): String = when {
     currentPurpose.equals("Preparing request", ignoreCase = true) && elapsedSeconds >= COMPANION_WAIT_CALLOUT_SECONDS ->
@@ -1662,6 +1759,8 @@ private fun RequestComposer(
     onEditTextConsumed: () -> Unit = {},
     onSend: (String) -> Boolean,
     onStop: () -> Unit,
+    canContinue: Boolean,
+    onContinue: () -> Unit,
 ) {
     val colors = LocalAssistantColors.current
     val focusManager = LocalFocusManager.current
@@ -1843,6 +1942,8 @@ private fun RequestComposer(
                         onSend = ::submitRequest,
                         onStop = onStop,
                         canSteer = canSteer,
+                        canContinue = canContinue,
+                        onContinue = onContinue,
                     )
                 }
             }
@@ -1888,6 +1989,8 @@ private fun RequestComposer(
                             onSend = ::submitRequest,
                             onStop = onStop,
                             canSteer = canSteer,
+                            canContinue = canContinue,
+                            onContinue = onContinue,
                         )
                     }
                 }
@@ -2272,9 +2375,11 @@ private fun ActionOrSendButton(
     hasText: Boolean,
     enabled: Boolean,
     canSteer: Boolean,
+    canContinue: Boolean,
     colors: AssistantColorScheme,
     onSend: () -> Unit,
     onStop: () -> Unit,
+    onContinue: () -> Unit,
 ) {
     if (isActive) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -2315,6 +2420,24 @@ private fun ActionOrSendButton(
                         modifier = Modifier.size(16.dp),
                     )
                 }
+            }
+        }
+    } else if (canContinue && !hasText) {
+        Surface(
+            shape = CircleShape,
+            color = if (enabled) colors.accentBlue else colors.sendButtonInactiveBg,
+            modifier = Modifier
+                .size(36.dp)
+                .clip(CircleShape)
+                .clickable(enabled = enabled, onClick = onContinue),
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_play),
+                    contentDescription = "Continue task",
+                    tint = if (enabled) Color.White else colors.sendButtonInactiveIcon,
+                    modifier = Modifier.size(18.dp),
+                )
             }
         }
     } else {
@@ -3986,9 +4109,21 @@ private fun SessionState.sessionIdOrNullForUi(): String? = when (this) {
     is SessionState.Completed -> sessionId
 }
 
-private fun TimelineItem.belongsTo(runId: String?): Boolean = when (this) {
-    is TimelineItem.Message -> this.runId == runId
-    is TimelineItem.Activity -> this.runId == runId
+private fun TimelineItem.belongsTo(runIds: Set<String>): Boolean = when (this) {
+    is TimelineItem.Message -> this.runId?.let(runIds::contains) == true
+    is TimelineItem.Activity -> this.runId in runIds
+}
+
+private fun SessionState.continuationSessionIdOrNullForUi(): String? = when (this) {
+    is SessionState.Running -> sessionId.takeIf { isContinuation }
+    is SessionState.Paused -> sessionId.takeIf { isContinuation }
+    else -> null
+}
+
+private fun SessionState.workedDurationMsOrNullForUi(): Long? = when (this) {
+    is SessionState.Stopped -> workedDurationMs
+    is SessionState.Completed -> workedDurationMs
+    else -> null
 }
 
 private const val RECENT_HISTORY_WINDOW_MS = 24L * 60L * 60L * 1000L

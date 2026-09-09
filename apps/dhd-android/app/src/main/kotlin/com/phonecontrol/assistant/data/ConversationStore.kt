@@ -66,6 +66,8 @@ data class MessageEntity(
 data class AgentRunEntity(
     @PrimaryKey val id: String,
     val conversationId: String,
+    // Continuation runs intentionally have no new user message and use an
+    // empty id so Play can resume the remote thread without adding a bubble.
     val userMessageId: String,
     val status: String,
     val currentPurpose: String,
@@ -393,6 +395,30 @@ class ConversationStore(context: Context) {
         )
         refresh(conversation.id)
         StartedRun(DHD_CONVERSATION_ID, runId, messageId)
+    }
+
+    /** Start a hidden local run for a Codex continuation with no new user message. */
+    fun startContinuationRun(runId: String, requestedConversationId: String? = null): StartedRun? = synchronized(lock) {
+        val now = System.currentTimeMillis()
+        val conversationId = canonicalConversationId(requestedConversationId)
+        val existing = dao.findConversation(conversationId) ?: return@synchronized null
+        val conversation = existing.copy(
+            updatedAtEpochMs = now,
+            deleted = false,
+        )
+        dao.updateConversation(conversation)
+        dao.insertRun(
+            AgentRunEntity(
+                id = runId,
+                conversationId = conversation.id,
+                userMessageId = "",
+                status = RunStatus.RUNNING.name,
+                currentPurpose = "Preparing request",
+                startedAtEpochMs = now,
+            ),
+        )
+        refresh(conversation.id)
+        StartedRun(conversation.id, runId, "")
     }
 
     fun setCurrentPurpose(runId: String, purpose: String) = synchronized(lock) {

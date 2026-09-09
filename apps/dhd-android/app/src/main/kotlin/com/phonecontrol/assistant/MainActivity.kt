@@ -174,6 +174,7 @@ class MainActivity : ComponentActivity() {
                 initialConversationId = initialConversationId,
                 onRunRequest = ::startSession,
                 onStopSession = ::stopSession,
+                onContinueSession = ::continueSession,
                 onAcknowledgeAttention = { app.sessionCoordinator.acknowledgeAttention() },
                 onSteerRequest = ::steerSession,
                 previewState = preview,
@@ -253,6 +254,16 @@ class MainActivity : ComponentActivity() {
         startService(
             Intent(this, AssistantForegroundService::class.java)
                 .setAction(AssistantForegroundService.ACTION_STOP),
+        )
+    }
+
+    private fun continueSession() {
+        val app = application as PhoneControlApplication
+        if (app.sessionCoordinator.state.value !is SessionState.Stopped) return
+        ContextCompat.startForegroundService(
+            this,
+            Intent(this, AssistantForegroundService::class.java)
+                .setAction(AssistantForegroundService.ACTION_CONTINUE),
         )
     }
 
