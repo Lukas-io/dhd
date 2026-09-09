@@ -5,6 +5,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.json.JSONObject
 
 class DevBridgeServerTest {
     @Test
@@ -130,5 +131,33 @@ class DevBridgeServerTest {
         assertEquals(2, apps.length())
         assertTrue(apps.getJSONObject(0).getBoolean("canUse"))
         assertFalse(apps.getJSONObject(1).getBoolean("canUse"))
+    }
+
+    @Test
+    fun `display limit recovery includes displays and actionable reuse instructions`() {
+        val response = addDisplayLimitRecovery(
+            response = JSONObject()
+                .put("type", "completed")
+                .put("ok", false)
+                .put("code", "DISPLAY_LIMIT_REACHED"),
+            packageName = "com.example.shop",
+            displays = listOf(
+                JSONObject()
+                    .put("displayRef", "dsp_0123456789abcd")
+                    .put("status", "completed")
+                    .put("lastPurpose", "Previous task"),
+            ),
+        )
+
+        assertEquals(1, response.getInt("count"))
+        assertEquals(
+            "dsp_0123456789abcd",
+            response.getJSONArray("displays").getJSONObject(0).getString("displayRef"),
+        )
+        assertFalse(response.getJSONArray("displays").getJSONObject(0).has("displayId"))
+        val message = response.getString("message")
+        assertTrue(message.contains("dhd_close_display"))
+        assertTrue(message.contains("exact displayRef"))
+        assertTrue(message.contains("pass its displayRef to dhd_open_app"))
     }
 }

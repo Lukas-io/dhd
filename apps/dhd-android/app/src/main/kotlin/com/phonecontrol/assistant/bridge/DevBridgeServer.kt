@@ -62,6 +62,7 @@ import java.util.UUID
 import java.util.Collections
 import java.util.LinkedHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -947,20 +948,7 @@ class DevBridgeServer(
             )
             return
         }
-        // Joining the registry's reconciliation job here ensures a freshly
-        // started app does not report stale persisted records before native
-        // sessions have been adopted or marked unavailable.
-        backend.activeDisplaySessions()
-        val now = System.currentTimeMillis()
-        val displays = backend.displayRecords.value
-            .asSequence()
-            .filter { record ->
-                record.status != TaskDisplayStatus.ENDED &&
-                    record.status != TaskDisplayStatus.EXPIRED &&
-                    (record.expiresAtEpochMs == null || record.expiresAtEpochMs > now)
-            }
-            .map(::displayJson)
-            .toList()
+        val displays = currentDisplayJson(backend)
         write(
             writer,
             JSONObject()
@@ -1040,7 +1028,47 @@ class DevBridgeServer(
         }
     }
 
-    private fun displayJson(record: com.phonecontrol.assistant.execution.TaskDisplayRecord): JSONObject = JSONObject()
+    /**
+     * Return the same actionable inventory as dhd_list_displays. Keeping this
+     * in one path means a model can use a displayRef from a recovery response
+     * without first making another list call.
+     */
+    private suspend fun currentDisplayJson(
+        backend: TaskDisplayBackend,
+    ): List<JSONObject> {
+        // Joining the registry's reconciliation job here ensures a freshly
+        // started app does not report stale persisted records before native
+        // sessions have been adopted or marked unavailable.
+        backend.activeDisplaySessions()
+        val now = System.currentTimeMillis()
+        return backend.displayRecords.value
+            .asSequence()
+            .filter { record ->
+                record.status != TaskDisplayStatus.ENDED &&
+                    record.status != TaskDisplayStatus.EXPIRED &&
+                    (record.expiresAtEpochMs == null || record.expiresAtEpochMs > now)
+            }
+            .map { record -> displayJson(record, now) }
+            .toList()
+    }
+
+    private suspend fun displayInventoryForRecovery(
+        backend: TaskDisplayBackend,
+    ): List<JSONObject> = try {
+        currentDisplayJson(backend)
+    } catch (error: CancellationException) {
+        throw error
+    } catch (_: Throwable) {
+        // The limit response is still useful when reconciliation is briefly
+        // unavailable; return an empty, well-formed inventory instead of
+        // replacing the actionable allocator error with a registry error.
+        emptyList()
+    }
+
+    private fun displayJson(
+        record: com.phonecontrol.assistant.execution.TaskDisplayRecord,
+        now: Long = System.currentTimeMillis(),
+    ): JSONObject = JSONObject()
         .put("displayRef", record.displayRef)
         .put("appLabel", appLabel(record.packageName))
         .put("packageName", record.packageName)
@@ -1053,7 +1081,7 @@ class DevBridgeServer(
         .put("expiresAtEpochMs", record.expiresAtEpochMs ?: JSONObject.NULL)
         .put(
             "remainingRetentionMs",
-            record.expiresAtEpochMs?.let { expiresAt -> (expiresAt - System.currentTimeMillis()).coerceAtLeast(0L) }
+            record.expiresAtEpochMs?.let { expiresAt -> (expiresAt - now).coerceAtLeast(0L) }
                 ?: JSONObject.NULL,
         )
         .put("lastPurpose", record.lastPurpose)
@@ -1384,19 +1412,33 @@ class DevBridgeServer(
         )
         writeActionResult(writer, requestId, wireActionName(action), result)
         if (!result.isSuccessful()) {
+            val failureCode = result.failureCode()
             val response = JSONObject()
                 .put("type", "completed")
                 .put("requestId", requestId)
                 .put("ok", false)
                 .put("action", wireActionName(action))
                 .put("message", result.failureMessage())
-            result.failureCode()?.let { response.put("code", it) }
+            failureCode?.let { response.put("code", it) }
             addBeforeDebug(
                 response,
                 observation,
                 result.beforeScreenshotOrNull(),
             )
             result.staleDetailsOrNull()?.let { details -> addStaleDiagnostics(response, details) }
+            if (failureCode == "DISPLAY_LIMIT_REACHED") {
+                val backend = taskDisplayBackend
+                val displays = if (backend == null) {
+                    emptyList()
+                } else {
+                    displayInventoryForRecovery(backend)
+                }
+                addDisplayLimitRecovery(
+                    response = response,
+                    packageName = (action as? OpenAppAction)?.packageName,
+                    displays = displays,
+                )
+            }
             write(writer, response)
             return
         }
@@ -2335,6 +2377,31 @@ internal fun buildBrowseAppsResponse(
     )
     .put("count", apps.size)
     .put("truncated", truncated)
+
+/**
+ * Add an actionable display inventory to a session-limit failure. The list
+ * intentionally contains only displayRefs and user-facing metadata so the
+ * agent can close or reuse a display without receiving native display IDs or
+ * coordinator/session keys.
+ */
+internal fun addDisplayLimitRecovery(
+    response: JSONObject,
+    packageName: String?,
+    displays: List<JSONObject>,
+): JSONObject {
+    val target = packageName?.trim()?.takeIf(String::isNotEmpty) ?: "the requested app"
+    return response
+        .put(
+            "message",
+            "The DHD virtual-display session limit was reached while opening $target. " +
+                "The displays array lists the active and retained displays. " +
+                "Close an unused display with dhd_close_display using its exact displayRef " +
+                "(stop its active run first if needed), then retry dhd_open_app. " +
+                "To reuse a retained display instead, pass its displayRef to dhd_open_app.",
+        )
+        .put("displays", JSONArray(displays))
+        .put("count", displays.size)
+}
 
 private fun buildAppResponse(app: InstalledUserApp, canUse: Boolean? = null): JSONObject {
     val response = JSONObject()

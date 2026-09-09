@@ -255,6 +255,34 @@ describe("DHD phone tool contract", () => {
     });
   });
 
+  it("preserves the safe display inventory in a limit recovery result", () => {
+    const result = toMcpResult({
+      type: "completed",
+      ok: false,
+      code: "DISPLAY_LIMIT_REACHED",
+      message: "Close an unused display, then retry.",
+      displays: [{
+        displayRef: "dsp_0123456789abcd",
+        appLabel: "Shopping",
+        packageName: "com.example.shop",
+        status: "completed",
+        lastPurpose: "Previous task",
+      }],
+      count: 1,
+    });
+
+    const modelResult = JSON.parse((result.content[0] as { text: string }).text) as Record<string, any>;
+    expect(modelResult.code).toBe("DISPLAY_LIMIT_REACHED");
+    expect(modelResult.displays).toEqual([{
+      displayRef: "dsp_0123456789abcd",
+      appLabel: "Shopping",
+      packageName: "com.example.shop",
+      status: "completed",
+      lastPurpose: "Previous task",
+    }]);
+    expect(modelResult.displays[0]).not.toHaveProperty("displayId");
+  });
+
   it("fails closed for unsupported or malformed screenshot payloads", () => {
     expect(() => toMcpResult({ screenshotBase64: "not base64" })).toThrow("invalid base64");
     expect(() => toMcpResult({
@@ -307,6 +335,8 @@ describe("DHD phone tool contract", () => {
     expect(record(observeTool.inputSchema).properties).not.toHaveProperty("guardRegions");
     expect(String(openAppTool.description)).toContain("Full Access");
     expect(String(openAppTool.description)).toContain("without requiring a caller-supplied observation ID");
+    expect(String(openAppTool.description)).toContain("close an unused display with dhd_close_display");
+    expect(String(openAppTool.description)).toContain("pass a retained displayRef to reuse it");
     expect(String(observeTool.description)).toContain("not part of the Android app UI");
     expect(String(observeTool.description)).toContain("screenProtection");
     const attentionTool = record(dynamicTools.find((tool) => tool.name === "dhd_request_attention"));
