@@ -14,6 +14,11 @@ internal class DhdMaintenanceClient(
     private val connectTimeoutMs: Int = 500,
     private val readTimeoutMs: Int = 20_000,
 ) {
+    data class CompatibilityCheck(
+        val compatible: Boolean,
+        val detail: String,
+    )
+
     /** Capabilities advertised by the daemon currently bound to this port. */
     data class Capabilities(
         val version: Int,
@@ -57,7 +62,41 @@ internal class DhdMaintenanceClient(
         parseCapabilities(String(result.stdout, Charsets.UTF_8))
     }.getOrNull()
 
-    fun isCompatible(): Boolean = capabilities()?.supportsNativeDisplay == true
+    /**
+     * Keep the reason for a failed health check. The old Boolean-only probe
+     * made a dead daemon, an unavailable socket, and a malformed capability
+     * response indistinguishable in the UI and logcat.
+     */
+    fun checkCompatibility(): CompatibilityCheck {
+        return try {
+            val result = execute(listOf("dhd-capabilities"))
+            if (result.timedOut) {
+                CompatibilityCheck(false, "capability probe timed out")
+            } else if (result.exitCode != 0) {
+                CompatibilityCheck(
+                    false,
+                    "capability probe exited ${result.exitCode}: ${result.stderr.ifBlank { "no stderr" }}",
+                )
+            } else {
+                val raw = String(result.stdout, Charsets.UTF_8)
+                val parsed = parseCapabilities(raw)
+                if (parsed == null) {
+                    CompatibilityCheck(false, "capability response was malformed")
+                } else if (!parsed.supportsNativeDisplay) {
+                    CompatibilityCheck(false, "daemon capabilities are incompatible: ${raw.trim()}")
+                } else {
+                    CompatibilityCheck(true, "compatible daemon ${raw.trim()}")
+                }
+            }
+        } catch (error: Throwable) {
+            CompatibilityCheck(
+                false,
+                "${error::class.java.simpleName}: ${error.message ?: "no message"}",
+            )
+        }
+    }
+
+    fun isCompatible(): Boolean = checkCompatibility().compatible
 
     private fun parseCapabilities(value: String): Capabilities? {
         val tokens = value.trim().split(Regex("\\s+"))
