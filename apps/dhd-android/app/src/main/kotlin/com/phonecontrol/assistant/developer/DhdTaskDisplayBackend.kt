@@ -70,6 +70,8 @@ class DhdTaskDisplayBackend(
     private val cancelledKeys = ConcurrentHashMap.newKeySet<String>()
     private val operationLocks = ConcurrentHashMap<String, Mutex>()
     private val liveHandles = mutableMapOf<String, LiveHandle>()
+    /** Sessions that have rendered at least one frame in this process. */
+    private val lastLivePreviewSessions = mutableSetOf<String>()
     private val previewStateJobs = mutableMapOf<String, Job>()
     private val _activeSession = MutableStateFlow<TaskDisplaySession?>(null)
     private val _previewState = MutableStateFlow<TaskPreviewState>(TaskPreviewState.Detached)
@@ -138,6 +140,7 @@ class DhdTaskDisplayBackend(
                 if (cancelledKeys.contains(sessionKey)) {
                     true
                 } else {
+                    lastLivePreviewSessions.remove(sessionKey)
                     sessions[sessionKey] = bound
                     bindRunKey(sessionKey, sessionKey)
                     _activeSession.value = taskSession
@@ -445,9 +448,19 @@ class DhdTaskDisplayBackend(
                         ?.takeIf { it.taskSession == session }
                         ?: throw TaskDisplayException("The task display session is no longer active.")
                 }
-                stateLock.withLock {
+                val (previousHandle, preserveLiveWhileReconnecting) = stateLock.withLock {
+                    val preserve = lastLivePreviewSessions.contains(session.sessionKey) ||
+                        _previewStates.value[session.sessionKey] is TaskPreviewState.Attached
                     previewStateJobs.remove(session.sessionKey)?.cancel()
-                    liveHandles.remove(session.sessionKey)?.handle?.close()
+                    Pair(liveHandles.remove(session.sessionKey), preserve)
+                }
+                // Closing the app-side decoder only closes its socket. The
+                // daemon must also clear its registered stream client before
+                // the replacement decoder can be accepted.
+                try {
+                    nativeManager.detachLiveSurface(bound.nativeSession)
+                } finally {
+                    previousHandle?.handle?.close()
                 }
                 val handle = nativeManager.attachLiveSurface(bound.nativeSession, surface)
                 stateLock.withLock {
@@ -458,13 +471,32 @@ class DhdTaskDisplayBackend(
                     liveHandles[session.sessionKey] = LiveHandle(surface, handle)
                     publishPreviewStateLocked(
                         session.sessionKey,
-                        TaskPreviewState.Connecting(session),
+                        if (preserveLiveWhileReconnecting) {
+                            TaskPreviewState.Attached(session)
+                        } else {
+                            TaskPreviewState.Connecting(session)
+                        },
                     )
-                    previewStateJobs[session.sessionKey] = observePreviewState(session, handle)
+                    previewStateJobs[session.sessionKey] = observePreviewState(
+                        session = session,
+                        handle = handle,
+                        preserveLiveWhileConnecting = preserveLiveWhileReconnecting,
+                    )
                 }
             }
         } catch (error: Throwable) {
             if (error is CancellationException) throw error
+            if (isNativeDisplaySessionMissing(error)) {
+                val reconciled = runCatching {
+                    reconcileNativeSessionsNow()
+                }.isSuccess
+                if (reconciled) {
+                    val stillBound = stateLock.withLock {
+                        sessions[session.sessionKey]?.taskSession == session
+                    }
+                    if (!stillBound) throw error
+                }
+            }
             val message = error.message ?: error::class.java.simpleName
             publishPreviewState(
                 session.sessionKey,
@@ -545,6 +577,12 @@ class DhdTaskDisplayBackend(
         // to this run so an in-flight action cannot outlive the run that
         // authorized it.
         ownerKeysForRun(sessionKey).forEach(::cancel)
+    }
+
+    /** Reconcile app state after the native maintenance daemon is restarted. */
+    suspend fun reconcileNativeSessionsNow() {
+        reconciliationJob.join()
+        reconcileNativeSessionsWithRetry(force = true)
     }
 
     override suspend fun retain(
@@ -636,6 +674,7 @@ class DhdTaskDisplayBackend(
                     false
                 } else {
                     sessions.remove(sessionKey)
+                    lastLivePreviewSessions.remove(sessionKey)
                     previewStateJobs.remove(sessionKey)?.cancel()
                     liveHandles.remove(sessionKey)?.handle?.close()
                     if (_activeSession.value?.sessionKey == sessionKey) {
@@ -762,11 +801,11 @@ class DhdTaskDisplayBackend(
         }
     }
 
-    private suspend fun reconcileNativeSessionsWithRetry() {
+    private suspend fun reconcileNativeSessionsWithRetry(force: Boolean = false) {
         var lastFailure: Throwable? = null
         repeat(RECONCILIATION_ATTEMPTS) { attempt ->
             try {
-                reconcileNativeSessions()
+                reconcileNativeSessions(force = force)
                 return
             } catch (error: CancellationException) {
                 throw error
@@ -782,14 +821,15 @@ class DhdTaskDisplayBackend(
         )
     }
 
-    private suspend fun reconcileNativeSessions() {
+    private suspend fun reconcileNativeSessions(force: Boolean = false) {
         val persisted = displayRecords.value
         val expectedKeys = persisted.map { it.sessionKey }.toSet()
-        val native = nativeManager.reconcile(expectedKeys)
+        val native = nativeManager.reconcile(expectedKeys, force = force)
         val now = nowEpochMs()
         persisted.forEach { record ->
             val nativeSession = native[record.sessionKey]
             if (nativeSession == null) {
+                removeLocalSession(record.sessionKey, record.taskId)
                 val next = when {
                     record.status == TaskDisplayStatus.EXPIRED -> record
                     record.status == TaskDisplayStatus.ENDED -> record
@@ -800,7 +840,8 @@ class DhdTaskDisplayBackend(
                     )
                     else -> record.copy(
                         status = TaskDisplayStatus.UNAVAILABLE,
-                        error = record.error ?: "The native display was unavailable after app restart.",
+                        error = record.error
+                            ?: "The DHD display session is no longer active. The display service may have restarted.",
                     )
                 }
                 if (next != record) publishRecord(next)
@@ -821,6 +862,7 @@ class DhdTaskDisplayBackend(
                 (record.expiresAtEpochMs != null && record.expiresAtEpochMs <= now)
             val ended = record.status == TaskDisplayStatus.ENDED
             if (!sameIdentity || expired || ended) {
+                removeLocalSession(record.sessionKey, record.taskId)
                 runCatching { nativeManager.close(record.sessionKey) }
                 val next = when {
                     expired -> record.copy(
@@ -869,6 +911,32 @@ class DhdTaskDisplayBackend(
                 .mapNotNull { sessions[it.sessionKey]?.taskSession }
                 .maxByOrNull { session -> candidateRecords.first { it.sessionKey == session.sessionKey }.createdAtEpochMs }
         }
+    }
+
+    private suspend fun removeLocalSession(sessionKey: String, expectedTaskId: String? = null) {
+        var removed = false
+        val staleHandle = stateLock.withLock {
+            val current = sessions[sessionKey]
+            if (current == null ||
+                (expectedTaskId != null && current.taskSession.taskId != expectedTaskId)
+            ) {
+                null
+            } else {
+                removed = true
+                sessions.remove(sessionKey)
+                lastLivePreviewSessions.remove(sessionKey)
+                previewStateJobs.remove(sessionKey)?.cancel()
+                if (_activeSession.value?.sessionKey == sessionKey) {
+                    _activeSession.value = sessions.values.lastOrNull()?.taskSession
+                }
+                if (_previewState.value.sessionKeyOrNull() == sessionKey) {
+                    publishPreviewStateLocked(sessionKey, TaskPreviewState.Detached)
+                }
+                liveHandles.remove(sessionKey)?.handle
+            }
+        }
+        staleHandle?.close()
+        if (removed) unbindOwner(sessionKey)
     }
 
     private fun markReconciliationUnavailable(message: String) {
@@ -939,6 +1007,7 @@ class DhdTaskDisplayBackend(
             cancelledKeys += sessionKey
             stateLock.withLock {
                 sessions.remove(sessionKey)
+                lastLivePreviewSessions.remove(sessionKey)
                 previewStateJobs.remove(sessionKey)?.cancel()
                 liveHandles.remove(sessionKey)?.handle?.close()
                 if (_activeSession.value?.sessionKey == sessionKey) {
@@ -1073,13 +1142,23 @@ class DhdTaskDisplayBackend(
     private fun observePreviewState(
         session: TaskDisplaySession,
         handle: DhdLivePreviewHandle,
+        preserveLiveWhileConnecting: Boolean = false,
     ): Job = scope.launch {
         handle.state.collectLatest { state ->
             stateLock.withLock {
                 if (liveHandles[session.sessionKey]?.handle !== handle) return@withLock
                 publishPreviewStateLocked(session.sessionKey, when (state.phase) {
-                    DhdLivePreviewPhase.CONNECTING -> TaskPreviewState.Connecting(session)
-                    DhdLivePreviewPhase.LIVE -> TaskPreviewState.Attached(session)
+                    DhdLivePreviewPhase.CONNECTING -> {
+                        if (preserveLiveWhileConnecting) {
+                            TaskPreviewState.Attached(session)
+                        } else {
+                            TaskPreviewState.Connecting(session)
+                        }
+                    }
+                    DhdLivePreviewPhase.LIVE -> {
+                        lastLivePreviewSessions += session.sessionKey
+                        TaskPreviewState.Attached(session)
+                    }
                     DhdLivePreviewPhase.ERROR -> TaskPreviewState.Error(
                         sessionKey = session.sessionKey,
                         message = state.message ?: "The live preview decoder failed.",
@@ -1200,4 +1279,18 @@ class DhdTaskDisplayBackend(
             "\\b([A-Za-z][A-Za-z0-9_.$]*)/(\\.?[A-Za-z0-9_.$]+)",
         )
     }
+}
+
+internal fun isNativeDisplaySessionMissing(error: Throwable): Boolean {
+    var current: Throwable? = error
+    while (current != null) {
+        val message = current.message.orEmpty()
+        if (message.contains("DHD display session is not active", ignoreCase = true) ||
+            message.contains("virtual display session is not active", ignoreCase = true)
+        ) {
+            return true
+        }
+        current = current.cause
+    }
+    return false
 }

@@ -311,9 +311,13 @@ class DhdVirtualDisplayManager(
      * unknown session. The stream token is returned only over the authenticated
      * maintenance channel and is held in memory; it is never persisted.
      */
-    suspend fun reconcile(expectedSessionKeys: Set<String>): Map<String, DhdVirtualDisplaySession> {
+    suspend fun reconcile(
+        expectedSessionKeys: Set<String>,
+        force: Boolean = false,
+    ): Map<String, DhdVirtualDisplaySession> {
         val validKeys = expectedSessionKeys.filter { DHD_SESSION_KEY_PATTERN.matches(it) }.toSet()
         return daemonResetMutex.withLock {
+            if (force) daemonResetComplete = false
             if (daemonResetComplete) {
                 return@withLock stateMutex.withLock { sessions.toMap() }
             }

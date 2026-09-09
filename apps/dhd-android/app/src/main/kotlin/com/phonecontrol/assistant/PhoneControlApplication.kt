@@ -17,6 +17,7 @@ import com.phonecontrol.assistant.execution.TaskDisplaySession
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 
 class PhoneControlApplication : Application() {
@@ -94,6 +95,16 @@ class PhoneControlApplication : Application() {
             processRunner,
             conversationStore,
         )
+        previewScope.launch {
+            developerModeController.status.collect { status ->
+                if (status.privilegedApiReady) {
+                    // A restarted shell daemon loses its in-memory display
+                    // sessions. Reconcile before a retained viewer or the
+                    // next task action can use the stale app-side binding.
+                    taskDisplayBackend.reconcileNativeSessionsNow()
+                }
+            }
+        }
         observationProvider = PhoneObservationProvider(this, processRunner, taskDisplayBackend)
         sessionCoordinator = SessionCoordinator(
             enabledPackagesProvider = { appPermissionRepository.enabledPackages() },

@@ -80,9 +80,26 @@ internal fun TaskPointerOverlay(
     var gestureEvent by remember { mutableStateOf<TaskPointerEvent?>(null) }
     var showBadge by remember { mutableStateOf(false) }
     var hasCursor by remember { mutableStateOf(false) }
+    var initialized by remember { mutableStateOf(false) }
+    var lastSeenSequence by remember { mutableStateOf<Long?>(null) }
 
     LaunchedEffect(event?.sequence) {
         val pointer = event
+        if (!initialized) {
+            // A new inline/full-screen surface can be created while the
+            // coordinator still holds the latest event. That event was
+            // already presented by the previous surface; only later
+            // sequences should animate here.
+            initialized = true
+            lastSeenSequence = pointer?.sequence
+            cursorMode = null
+            gestureEvent = null
+            showBadge = false
+            trackAlpha.snapTo(0f)
+            return@LaunchedEffect
+        }
+        if (pointer?.sequence == lastSeenSequence) return@LaunchedEffect
+        lastSeenSequence = pointer?.sequence
         if (pointer == null) {
             cursorMode = null
             gestureEvent = null
