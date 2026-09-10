@@ -154,6 +154,11 @@ class OverlayWindowController(
         setPanelMode(OverlayPanelMode.BUBBLE)
     }
 
+    fun dismissResult() {
+        _resultMessage.value = null
+        setPanelMode(OverlayPanelMode.COMPOSER)
+    }
+
     private fun dismissAfterHorizontalSwipe(direction: OverlaySwipeDirection, swipeEndX: Int) {
         val metrics = appContext.resources.displayMetrics
         val insets = bubbleInsets()
@@ -287,6 +292,7 @@ class OverlayWindowController(
                         onStop = ::stopSession,
                         onContinueInDhd = ::continueInDhd,
                         onCollapse = ::showBubble,
+                        onDismissResult = ::dismissResult,
                         onHorizontalSwipeDismiss = ::dismissAfterHorizontalSwipe,
                         taskPreviewState = taskPreviewState,
                         onTaskPreviewSurfaceAvailable = onTaskPreviewSurfaceAvailable,
@@ -434,6 +440,7 @@ class OverlayWindowController(
     }
 
     private fun submitRequest(request: String) {
+        _resultMessage.value = null
         val prefs = appContext.getSharedPreferences(OverlayPreferences.PREFS_NAME, Context.MODE_PRIVATE)
         val reasoningEffort = ReasoningEffort.fromStorage(
             prefs.getString(OverlayPreferences.KEY_REASONING_EFFORT, ReasoningEffort.default.storageValue),

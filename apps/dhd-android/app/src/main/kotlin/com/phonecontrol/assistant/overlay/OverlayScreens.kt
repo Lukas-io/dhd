@@ -11,10 +11,13 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.*
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
@@ -80,6 +83,7 @@ import com.phonecontrol.assistant.ui.FastModeButton
 import com.phonecontrol.assistant.ui.LiveDisplayPreview
 import com.phonecontrol.assistant.ui.LiveDisplayPreviewState
 import com.phonecontrol.assistant.ui.LocalAssistantColors
+import com.phonecontrol.assistant.ui.MarkdownContent
 import com.phonecontrol.assistant.ui.ReasoningEffortButton
 import com.phonecontrol.assistant.ui.ReasoningEffortTrack
 import kotlinx.coroutines.flow.StateFlow
@@ -449,6 +453,176 @@ fun OverlayGlow(
 }
 
 @Composable
+private fun ClosePillButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    label: String = "Close",
+) {
+    val colors = LocalAssistantColors.current
+    Surface(
+        onClick = onClick,
+        shape = CircleShape,
+        color = colors.composerBackground.copy(
+            alpha = if (colors.isDark) 0.95f else 0.92f,
+        ),
+        border = BorderStroke(
+            0.8.dp,
+            colors.borderColor.copy(alpha = if (colors.isDark) 0.85f else 0.9f),
+        ),
+        shadowElevation = 8.dp,
+        modifier = modifier.semantics { contentDescription = "$label assistant card" },
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+        ) {
+            Text(
+                text = label,
+                color = colors.textPrimary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+            )
+        }
+    }
+}
+
+@Composable
+private fun FloatingResultCard(
+    message: String,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalAssistantColors.current
+    val cardShape = RoundedCornerShape(24.dp)
+
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.End,
+    ) {
+        ClosePillButton(
+            onClick = onDismiss,
+            modifier = Modifier.padding(bottom = 6.dp, end = 4.dp),
+            label = "Close",
+        )
+
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .shadow(20.dp, cardShape, clip = false),
+            shape = cardShape,
+            color = colors.composerBackground.copy(
+                alpha = if (colors.isDark) 0.98f else 0.97f,
+            ),
+            border = BorderStroke(
+                width = 0.8.dp,
+                color = colors.borderColor.copy(alpha = if (colors.isDark) 0.9f else 0.95f),
+            ),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 18.dp, vertical = 12.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 12.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .width(36.dp)
+                            .height(4.dp)
+                            .clip(CircleShape)
+                            .background(colors.textSecondary.copy(alpha = 0.35f)),
+                    )
+                }
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 380.dp)
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    MarkdownContent(
+                        markdown = message,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FloatingVirtualDisplayCard(
+    previewState: TaskPreviewState,
+    onHide: () -> Unit,
+    onContinue: () -> Unit,
+    onSurfaceAvailable: (TaskDisplaySession, AndroidSurface) -> Unit,
+    onSurfaceDestroyed: (TaskDisplaySession, AndroidSurface) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalAssistantColors.current
+    val cardShape = RoundedCornerShape(24.dp)
+
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.End,
+    ) {
+        ClosePillButton(
+            onClick = onHide,
+            modifier = Modifier.padding(bottom = 6.dp, end = 4.dp),
+            label = "Close",
+        )
+
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .shadow(20.dp, cardShape, clip = false),
+            shape = cardShape,
+            color = colors.composerBackground.copy(
+                alpha = if (colors.isDark) 0.98f else 0.97f,
+            ),
+            border = BorderStroke(
+                width = 0.8.dp,
+                color = colors.borderColor.copy(alpha = if (colors.isDark) 0.9f else 0.95f),
+            ),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 12.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .width(36.dp)
+                            .height(4.dp)
+                            .clip(CircleShape)
+                            .background(colors.textSecondary.copy(alpha = 0.35f)),
+                    )
+                }
+
+                OverlayVirtualDisplayPreview(
+                    previewState = previewState,
+                    onHide = onHide,
+                    onContinue = onContinue,
+                    onSurfaceAvailable = onSurfaceAvailable,
+                    onSurfaceDestroyed = onSurfaceDestroyed,
+                )
+            }
+        }
+    }
+}
+
+@Composable
 fun OverlayPanel(
     sessionState: StateFlow<SessionState>,
     toolCalls: StateFlow<List<DhdToolCall>>,
@@ -461,6 +635,7 @@ fun OverlayPanel(
     onStop: () -> Unit,
     onContinueInDhd: () -> Unit,
     onCollapse: () -> Unit,
+    onDismissResult: () -> Unit = {},
     onHorizontalSwipeDismiss: (OverlaySwipeDirection, Int) -> Unit,
     taskPreviewState: StateFlow<TaskPreviewState>,
     onTaskPreviewSurfaceAvailable: (TaskDisplaySession, AndroidSurface) -> Unit,
@@ -549,11 +724,18 @@ fun OverlayPanel(
     val density = LocalDensity.current
     val imeBottom = WindowInsets.ime.getBottom(density)
     val keyboardVisible = imeBottom > with(density) { 96.dp.toPx() }
-    val isCollapsedPill = ((effectiveMode == OverlayPanelMode.COMPOSER && !keyboardVisible) ||
-        effectiveMode == OverlayPanelMode.WORKING ||
-        effectiveMode == OverlayPanelMode.ATTENTION) && !previewVisible
 
-    val panelShape = if (isCollapsedPill) CircleShape else RoundedCornerShape(28.dp)
+    val resultText = result?.takeIf { it.isNotBlank() } ?: terminalMessage(state)
+    val hasFloatingResult = effectiveMode == OverlayPanelMode.RESULT && resultText.isNotBlank()
+    val hasFloatingCard = hasFloatingResult || previewVisible
+    val isCollapsedPill = !hasFloatingCard && !keyboardVisible
+
+    val bottomCapsuleShape = when {
+        effectiveMode == OverlayPanelMode.WORKING || effectiveMode == OverlayPanelMode.ATTENTION -> CircleShape
+        !keyboardVisible -> CircleShape
+        else -> RoundedCornerShape(28.dp)
+    }
+
     val panelDescription = when (effectiveMode) {
         OverlayPanelMode.COMPOSER -> "DHD assistant. Ready for a request."
         OverlayPanelMode.RESULT -> "DHD assistant. Result ready."
@@ -564,8 +746,7 @@ fun OverlayPanel(
 
     val horizontalPadding = when {
         isCollapsedPill -> 36.dp
-        effectiveMode == OverlayPanelMode.COMPOSER -> 14.dp
-        else -> 12.dp
+        else -> 14.dp
     }
     val bottomPadding = when {
         isCollapsedPill -> 10.dp
@@ -630,7 +811,7 @@ fun OverlayPanel(
             .semantics { contentDescription = panelDescription },
         contentAlignment = Alignment.BottomCenter,
     ) {
-        val composerWidthModifier = if (isCollapsedPill) {
+        val containerWidthModifier = if (isCollapsedPill) {
             Modifier
                 .fillMaxWidth()
                 .widthIn(max = 320.dp)
@@ -640,205 +821,177 @@ fun OverlayPanel(
                 .widthIn(max = 520.dp)
         }
 
-        Box(
-            modifier = composerWidthModifier,
-            contentAlignment = Alignment.Center,
+        Column(
+            modifier = containerWidthModifier,
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            if (effectiveMode == OverlayPanelMode.COMPOSER) {
-                val glowOrbitPhase by motionPhase(
-                label = "composer-orbit-glow",
-                duration = 3_400,
-                enabled = true,
-            )
-            val glowBreathPhase by motionPhase(
-                label = "composer-ambient-glow",
-                duration = 4_500,
-                enabled = true,
-            )
-            val breath = 0.88f + 0.12f * sin(glowBreathPhase)
-            val glowBase = if (colors.isDark) Color.White else Color(0xFF1E293B)
-            val glowAccent = if (colors.isDark) Color(0xFF93C5FD) else Color(0xFF3B82F6)
-
-            val chromaticColors = if (state.needsAttention()) {
-                listOf(
-                    colors.warningAmber,
-                    Color(0xFFFBBF24),
-                    colors.warningAmber,
-                    Color(0xFFFBBF24),
-                    colors.warningAmber,
-                    Color(0xFFFBBF24),
-                )
-            } else {
-                listOf(
-                    Color(0xFF10B981), // Emerald Green
-                    Color(0xFF06B6D4), // Cyan
-                    Color(0xFF3B82F6), // Electric Blue
-                    Color(0xFF8B5CF6), // Purple
-                    Color(0xFFEF4444), // Coral Red
-                    Color(0xFFF59E0B), // Amber Gold
+            if (previewVisible) {
+                FloatingVirtualDisplayCard(
+                    previewState = previewState,
+                    onHide = { previewVisible = false },
+                    onContinue = onContinueInDhd,
+                    onSurfaceAvailable = onTaskPreviewSurfaceAvailable,
+                    onSurfaceDestroyed = onTaskPreviewSurfaceDestroyed,
                 )
             }
 
-            val shift = (glowOrbitPhase / (2 * PI.toFloat())) % 1f
-            val stops = List(17) { i ->
-                val frac = i.toFloat() / 16f
-                val sampleFrac = ((frac - shift) % 1f + 1f) % 1f
-                val scaled = sampleFrac * 6f
-                val idx = scaled.toInt() % 6
-                val nextIdx = (idx + 1) % 6
-                val blend = scaled - scaled.toInt()
-                val c1 = chromaticColors[idx]
-                val c2 = chromaticColors[nextIdx]
-                val baseRed = c1.red + (c2.red - c1.red) * blend
-                val baseGreen = c1.green + (c2.green - c1.green) * blend
-                val baseBlue = c1.blue + (c2.blue - c1.blue) * blend
-                val distFromHead = abs(((sampleFrac) % 1f + 1.5f) % 1f - 0.5f)
-                val pulse = (1f - distFromHead * 2f).coerceIn(0f, 1f).pow(2.2f) * 0.40f
-                val r = (baseRed + pulse).coerceAtMost(1f)
-                val g = (baseGreen + pulse).coerceAtMost(1f)
-                val b = (baseBlue + pulse).coerceAtMost(1f)
-                frac to Color(r, g, b)
-            }
-
-            Canvas(Modifier.matchParentSize()) {
-                val baseCornerPx = if (isCollapsedPill) size.height / 2f else with(density) { 28.dp.toPx() }
-                val sweepBrush = Brush.sweepGradient(
-                    *stops.toTypedArray(),
-                    center = Offset(size.width / 2f, size.height / 2f),
-                )
-
-                // 1. Soft atmospheric outer ambient glow (14dp spread)
-                val outerSpread = with(density) { 14.dp.toPx() }
-                drawRoundRect(
-                    brush = Brush.radialGradient(
-                        colors = listOf(
-                            glowAccent.copy(alpha = 0.05f * breath),
-                            glowBase.copy(alpha = 0.02f * breath),
-                            Color.Transparent,
-                        ),
-                        center = Offset(size.width / 2f, size.height / 2f),
-                        radius = (size.width / 2f) + outerSpread,
-                    ),
-                    topLeft = Offset(-outerSpread, -outerSpread),
-                    size = Size(size.width + outerSpread * 2f, size.height + outerSpread * 2f),
-                    cornerRadius = CornerRadius(baseCornerPx + outerSpread),
-                )
-
-                // 2. One animated chromatic rim. The panel supplies its own
-                // neutral border; keeping one chromatic stroke avoids the
-                // stacked double-ring effect while the ambient bloom above
-                // still gives the capsule a soft presence.
-                val rimSpread = with(density) { 0.9.dp.toPx() }
-                drawRoundRect(
-                    brush = sweepBrush,
-                    topLeft = Offset(-rimSpread, -rimSpread),
-                    size = Size(size.width + rimSpread * 2f, size.height + rimSpread * 2f),
-                    cornerRadius = CornerRadius(baseCornerPx + rimSpread),
-                    style = Stroke(with(density) { 2.6.dp.toPx() }),
-                    alpha = 0.84f * breath,
+            if (hasFloatingResult) {
+                FloatingResultCard(
+                    message = resultText,
+                    onDismiss = onDismissResult,
                 )
             }
-            }
 
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .then(swipeDismissModifier)
-                    .onGloballyPositioned { coordinates ->
-                        composerOriginX = coordinates.positionInRoot().x.roundToInt()
-                    }
-                    .shadow(24.dp, panelShape, clip = false)
-                    .clip(panelShape)
-                    .background(
-                        colors.composerBackground.copy(
-                            alpha = if (colors.isDark) 0.98f else 0.97f,
-                        ),
-                    )
-                    .border(
-                        width = 0.8.dp,
-                        color = colors.borderColor.copy(alpha = if (colors.isDark) 0.9f else 0.95f),
-                        shape = panelShape,
-                    ),
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.Center,
             ) {
-            if (effectiveMode != OverlayPanelMode.COMPOSER && !isCollapsedPill) {
-                PanelHeader(
-                    mode = effectiveMode,
-                    orbWorking = state is SessionState.Running && !state.needsAttention(),
-                    orbAnimated = state !is SessionState.Paused && !state.needsAttention(),
-                    onCollapse = onCollapse,
-                    onIdentityClick = onContinueInDhd,
-                )
-            }
+                if (effectiveMode == OverlayPanelMode.COMPOSER || effectiveMode == OverlayPanelMode.RESULT) {
+                    val glowOrbitPhase by motionPhase(
+                        label = "composer-orbit-glow",
+                        duration = 3_400,
+                        enabled = true,
+                    )
+                    val glowBreathPhase by motionPhase(
+                        label = "composer-ambient-glow",
+                        duration = 4_500,
+                        enabled = true,
+                    )
+                    val breath = 0.88f + 0.12f * sin(glowBreathPhase)
+                    val glowBase = if (colors.isDark) Color.White else Color(0xFF1E293B)
+                    val glowAccent = if (colors.isDark) Color(0xFF93C5FD) else Color(0xFF3B82F6)
 
-            when (effectiveMode) {
-                    OverlayPanelMode.COMPOSER -> Composer(
-                        onSubmit = onSubmit,
-                        onContinueInDhd = onContinueInDhd,
-                        onCollapse = onCollapse,
-                        onShowPreview = { previewVisible = true },
-                        onHidePreview = { previewVisible = false },
-                        previewVisible = previewVisible,
-                        previewState = previewState,
-                        onTaskPreviewSurfaceAvailable = onTaskPreviewSurfaceAvailable,
-                        onTaskPreviewSurfaceDestroyed = onTaskPreviewSurfaceDestroyed,
-                        fastMode = fastMode,
-                        onSetFastMode = setFastMode,
-                        reasoningEffort = reasoningEffort,
-                        visibleReasoningEfforts = visibleReasoningEfforts,
-                        onSelectReasoningEffort = setReasoningEffort,
-                    )
-                    OverlayPanelMode.RESULT -> ResultContent(
-                        message = result ?: terminalMessage(state),
-                        state = state,
-                        onSubmit = onSubmit,
-                        onContinue = onContinueInDhd,
-                        onCollapse = onCollapse,
-                        onShowPreview = { previewVisible = true },
-                        onHidePreview = { previewVisible = false },
-                        previewVisible = previewVisible,
-                        previewState = previewState,
-                        onTaskPreviewSurfaceAvailable = onTaskPreviewSurfaceAvailable,
-                        onTaskPreviewSurfaceDestroyed = onTaskPreviewSurfaceDestroyed,
-                        fastMode = fastMode,
-                        onSetFastMode = setFastMode,
-                        reasoningEffort = reasoningEffort,
-                        visibleReasoningEfforts = visibleReasoningEfforts,
-                        onSelectReasoningEffort = setReasoningEffort,
-                    )
-                    OverlayPanelMode.WORKING,
-                    OverlayPanelMode.ATTENTION,
-                    -> {
-                        if (previewVisible) {
-                            OverlayVirtualDisplayPreview(
-                                previewState = previewState,
-                                onHide = { previewVisible = false },
-                                onContinue = onContinueInDhd,
-                                onSurfaceAvailable = onTaskPreviewSurfaceAvailable,
-                                onSurfaceDestroyed = onTaskPreviewSurfaceDestroyed,
-                            )
-                        }
-                        if (isCollapsedPill) {
-                            WorkingRow(
-                                state = state,
-                                calls = calls,
-                                onStop = onStop,
-                                onContinueInDhd = onContinueInDhd,
-                                onCollapse = onCollapse,
-                                onShowPreview = { previewVisible = true },
-                            )
-                        } else {
-                            WorkingContent(
-                                state = state,
-                                calls = calls,
-                                onStop = onStop,
-                            )
-                        }
+                    val chromaticColors = if (state.needsAttention()) {
+                        listOf(
+                            colors.warningAmber,
+                            Color(0xFFFBBF24),
+                            colors.warningAmber,
+                            Color(0xFFFBBF24),
+                            colors.warningAmber,
+                            Color(0xFFFBBF24),
+                        )
+                    } else {
+                        listOf(
+                            Color(0xFF10B981), // Emerald Green
+                            Color(0xFF06B6D4), // Cyan
+                            Color(0xFF3B82F6), // Electric Blue
+                            Color(0xFF8B5CF6), // Purple
+                            Color(0xFFEF4444), // Coral Red
+                            Color(0xFFF59E0B), // Amber Gold
+                        )
                     }
-                    OverlayPanelMode.BUBBLE -> Unit
+
+                    val shift = (glowOrbitPhase / (2 * PI.toFloat())) % 1f
+                    val stops = List(17) { i ->
+                        val frac = i.toFloat() / 16f
+                        val sampleFrac = ((frac - shift) % 1f + 1f) % 1f
+                        val scaled = sampleFrac * 6f
+                        val idx = scaled.toInt() % 6
+                        val nextIdx = (idx + 1) % 6
+                        val blend = scaled - scaled.toInt()
+                        val c1 = chromaticColors[idx]
+                        val c2 = chromaticColors[nextIdx]
+                        val baseRed = c1.red + (c2.red - c1.red) * blend
+                        val baseGreen = c1.green + (c2.green - c1.green) * blend
+                        val baseBlue = c1.blue + (c2.blue - c1.blue) * blend
+                        val distFromHead = abs(((sampleFrac) % 1f + 1.5f) % 1f - 0.5f)
+                        val pulse = (1f - distFromHead * 2f).coerceIn(0f, 1f).pow(2.2f) * 0.40f
+                        val r = (baseRed + pulse).coerceAtMost(1f)
+                        val g = (baseGreen + pulse).coerceAtMost(1f)
+                        val b = (baseBlue + pulse).coerceAtMost(1f)
+                        frac to Color(r, g, b)
+                    }
+
+                    Canvas(Modifier.matchParentSize()) {
+                        val baseCornerPx = if (bottomCapsuleShape == CircleShape) {
+                            size.height / 2f
+                        } else {
+                            with(density) { 28.dp.toPx() }
+                        }
+                        val sweepBrush = Brush.sweepGradient(
+                            *stops.toTypedArray(),
+                            center = Offset(size.width / 2f, size.height / 2f),
+                        )
+
+                        // 1. Soft atmospheric outer ambient glow (14dp spread)
+                        val outerSpread = with(density) { 14.dp.toPx() }
+                        drawRoundRect(
+                            brush = Brush.radialGradient(
+                                colors = listOf(
+                                    glowAccent.copy(alpha = 0.05f * breath),
+                                    glowBase.copy(alpha = 0.02f * breath),
+                                    Color.Transparent,
+                                ),
+                                center = Offset(size.width / 2f, size.height / 2f),
+                                radius = (size.width / 2f) + outerSpread,
+                            ),
+                            topLeft = Offset(-outerSpread, -outerSpread),
+                            size = Size(size.width + outerSpread * 2f, size.height + outerSpread * 2f),
+                            cornerRadius = CornerRadius(baseCornerPx + outerSpread),
+                        )
+
+                        // 2. Chromatic rim
+                        val rimSpread = with(density) { 0.9.dp.toPx() }
+                        drawRoundRect(
+                            brush = sweepBrush,
+                            topLeft = Offset(-rimSpread, -rimSpread),
+                            size = Size(size.width + rimSpread * 2f, size.height + rimSpread * 2f),
+                            cornerRadius = CornerRadius(baseCornerPx + rimSpread),
+                            style = Stroke(with(density) { 2.6.dp.toPx() }),
+                            alpha = 0.84f * breath,
+                        )
+                    }
+                }
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .then(swipeDismissModifier)
+                        .onGloballyPositioned { coordinates ->
+                            composerOriginX = coordinates.positionInRoot().x.roundToInt()
+                        }
+                        .shadow(24.dp, bottomCapsuleShape, clip = false)
+                        .clip(bottomCapsuleShape)
+                        .background(
+                            colors.composerBackground.copy(
+                                alpha = if (colors.isDark) 0.98f else 0.97f,
+                            ),
+                        )
+                        .border(
+                            width = 0.8.dp,
+                            color = colors.borderColor.copy(alpha = if (colors.isDark) 0.9f else 0.95f),
+                            shape = bottomCapsuleShape,
+                        ),
+                ) {
+                    when (effectiveMode) {
+                        OverlayPanelMode.COMPOSER,
+                        OverlayPanelMode.RESULT -> Composer(
+                            onSubmit = onSubmit,
+                            onContinueInDhd = onContinueInDhd,
+                            onCollapse = onCollapse,
+                            onShowPreview = { previewVisible = true },
+                            fastMode = fastMode,
+                            onSetFastMode = setFastMode,
+                            reasoningEffort = reasoningEffort,
+                            visibleReasoningEfforts = visibleReasoningEfforts,
+                            onSelectReasoningEffort = setReasoningEffort,
+                        )
+                        OverlayPanelMode.WORKING,
+                        OverlayPanelMode.ATTENTION -> WorkingRow(
+                            state = state,
+                            calls = calls,
+                            onStop = onStop,
+                            onContinueInDhd = onContinueInDhd,
+                            onCollapse = onCollapse,
+                            onShowPreview = { previewVisible = true },
+                        )
+                        OverlayPanelMode.BUBBLE -> Unit
+                    }
+                }
             }
         }
     }
-}
 }
 
 @Composable
@@ -1038,11 +1191,6 @@ private fun Composer(
     onContinueInDhd: () -> Unit,
     onCollapse: () -> Unit,
     onShowPreview: () -> Unit,
-    onHidePreview: () -> Unit,
-    previewVisible: Boolean,
-    previewState: TaskPreviewState,
-    onTaskPreviewSurfaceAvailable: (TaskDisplaySession, AndroidSurface) -> Unit,
-    onTaskPreviewSurfaceDestroyed: (TaskDisplaySession, AndroidSurface) -> Unit,
     fastMode: Boolean,
     onSetFastMode: (Boolean) -> Unit,
     reasoningEffort: ReasoningEffort,
@@ -1085,31 +1233,17 @@ private fun Composer(
 
     CompositionLocalProvider(LocalTextToolbar provides textToolbar) {
         Column(modifier = Modifier.fillMaxWidth()) {
-        if (previewVisible) {
-            OverlayVirtualDisplayPreview(
-                previewState = previewState,
-                onHide = onHidePreview,
-                onContinue = onContinueInDhd,
-                onSurfaceAvailable = onTaskPreviewSurfaceAvailable,
-                onSurfaceDestroyed = onTaskPreviewSurfaceDestroyed,
-            )
-        }
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(
-                    start = if (keyboardVisible) 14.dp else 12.dp,
-                    end = if (keyboardVisible) 14.dp else 12.dp,
-                    top = when {
-                        previewVisible -> 8.dp
-                        keyboardVisible -> 14.dp
-                        else -> 12.dp
-                    },
-                    bottom = if (keyboardVisible) 8.dp else 12.dp,
-                ),
-            verticalAlignment = if (keyboardVisible) Alignment.Top else Alignment.CenterVertically,
-        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(
+                        start = if (keyboardVisible) 14.dp else 12.dp,
+                        end = if (keyboardVisible) 14.dp else 12.dp,
+                        top = if (keyboardVisible) 14.dp else 12.dp,
+                        bottom = if (keyboardVisible) 8.dp else 12.dp,
+                    ),
+                verticalAlignment = if (keyboardVisible) Alignment.Top else Alignment.CenterVertically,
+            ) {
             Box(
                 modifier = Modifier
                     .size(if (keyboardVisible) 42.dp else 48.dp)
@@ -1520,38 +1654,20 @@ private fun OverlayVirtualDisplayPreview(
     }
 
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 14.dp),
+        modifier = Modifier.fillMaxWidth(),
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(top = 2.dp, bottom = 7.dp),
+                .padding(bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
                 text = "Live view",
                 color = colors.textPrimary,
-                fontSize = 12.sp,
+                fontSize = 13.sp,
                 fontWeight = FontWeight.Medium,
             )
-            Spacer(Modifier.weight(1f))
-            Box(
-                modifier = Modifier
-                    .size(28.dp)
-                    .clip(CircleShape)
-                    .clickable(role = Role.Button, onClickLabel = "Hide live view", onClick = onHide)
-                    .semantics { contentDescription = "Hide live view" },
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = "×",
-                    color = colors.textSecondary,
-                    fontSize = 20.sp,
-                    lineHeight = 20.sp,
-                )
-            }
         }
         if (live != null && session != null) {
             LiveDisplayPreview(
@@ -1912,72 +2028,7 @@ private fun WorkingContent(
     }
 }
 
-@Composable
-private fun ResultContent(
-    message: String,
-    state: SessionState,
-    onSubmit: (String) -> Unit,
-    onContinue: () -> Unit,
-    onCollapse: () -> Unit,
-    onShowPreview: () -> Unit,
-    onHidePreview: () -> Unit,
-    previewVisible: Boolean,
-    previewState: TaskPreviewState,
-    onTaskPreviewSurfaceAvailable: (TaskDisplaySession, AndroidSurface) -> Unit,
-    onTaskPreviewSurfaceDestroyed: (TaskDisplaySession, AndroidSurface) -> Unit,
-    fastMode: Boolean,
-    onSetFastMode: (Boolean) -> Unit,
-    reasoningEffort: ReasoningEffort,
-    visibleReasoningEfforts: List<ReasoningEffort>,
-    onSelectReasoningEffort: (ReasoningEffort) -> Unit,
-) {
-    val colors = LocalAssistantColors.current
-    val completed = state is SessionState.Completed
-    val accent = if (completed) colors.accentGreen else colors.warningAmber
-    val title = if (completed) "All set" else "Stopped here"
-    val visibleMessage = message.ifBlank { if (completed) "Done." else "The request was stopped." }
 
-    Column(
-        modifier = Modifier.padding(bottom = 5.dp),
-    ) {
-        Row(
-            modifier = Modifier.padding(start = 20.dp, end = 16.dp, top = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            StatusMark(
-                status = if (completed) DhdToolCallStatus.COMPLETED else DhdToolCallStatus.ATTENTION,
-                color = accent,
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(title, color = accent, fontSize = 12.sp, fontWeight = FontWeight.Medium)
-        }
-        Text(
-            text = visibleMessage,
-            color = colors.textPrimary,
-            fontSize = 17.sp,
-            lineHeight = 24.sp,
-            maxLines = 3,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(start = 20.dp, end = 16.dp, top = 7.dp, bottom = 1.dp),
-        )
-        Composer(
-            onSubmit = onSubmit,
-            onContinueInDhd = onContinue,
-            onCollapse = onCollapse,
-            onShowPreview = onShowPreview,
-            onHidePreview = onHidePreview,
-            previewVisible = previewVisible,
-            previewState = previewState,
-            onTaskPreviewSurfaceAvailable = onTaskPreviewSurfaceAvailable,
-            onTaskPreviewSurfaceDestroyed = onTaskPreviewSurfaceDestroyed,
-            fastMode = fastMode,
-            onSetFastMode = onSetFastMode,
-            reasoningEffort = reasoningEffort,
-            visibleReasoningEfforts = visibleReasoningEfforts,
-            onSelectReasoningEffort = onSelectReasoningEffort,
-        )
-    }
-}
 
 @Composable
 private fun StatusMark(status: DhdToolCallStatus, color: Color) {
