@@ -533,7 +533,7 @@ fun OverlayPanel(
         BubbleButton(
             onClick = onExpand,
             onDrag = onDrag,
-            running = state is SessionState.Running,
+            running = state is SessionState.Running || state is SessionState.Paused,
             attention = state.needsAttention(),
             animated = state is SessionState.Running && !state.needsAttention(),
         )
@@ -874,6 +874,9 @@ private fun BubbleButton(
     attention: Boolean,
     animated: Boolean,
 ) {
+    val colors = LocalAssistantColors.current
+    val bubbleShape = CircleShape
+
     Box(
         modifier = Modifier
             .size(64.dp)
@@ -886,12 +889,44 @@ private fun BubbleButton(
             },
         contentAlignment = Alignment.Center,
     ) {
-        DhdIdentity(
-            modifier = Modifier.fillMaxSize(),
-            working = running && !attention,
-            attention = attention,
-            animated = animated,
-        )
+        if (running) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .shadow(12.dp, bubbleShape, clip = false)
+                    .clip(bubbleShape)
+                    .background(
+                        colors.composerBackground.copy(
+                            alpha = if (colors.isDark) 0.98f else 0.96f,
+                        ),
+                    )
+                    .border(
+                        width = 1.dp,
+                        color = if (attention) {
+                            colors.warningAmber.copy(alpha = 0.85f)
+                        } else {
+                            Color(0xFF38BDF8).copy(alpha = 0.65f)
+                        },
+                        shape = bubbleShape,
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                GeminiHorizonGlow(attention = attention)
+                DhdIdentity(
+                    modifier = Modifier.size(40.dp),
+                    working = !attention,
+                    attention = attention,
+                    animated = animated,
+                )
+            }
+        } else {
+            DhdIdentity(
+                modifier = Modifier.fillMaxSize(),
+                working = false,
+                attention = attention,
+                animated = animated,
+            )
+        }
         Box(
             modifier = Modifier
                 .fillMaxSize()
