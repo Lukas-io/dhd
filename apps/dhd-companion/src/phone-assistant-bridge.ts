@@ -16,6 +16,8 @@ export interface BridgeMessage {
 export interface BridgeRequest {
   type: string;
   requestId: string;
+  /** Canonical DHD tool name used for safe phone-side activity display. */
+  tool?: string;
   [key: string]: unknown;
 }
 

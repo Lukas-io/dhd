@@ -10,11 +10,15 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.provider.Settings
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.phonecontrol.assistant.MainActivity
 import com.phonecontrol.assistant.PhoneControlApplication
 import com.phonecontrol.assistant.R
 import com.phonecontrol.assistant.domain.ReasoningEffort
+import com.phonecontrol.assistant.overlay.OverlayPreferences
+import com.phonecontrol.assistant.overlay.OverlayWindowController
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -26,20 +30,67 @@ class AssistantForegroundService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val coordinator: SessionCoordinator
         get() = (application as PhoneControlApplication).sessionCoordinator
+    private lateinit var overlayWindowController: OverlayWindowController
+    private val overlayVisibilityGate
+        get() = (application as PhoneControlApplication).overlayVisibilityGate
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannels()
+        overlayWindowController = OverlayWindowController(this, coordinator, overlayVisibilityGate)
         startForegroundCompat(buildNotification(coordinator.state.value))
         serviceScope.launch {
             coordinator.state.collectLatest { state ->
+                overlayWindowController.onSessionState(state)
                 updateNotification(state)
             }
+        }
+        serviceScope.launch {
+            overlayVisibilityGate.hidden.collectLatest { hidden ->
+                overlayWindowController.setHidden(hidden)
+            }
+        }
+        if (overlayEnabledAndPermitted()) {
+            overlayWindowController.show()
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
+            ACTION_ENABLE_OVERLAY -> {
+                if (overlayEnabledAndPermitted()) {
+                    overlayWindowController.show()
+                }
+            }
+
+            ACTION_DISABLE_OVERLAY -> {
+                overlayWindowController.hide()
+                if (!coordinator.state.value.isActiveForService()) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelfResult(startId)
+                }
+            }
+
+            ACTION_REFRESH -> {
+                if (overlayEnabledAndPermitted()) {
+                    overlayWindowController.show()
+                } else if (!coordinator.state.value.isActiveForService()) {
+                    overlayWindowController.hide()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelfResult(startId)
+                }
+            }
+
+            ACTION_SESSION_ENDED -> {
+                if (!overlayEnabledAndPermitted() && !coordinator.state.value.isActiveForService()) {
+                    overlayWindowController.hide()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelfResult(startId)
+                } else {
+                    updateNotification(coordinator.state.value)
+                }
+            }
+
             ACTION_TOGGLE_PAUSE -> coordinator.togglePause()
             ACTION_CONTINUE -> {
                 if (!coordinator.continueStopped()) {
@@ -50,11 +101,18 @@ class AssistantForegroundService : Service() {
             ACTION_STOP -> {
                 coordinator.stop("Stopped from the notification.")
                 removeAttentionNotification(this)
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelfResult(startId)
+                if (!overlayEnabledAndPermitted()) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelfResult(startId)
+                } else {
+                    updateNotification(coordinator.state.value)
+                }
             }
 
             ACTION_START, null -> {
+                if (overlayEnabledAndPermitted()) {
+                    overlayWindowController.show()
+                }
                 val request = intent?.getStringExtra(EXTRA_REQUEST)
                     ?.takeIf(String::isNotBlank)
                 if (request != null) {
@@ -68,10 +126,13 @@ class AssistantForegroundService : Service() {
                 }
             }
         }
-        return START_NOT_STICKY
+        return if (overlayEnabledAndPermitted()) START_STICKY else START_NOT_STICKY
     }
 
     override fun onDestroy() {
+        if (::overlayWindowController.isInitialized) {
+            overlayWindowController.destroy()
+        }
         serviceScope.cancel()
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
@@ -86,13 +147,14 @@ class AssistantForegroundService : Service() {
 
     private fun buildNotification(state: SessionState): Notification {
         val isActive = state is SessionState.Running || state is SessionState.Paused
+        val overlayEnabled = overlayEnabledAndPermitted()
         val isPaused = state is SessionState.Paused
         val status = when (state) {
-            SessionState.Idle -> "Ready"
+            SessionState.Idle -> if (overlayEnabled) "Overlay ready" else "Ready"
             is SessionState.Running -> notificationPurpose(state.currentPurpose)
             is SessionState.Paused -> "Paused · ${notificationPurpose(state.currentPurpose)}"
-            is SessionState.Stopped -> "Stopped"
-            is SessionState.Completed -> "Completed"
+            is SessionState.Stopped -> if (overlayEnabled) "Overlay ready · Stopped" else "Stopped"
+            is SessionState.Completed -> if (overlayEnabled) "Overlay ready · Completed" else "Completed"
         }
         val contentIntent = PendingIntent.getActivity(
             this,
@@ -120,7 +182,7 @@ class AssistantForegroundService : Service() {
             .setContentText(status)
             .setStyle(NotificationCompat.BigTextStyle().bigText(status))
             .setContentIntent(contentIntent)
-            .setOngoing(isActive)
+            .setOngoing(isActive || overlayEnabled)
             .setOnlyAlertOnce(true)
         if (isActive) {
             builder
@@ -158,11 +220,18 @@ class AssistantForegroundService : Service() {
         createNotificationChannels(this)
     }
 
+    private fun overlayEnabledAndPermitted(): Boolean =
+        OverlayPreferences.isEnabled(this) && Settings.canDrawOverlays(this)
+
     private fun pendingIntentImmutableFlag(): Int =
         pendingIntentFlags()
 
     companion object {
         const val ACTION_START = "com.phonecontrol.assistant.action.START"
+        const val ACTION_ENABLE_OVERLAY = "com.phonecontrol.assistant.action.ENABLE_OVERLAY"
+        const val ACTION_DISABLE_OVERLAY = "com.phonecontrol.assistant.action.DISABLE_OVERLAY"
+        const val ACTION_REFRESH = "com.phonecontrol.assistant.action.REFRESH"
+        const val ACTION_SESSION_ENDED = "com.phonecontrol.assistant.action.SESSION_ENDED"
         const val ACTION_TOGGLE_PAUSE = "com.phonecontrol.assistant.action.TOGGLE_PAUSE"
         const val ACTION_CONTINUE = "com.phonecontrol.assistant.action.CONTINUE"
         const val ACTION_STOP = "com.phonecontrol.assistant.action.STOP"
@@ -186,6 +255,23 @@ class AssistantForegroundService : Service() {
         fun removeSessionNotification(context: Context) {
             context.getSystemService(NotificationManager::class.java)
                 .cancel(NOTIFICATION_ID)
+        }
+
+        /** Keep the foreground host alive only for an active task or enabled overlay. */
+        fun reconcileLifetime(context: Context) {
+            val appContext = context.applicationContext
+            val application = appContext as? PhoneControlApplication ?: return
+            val active = application.sessionCoordinator.state.value.isActiveForService()
+            val overlayAvailable = OverlayPreferences.isEnabled(appContext) && Settings.canDrawOverlays(appContext)
+            if (!overlayAvailable && !active) {
+                appContext.stopService(Intent(appContext, AssistantForegroundService::class.java))
+            } else {
+                ContextCompat.startForegroundService(
+                    appContext,
+                    Intent(appContext, AssistantForegroundService::class.java)
+                        .setAction(ACTION_SESSION_ENDED),
+                )
+            }
         }
 
         /** Post a result notification without bringing the assistant to the foreground. */
@@ -285,3 +371,6 @@ private fun SessionState.conversationIdOrNull(): String? = when (this) {
     is SessionState.Stopped -> conversationId
     is SessionState.Completed -> conversationId
 }
+
+private fun SessionState.isActiveForService(): Boolean =
+    this is SessionState.Running || this is SessionState.Paused

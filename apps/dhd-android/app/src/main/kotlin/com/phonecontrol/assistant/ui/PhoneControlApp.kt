@@ -180,6 +180,9 @@ fun PhoneControlApp(
     },
     onEndTaskDisplay: (TaskDisplayUiRecord) -> Unit = {},
     onRetryTaskDisplayPreview: (TaskDisplayUiRecord) -> Unit = {},
+    overlayEnabled: Boolean = false,
+    overlayPermissionGranted: Boolean = false,
+    onSetOverlayEnabled: (Boolean) -> Unit = {},
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
@@ -408,6 +411,9 @@ fun PhoneControlApp(
                             onOpenApprovedApps = { navController.navigate(AppRoutes.APPROVED_APPS) },
                             onOpenCompanion = { navController.navigate(AppRoutes.COMPANION) },
                             onOpenTaskDisplays = openTaskDisplays,
+                            overlayEnabled = overlayEnabled,
+                            overlayPermissionGranted = overlayPermissionGranted,
+                            onSetOverlayEnabled = onSetOverlayEnabled,
                             onBack = { navController.popBackStack() },
                         )
                     }

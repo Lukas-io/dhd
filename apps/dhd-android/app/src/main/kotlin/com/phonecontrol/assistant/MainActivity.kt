@@ -3,21 +3,27 @@ package com.phonecontrol.assistant
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import com.phonecontrol.assistant.developer.TaskPreviewState
 import com.phonecontrol.assistant.execution.TaskDisplayRecord
 import com.phonecontrol.assistant.execution.TaskDisplaySession
 import com.phonecontrol.assistant.execution.TaskDisplayStatus
 import com.phonecontrol.assistant.execution.taskDisplayReference
+import com.phonecontrol.assistant.overlay.OverlayPreferences
+import com.phonecontrol.assistant.overlay.OverlayVisibilityGate
 import com.phonecontrol.assistant.session.AssistantForegroundService
 import com.phonecontrol.assistant.session.SessionState
 import com.phonecontrol.assistant.ui.PhoneControlApp
@@ -31,6 +37,10 @@ class MainActivity : ComponentActivity() {
     private var pendingConversationId: String? = null
     private var pendingReasoningEffort: String? = null
     private var pendingFastMode: Boolean = false
+    private var overlayEnabled by mutableStateOf(false)
+    private var overlayPermissionGranted by mutableStateOf(false)
+    private var pendingOverlayEnable = false
+    private var overlayActivityToken: OverlayVisibilityGate.Token? = null
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
@@ -48,6 +58,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        refreshOverlayState()
         val initialConversationId = intent.getStringExtra(EXTRA_CONVERSATION_ID)
         val app = application as PhoneControlApplication
         val appPackageManager = packageManager
@@ -197,16 +208,42 @@ class MainActivity : ComponentActivity() {
                 onRetryTaskDisplayPreview = { record ->
                     app.retryTaskPreview(record.sessionKey)
                 },
+                overlayEnabled = overlayEnabled,
+                overlayPermissionGranted = overlayPermissionGranted,
+                onSetOverlayEnabled = ::handleOverlayToggle,
             )
         }
     }
 
     override fun onStart() {
         super.onStart()
+        val app = application as? PhoneControlApplication
+        if (overlayActivityToken == null) {
+            overlayActivityToken = app?.overlayVisibilityGate?.acquire(
+                com.phonecontrol.assistant.overlay.OverlayHideReason.DHD_ACTIVITY,
+            )
+        }
         (application as? PhoneControlApplication)?.let { app ->
             app.developerModeController.refresh()
             app.devBridgeServer.requestCodexWarmup()
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshOverlayState()
+    }
+
+    override fun onStop() {
+        overlayActivityToken?.close()
+        overlayActivityToken = null
+        super.onStop()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        refreshOverlayState()
     }
 
     private fun startSession(
@@ -269,6 +306,58 @@ class MainActivity : ComponentActivity() {
 
     private fun steerSession(text: String): Boolean =
         (application as PhoneControlApplication).sessionCoordinator.enqueueSteer(text) != null
+
+    private fun refreshOverlayState() {
+        val granted = Settings.canDrawOverlays(this)
+        overlayPermissionGranted = granted
+        overlayEnabled = granted && OverlayPreferences.isEnabled(this)
+        if (pendingOverlayEnable && granted) {
+            pendingOverlayEnable = false
+            enableOverlay()
+        } else if (overlayEnabled) {
+            ContextCompat.startForegroundService(
+                this,
+                Intent(this, AssistantForegroundService::class.java)
+                    .setAction(AssistantForegroundService.ACTION_ENABLE_OVERLAY),
+            )
+        }
+    }
+
+    private fun handleOverlayToggle(enabled: Boolean) {
+        if (!enabled) {
+            pendingOverlayEnable = false
+            OverlayPreferences.setEnabled(this, false)
+            overlayEnabled = false
+            startService(
+                Intent(this, AssistantForegroundService::class.java)
+                    .setAction(AssistantForegroundService.ACTION_DISABLE_OVERLAY),
+            )
+            return
+        }
+
+        if (!Settings.canDrawOverlays(this)) {
+            pendingOverlayEnable = true
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName"),
+                ),
+            )
+            return
+        }
+        enableOverlay()
+    }
+
+    private fun enableOverlay() {
+        OverlayPreferences.setEnabled(this, true)
+        overlayEnabled = true
+        overlayPermissionGranted = true
+        ContextCompat.startForegroundService(
+            this,
+            Intent(this, AssistantForegroundService::class.java)
+                .setAction(AssistantForegroundService.ACTION_ENABLE_OVERLAY),
+        )
+    }
 
     companion object {
         const val EXTRA_CONVERSATION_ID = "com.phonecontrol.assistant.extra.CONVERSATION_ID"

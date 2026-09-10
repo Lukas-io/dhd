@@ -2475,6 +2475,9 @@ fun SettingsScreen(
     onOpenPairing: () -> Unit,
     onOpenApprovedApps: () -> Unit,
     onOpenCompanion: () -> Unit,
+    overlayEnabled: Boolean,
+    overlayPermissionGranted: Boolean,
+    onSetOverlayEnabled: (Boolean) -> Unit,
     onBack: () -> Unit,
     onOpenTaskDisplays: () -> Unit = {},
 ) {
@@ -2762,11 +2765,62 @@ fun SettingsScreen(
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Column {
-                        // Desktop companion Row -> Opens dedicated screen
+                        // Display-over-other-apps overlay
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
+                                .clickable { onSetOverlayEnabled(!overlayEnabled) }
+                                .padding(horizontal = 16.dp, vertical = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_bot),
+                                contentDescription = "Display over other apps",
+                                tint = colors.textPrimary,
+                                modifier = Modifier.size(22.dp),
+                            )
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(start = 14.dp),
+                            ) {
+                                Text(
+                                    text = "Display over other apps",
+                                    fontWeight = FontWeight.Medium,
+                                    color = colors.textPrimary,
+                                    fontSize = 15.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    text = if (overlayPermissionGranted) {
+                                        "Floating DHD bubble is ${if (overlayEnabled) "available" else "off"}"
+                                    } else {
+                                        "Permission required"
+                                    },
+                                    fontSize = 12.sp,
+                                    color = if (!overlayPermissionGranted) colors.accentBlue else colors.textSecondary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            Switch(
+                                checked = overlayEnabled,
+                                onCheckedChange = onSetOverlayEnabled,
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = Color.White,
+                                    checkedTrackColor = colors.accentBlue,
+                                ),
+                            )
+                        }
+
+                        HorizontalDivider(thickness = 2.dp, color = colors.cardDivider)
+
+                        // Desktop companion Row -> Opens dedicated screen
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
                                 .clickable { onOpenCompanion() }
                                 .padding(horizontal = 16.dp, vertical = 14.dp),
                             verticalAlignment = Alignment.CenterVertically,

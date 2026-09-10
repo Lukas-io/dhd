@@ -5,12 +5,14 @@ import android.content.Context
 import android.content.Intent
 import com.phonecontrol.assistant.apps.InstalledAppsRepository
 import com.phonecontrol.assistant.apps.InstalledUserApp
+import com.phonecontrol.assistant.PhoneControlApplication
 import com.phonecontrol.assistant.data.DHD_BROWSE_APP_TOOL
 import com.phonecontrol.assistant.data.DHD_EXECUTE_TOOL
 import com.phonecontrol.assistant.data.DHD_FOREGROUND_APP_TOOL
 import com.phonecontrol.assistant.data.DHD_EXECUTE_SEQUENCE_TOOL
 import com.phonecontrol.assistant.data.DHD_LIST_ALLOWED_APPS_TOOL
 import com.phonecontrol.assistant.data.DHD_OBSERVE_TOOL
+import com.phonecontrol.assistant.data.DHD_OPEN_APP_TOOL
 import com.phonecontrol.assistant.domain.ActionMetadata
 import com.phonecontrol.assistant.domain.BackAction
 import com.phonecontrol.assistant.domain.GuardRegion
@@ -30,11 +32,14 @@ import com.phonecontrol.assistant.domain.SwipeAction
 import com.phonecontrol.assistant.domain.TapAction
 import com.phonecontrol.assistant.domain.TypeAction
 import com.phonecontrol.assistant.domain.WaitAction
+import com.phonecontrol.assistant.overlay.OverlayHideReason
 import com.phonecontrol.assistant.session.ActionExecutionResult
 import com.phonecontrol.assistant.session.AssistantForegroundService
 import com.phonecontrol.assistant.session.AttentionResolution
+import com.phonecontrol.assistant.session.DhdToolCallStatus
 import com.phonecontrol.assistant.session.SessionCoordinator
 import com.phonecontrol.assistant.session.SessionState
+import com.phonecontrol.assistant.session.defaultDhdToolPurpose
 import com.phonecontrol.assistant.execution.ForegroundAppResult
 import com.phonecontrol.assistant.execution.ObservationCaptureResult
 import com.phonecontrol.assistant.execution.PhoneObservationProvider
@@ -126,6 +131,8 @@ class DevBridgeServer(
     @Volatile private var pairingCodeValue: String = loadOrCreatePairingCode()
     private val codexWarmupRequested = AtomicBoolean(false)
     private val phoneActionMutex = Mutex()
+    private val overlayVisibilityGate
+        get() = (context.applicationContext as? PhoneControlApplication)?.overlayVisibilityGate
     private val observations = Collections.synchronizedMap(
         object : LinkedHashMap<String, ObservationSnapshot>(MAX_OBSERVATIONS + 1, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ObservationSnapshot>?): Boolean =
@@ -342,15 +349,45 @@ class DevBridgeServer(
                     "stream_agent_message" -> streamAgentMessage(requestId, json, writer)
                     "complete_session" -> completeSession(requestId, json, writer)
                     "fail_session" -> failSession(requestId, json, writer)
-                    "allowed_apps" -> allowedApps(requestId, json, writer)
-                    "browse_apps" -> browseApps(requestId, json, writer)
+                    "allowed_apps" -> withDhdTool(json, DHD_LIST_ALLOWED_APPS_TOOL) {
+                        allowedApps(requestId, json, writer)
+                    }
+                    "browse_apps" -> withDhdTool(json, DHD_BROWSE_APP_TOOL) {
+                        browseApps(requestId, json, writer)
+                    }
                     "list_displays" -> listDisplays(requestId, writer)
                     "close_display" -> closeDisplay(requestId, json, writer)
-                    "foreground_app" -> foregroundApp(requestId, json, writer)
-                    "observe" -> observe(requestId, json, writer)
-                    "execute_action" -> phoneActionMutex.withLock { executeAction(requestId, json, writer) }
-                    "execute_sequence" -> phoneActionMutex.withLock { executeSequence(requestId, json, writer) }
-                    "request_attention" -> requestAttention(requestId, json, writer)
+                    "foreground_app" -> withDhdTool(json, DHD_FOREGROUND_APP_TOOL) {
+                        foregroundApp(requestId, json, writer)
+                    }
+                    "observe" -> withDhdTool(
+                        json = json,
+                        fallbackToolName = DHD_OBSERVE_TOOL,
+                        hideDuringObservation = true,
+                    ) {
+                        observe(requestId, json, writer)
+                    }
+                    "execute_action" -> withDhdTool(
+                        json = json,
+                        fallbackToolName = fallbackActionToolName(json),
+                        hideDuringObservation = true,
+                    ) {
+                        phoneActionMutex.withLock { executeAction(requestId, json, writer) }
+                    }
+                    "execute_sequence" -> withDhdTool(
+                        json = json,
+                        fallbackToolName = "dhd_execute_sequence",
+                        hideDuringObservation = true,
+                    ) {
+                        phoneActionMutex.withLock { executeSequence(requestId, json, writer) }
+                    }
+                    "request_attention" -> withDhdTool(
+                        json = json,
+                        fallbackToolName = "dhd_request_attention",
+                        terminalStatus = DhdToolCallStatus.ATTENTION,
+                    ) {
+                        requestAttention(requestId, json, writer)
+                    }
                     "stop_session" -> stopSession(requestId, json, writer)
                     else -> write(writer, errorResponse(requestId, "Unsupported bridge request type."))
                 }
@@ -360,6 +397,54 @@ class DevBridgeServer(
                 write(writer, errorResponse(requestId, "The phone bridge failed: $message"))
             }
         }
+    }
+
+    private suspend fun withDhdTool(
+        json: JSONObject,
+        fallbackToolName: String,
+        hideDuringObservation: Boolean = false,
+        terminalStatus: DhdToolCallStatus = DhdToolCallStatus.COMPLETED,
+        block: suspend () -> Unit,
+    ) {
+        val toolName = json.optString("tool").trim().ifBlank { fallbackToolName }
+        val callId = coordinator.beginToolCall(toolName, toolPurpose(toolName, json))
+        val visibilityToken = if (hideDuringObservation) {
+            overlayVisibilityGate?.acquire(OverlayHideReason.OBSERVATION)
+        } else {
+            null
+        }
+        try {
+            block()
+            coordinator.finishToolCall(callId, terminalStatus)
+        } catch (error: Throwable) {
+            coordinator.finishToolCall(callId, DhdToolCallStatus.FAILED)
+            throw error
+        } finally {
+            visibilityToken?.close()
+        }
+    }
+
+    private fun fallbackActionToolName(json: JSONObject): String {
+        val actionType = json.optJSONObject("action")?.optString("type")?.lowercase()
+        return if (actionType == "open_app") DHD_OPEN_APP_TOOL else DHD_EXECUTE_TOOL
+    }
+
+    private fun toolPurpose(toolName: String, json: JSONObject): String = when (toolName) {
+        DHD_OBSERVE_TOOL -> json.optString("purpose").trim().takeIf(String::isNotBlank)
+            ?: defaultDhdToolPurpose(toolName)
+        DHD_OPEN_APP_TOOL -> {
+            val packageName = json.optJSONObject("action")?.optString("packageName")?.trim()
+            if (packageName.isNullOrBlank()) defaultDhdToolPurpose(toolName) else "Opening $packageName"
+        }
+        DHD_EXECUTE_TOOL -> {
+            val purpose = json.optJSONObject("action")
+                ?.optJSONObject("metadata")
+                ?.optString("purpose")
+                ?.trim()
+            purpose?.takeIf(String::isNotBlank) ?: defaultDhdToolPurpose(toolName)
+        }
+        "dhd_request_attention" -> defaultDhdToolPurpose(toolName)
+        else -> defaultDhdToolPurpose(toolName)
     }
 
     private fun startSession(
@@ -672,8 +757,7 @@ class DevBridgeServer(
             )
         }
         AssistantForegroundService.removeAttentionNotification(context)
-        context.stopService(Intent(context, AssistantForegroundService::class.java))
-        AssistantForegroundService.removeSessionNotification(context)
+        AssistantForegroundService.reconcileLifetime(context)
         write(
             writer,
             JSONObject()
@@ -758,8 +842,7 @@ class DevBridgeServer(
             AssistantForegroundService.showCompletionNotification(context, completionMessage, coordinator.state.value.conversationIdOrNullForBridge())
         }
         AssistantForegroundService.removeAttentionNotification(context)
-        context.stopService(Intent(context, AssistantForegroundService::class.java))
-        AssistantForegroundService.removeSessionNotification(context)
+        AssistantForegroundService.reconcileLifetime(context)
         write(
             writer,
             JSONObject()
@@ -1657,8 +1740,8 @@ class DevBridgeServer(
             .ifBlank { "Stopped by the desktop assistant." }
             .take(MAX_TEXT_CHARS)
         val stopped = coordinator.stop(reason)
-        context.stopService(Intent(context, AssistantForegroundService::class.java))
         AssistantForegroundService.removeAttentionNotification(context)
+        AssistantForegroundService.reconcileLifetime(context)
         write(
             writer,
             JSONObject()
