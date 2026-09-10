@@ -893,21 +893,11 @@ private fun BubbleButton(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .shadow(12.dp, bubbleShape, clip = false)
                     .clip(bubbleShape)
                     .background(
                         colors.composerBackground.copy(
                             alpha = if (colors.isDark) 0.98f else 0.96f,
                         ),
-                    )
-                    .border(
-                        width = 1.dp,
-                        color = if (attention) {
-                            colors.warningAmber.copy(alpha = 0.85f)
-                        } else {
-                            Color(0xFF38BDF8).copy(alpha = 0.65f)
-                        },
-                        shape = bubbleShape,
                     ),
                 contentAlignment = Alignment.Center,
             ) {
