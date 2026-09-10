@@ -1525,6 +1525,109 @@ private fun OverlayVirtualDisplayPreview(
 }
 
 @Composable
+private fun BoxScope.GeminiHorizonGlow(attention: Boolean) {
+    val density = LocalDensity.current
+    val wavePhase by motionPhase(
+        label = "gemini-horizon-wave",
+        duration = 3_200,
+        enabled = true,
+    )
+    val breathPhase by motionPhase(
+        label = "gemini-horizon-breath",
+        duration = 4_000,
+        enabled = true,
+    )
+    val breath = 0.82f + 0.18f * sin(breathPhase)
+
+    Canvas(Modifier.matchParentSize()) {
+        // 1. Ambient floor gradient across bottom 42%
+        drawRect(
+            brush = Brush.verticalGradient(
+                0.0f to Color.Transparent,
+                0.36f to Color.Transparent,
+                0.68f to if (attention) Color(0xFFD97706).copy(alpha = 0.26f * breath) else Color(0xFF1E40AF).copy(alpha = 0.28f * breath),
+                1.0f to if (attention) Color(0xFFF59E0B).copy(alpha = 0.62f * breath) else Color(0xFF2563EB).copy(alpha = 0.65f * breath),
+                startY = 0f,
+                endY = size.height,
+            ),
+        )
+
+        // 2. Primary undulating horizontal light wave (flowing crest)
+        val primaryX = size.width * (0.50f + 0.26f * sin(wavePhase))
+        val primaryY = size.height * 1.05f
+        val primaryRadius = size.width * 0.46f
+        val primaryColors = if (attention) {
+            listOf(
+                Color(0xFFFBBF24).copy(alpha = 0.75f * breath),
+                Color(0xFFF59E0B).copy(alpha = 0.50f * breath),
+                Color(0xFFD97706).copy(alpha = 0.22f * breath),
+                Color.Transparent,
+            )
+        } else {
+            listOf(
+                Color(0xFF38BDF8).copy(alpha = 0.70f * breath),
+                Color(0xFF2563EB).copy(alpha = 0.80f * breath),
+                Color(0xFF1D4ED8).copy(alpha = 0.40f * breath),
+                Color.Transparent,
+            )
+        }
+        drawCircle(
+            brush = Brush.radialGradient(
+                colors = primaryColors,
+                center = Offset(primaryX, primaryY),
+                radius = primaryRadius,
+            ),
+            center = Offset(primaryX, primaryY),
+            radius = primaryRadius,
+        )
+
+        // 3. Secondary harmonic wave counter-pulsing
+        val secondaryX = size.width * (0.50f - 0.20f * cos(wavePhase * 0.78f))
+        val secondaryY = size.height * 1.02f
+        val secondaryRadius = size.width * 0.38f
+        val secondaryColors = if (attention) {
+            listOf(
+                Color(0xFFF59E0B).copy(alpha = 0.40f * breath),
+                Color(0xFFD97706).copy(alpha = 0.18f * breath),
+                Color.Transparent,
+            )
+        } else {
+            listOf(
+                Color(0xFF60A5FA).copy(alpha = 0.45f * breath),
+                Color(0xFF1E40AF).copy(alpha = 0.30f * breath),
+                Color.Transparent,
+            )
+        }
+        drawCircle(
+            brush = Brush.radialGradient(
+                colors = secondaryColors,
+                center = Offset(secondaryX, secondaryY),
+                radius = secondaryRadius,
+            ),
+            center = Offset(secondaryX, secondaryY),
+            radius = secondaryRadius,
+        )
+
+        // 4. Luminous rim edge accent along the bottom border curve
+        val rimXRatio = (primaryX / size.width).coerceIn(0f, 1f)
+        val rimBrush = Brush.horizontalGradient(
+            0.0f to Color.Transparent,
+            (rimXRatio - 0.25f).coerceAtLeast(0f) to Color.Transparent,
+            rimXRatio to if (attention) Color(0xFFFDE68A).copy(alpha = 0.65f * breath) else Color(0xFF93C5FD).copy(alpha = 0.70f * breath),
+            (rimXRatio + 0.25f).coerceAtMost(1f) to Color.Transparent,
+            1.0f to Color.Transparent,
+        )
+        val rimHeightPx = with(density) { 2.2.dp.toPx() }
+        drawRoundRect(
+            brush = rimBrush,
+            topLeft = Offset(0f, size.height - rimHeightPx),
+            size = Size(size.width, rimHeightPx),
+            cornerRadius = CornerRadius(rimHeightPx),
+        )
+    }
+}
+
+@Composable
 private fun WorkingRow(
     state: SessionState,
     calls: List<DhdToolCall>,
@@ -1553,80 +1656,90 @@ private fun WorkingRow(
         else -> rawTask
     }
 
-    Row(
+    Box(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(
-                start = 12.dp,
-                end = 12.dp,
-                top = 12.dp,
-                bottom = 12.dp,
-            ),
-        verticalAlignment = Alignment.CenterVertically,
+            .clip(CircleShape),
+        contentAlignment = Alignment.Center,
     ) {
-        Box(
+        GeminiHorizonGlow(attention = attention)
+
+        Row(
             modifier = Modifier
-                .size(48.dp)
-                .pointerInput(onContinueInDhd, onCollapse, onShowPreview) {
-                    detectTapGestures(
-                        onTap = { onContinueInDhd() },
-                        onDoubleTap = { onCollapse() },
-                        onLongPress = { onShowPreview?.invoke() },
-                    )
-                }
+                .fillMaxWidth()
+                .padding(
+                    start = 12.dp,
+                    end = 12.dp,
+                    top = 12.dp,
+                    bottom = 12.dp,
+                ),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .pointerInput(onContinueInDhd, onCollapse, onShowPreview) {
+                        detectTapGestures(
+                            onTap = { onContinueInDhd() },
+                            onDoubleTap = { onCollapse() },
+                            onLongPress = { onShowPreview?.invoke() },
+                        )
+                    }
                 .semantics {
                     contentDescription =
                         "DHD is working. Tap to continue in DHD, double tap to collapse."
                 },
-            contentAlignment = Alignment.Center,
-        ) {
-            DhdIdentity(
-                modifier = Modifier.fillMaxSize(),
-                working = state is SessionState.Running && !attention,
-                attention = attention,
-                animated = state !is SessionState.Paused && !attention,
-            )
-        }
-
-        Spacer(Modifier.width(8.dp))
-
-        AnimatedContent(
-            targetState = activeTask,
-            transitionSpec = {
-                (fadeIn(animationSpec = tween(220)) + slideInVertically(animationSpec = tween(220)) { it / 3 })
-                    .togetherWith(fadeOut(animationSpec = tween(140)) + slideOutVertically(animationSpec = tween(140)) { -it / 3 })
-            },
-            modifier = Modifier
-                .weight(1f)
-                .clickable(
-                    role = Role.Button,
-                    onClickLabel = "Continue in DHD",
-                    onClick = onContinueInDhd,
+                contentAlignment = Alignment.Center,
+            ) {
+                DhdIdentity(
+                    modifier = Modifier.fillMaxSize(),
+                    working = state is SessionState.Running && !attention,
+                    attention = attention,
+                    animated = state !is SessionState.Paused && !attention,
                 )
-                .semantics { contentDescription = "Active task: $activeTask" },
-            contentAlignment = Alignment.CenterStart,
-            label = "working-task-progress",
-        ) { text ->
-            Text(
-                text = text,
-                color = if (attention) colors.warningAmber else colors.textPrimary,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+            }
+
+            Spacer(Modifier.width(10.dp))
+
+            AnimatedContent(
+                targetState = activeTask,
+                transitionSpec = {
+                    (fadeIn(animationSpec = tween(220)) + slideInVertically(animationSpec = tween(220)) { it / 3 })
+                        .togetherWith(fadeOut(animationSpec = tween(140)) + slideOutVertically(animationSpec = tween(140)) { -it / 3 })
+                },
+                modifier = Modifier
+                    .weight(1f)
+                    .clickable(
+                        role = Role.Button,
+                        onClickLabel = "Continue in DHD",
+                        onClick = onContinueInDhd,
+                    )
+                    .semantics { contentDescription = "Active task: $activeTask" },
+                contentAlignment = Alignment.CenterStart,
+                label = "working-task-progress",
+            ) { text ->
+                Text(
+                    text = text,
+                    color = if (attention) colors.warningAmber else Color.White,
+                    fontSize = 15.sp,
+                    lineHeight = 20.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 3,
+                    overflow = TextOverflow.Clip,
+                )
+            }
+
+            Spacer(Modifier.width(10.dp))
+
+            GlyphButton(
+                label = "Stop assistant",
+                glyph = "stop",
+                onClick = onStop,
+                filled = true,
+                buttonSize = 44.dp,
+                iconSize = 22.dp,
             )
         }
-
-        Spacer(Modifier.width(8.dp))
-
-        GlyphButton(
-            label = "Stop assistant",
-            glyph = "stop",
-            onClick = onStop,
-            filled = true,
-            buttonSize = 48.dp,
-            iconSize = 20.dp,
-        )
     }
 }
 
@@ -1873,6 +1986,7 @@ private fun GlyphButton(
 ) {
     val colors = LocalAssistantColors.current
     val tint = when {
+        glyph == "stop" -> Color(0xFF1E2B45).copy(alpha = 0.88f)
         filled && enabled -> colors.sendButtonActiveBg
         filled -> colors.sendButtonInactiveBg
         enabled -> colors.surfaceCard.copy(alpha = 0.78f)
@@ -1883,6 +1997,13 @@ private fun GlyphButton(
             .size(buttonSize)
             .clip(CircleShape)
             .background(tint)
+            .then(
+                if (glyph == "stop") {
+                    Modifier.border(1.dp, Color(0xFF38BDF8).copy(alpha = 0.35f), CircleShape)
+                } else {
+                    Modifier
+                }
+            )
             .clickable(
                 enabled = enabled,
                 role = Role.Button,
@@ -1915,10 +2036,11 @@ private fun GlyphButton(
                     drawPath(path, color, style = Stroke(1.8.dp.toPx(), cap = StrokeCap.Round))
                 }
                 "stop" -> drawRoundRect(
-                    color,
-                    topLeft = Offset(size.width * 0.27f, size.height * 0.27f),
-                    size = Size(size.width * 0.46f, size.height * 0.46f),
-                    cornerRadius = CornerRadius(2.5.dp.toPx()),
+                    color = Color.White.copy(alpha = 0.95f),
+                    topLeft = Offset(size.width * 0.24f, size.height * 0.24f),
+                    size = Size(size.width * 0.52f, size.height * 0.52f),
+                    cornerRadius = CornerRadius(3.5.dp.toPx()),
+                    style = Stroke(1.8.dp.toPx()),
                 )
                 else -> Unit
             }
