@@ -100,7 +100,7 @@ class MainActivity : ComponentActivity() {
             val currentToolName = coordinatorSessionKey?.let { sessionKey ->
                 events.asReversed()
                     .firstOrNull { event ->
-                        event.sessionId == sessionKey && !event.toolName.isNullOrBlank()
+                        event.sessionId == sessionKey && !event.toolName.isNullOrBlank() && !event.toolName.equals("dhd_close_display", ignoreCase = true) && !event.toolName.equals("close_display", ignoreCase = true)
                     }
                     ?.toolName
             }

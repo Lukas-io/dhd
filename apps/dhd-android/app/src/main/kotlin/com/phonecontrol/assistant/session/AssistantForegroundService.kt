@@ -210,7 +210,7 @@ class AssistantForegroundService : Service() {
 
     private fun notificationPurpose(purpose: String): String = when {
         purpose.equals("Preparing request", ignoreCase = true) -> "Connecting to Codex…"
-        purpose.equals("Codex is planning", ignoreCase = true) -> "Thinking…"
+        purpose.equals("Codex is planning", ignoreCase = true) || purpose.equals("DHD is planning", ignoreCase = true) -> "Thinking…"
         purpose.equals("Waiting for desktop Codex bridge", ignoreCase = true) -> "Companion not connected"
         purpose.equals("Needs your attention", ignoreCase = true) -> "DHD needs your attention"
         else -> purpose

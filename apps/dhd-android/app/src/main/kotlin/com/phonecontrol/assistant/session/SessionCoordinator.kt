@@ -352,8 +352,8 @@ class SessionCoordinator(
         if (!phoneActionsReadyProvider()) return@synchronized null
         if (claimedRequestSessionId == running.sessionId) return@synchronized null
         claimedRequestSessionId = running.sessionId
-        _state.value = running.copy(currentPurpose = "Codex is planning")
-        taskDisplayBackend?.updatePurposeForRun(running.sessionId, "Codex is planning")
+        _state.value = running.copy(currentPurpose = "DHD is planning")
+        taskDisplayBackend?.updatePurposeForRun(running.sessionId, "DHD is planning")
         appendEvent(
             ActivityEventKind.SYSTEM,
             "Desktop Codex companion claimed the request.",
@@ -686,7 +686,7 @@ class SessionCoordinator(
         pendingAttention = null
         _state.value = when (current) {
             is SessionState.Running -> current.copy(
-                currentPurpose = "Codex is planning",
+                currentPurpose = "DHD is planning",
                 attentionReason = null,
             )
             is SessionState.Paused -> current.copy(
@@ -698,7 +698,7 @@ class SessionCoordinator(
         val resumedPurpose = when (val after = _state.value) {
             is SessionState.Running -> after.currentPurpose
             is SessionState.Paused -> after.currentPurpose
-            else -> "Codex is planning"
+            else -> "DHD is planning"
         }
         val resumedDisplayStatus = if (_state.value is SessionState.Paused) {
             TaskDisplayStatus.PAUSED

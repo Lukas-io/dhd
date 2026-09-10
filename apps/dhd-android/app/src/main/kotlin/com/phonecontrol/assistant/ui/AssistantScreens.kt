@@ -707,7 +707,9 @@ private fun TaskGroup.merge(other: TaskGroup): TaskGroup = copy(
 )
 
 private fun TimelineItem.Activity.isDhdActionActivity(): Boolean =
-    !status.equals("confirmation", ignoreCase = true)
+    !status.equals("confirmation", ignoreCase = true) &&
+        !toolName.equals("dhd_close_display", ignoreCase = true) &&
+        !toolName.equals("close_display", ignoreCase = true)
 
 @Composable
 private fun ConversationTimeline(
@@ -1290,7 +1292,7 @@ private fun thinkingDetail(currentPurpose: String, elapsedSeconds: Long): String
     currentPurpose.equals("Preparing request", ignoreCase = true) && elapsedSeconds >= COMPANION_WAIT_CALLOUT_SECONDS ->
         "Waiting for the desktop companion"
     currentPurpose.equals("Preparing request", ignoreCase = true) -> "Connecting to the desktop companion"
-    currentPurpose.equals("Codex is planning", ignoreCase = true) -> "Thinking…"
+    currentPurpose.equals("Codex is planning", ignoreCase = true) || currentPurpose.equals("DHD is planning", ignoreCase = true) -> "Thinking…"
     else -> currentPurpose.ifBlank { "Preparing the next step" }
 }
 

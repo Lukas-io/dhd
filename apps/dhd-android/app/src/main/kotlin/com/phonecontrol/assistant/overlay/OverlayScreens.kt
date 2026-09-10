@@ -542,9 +542,11 @@ fun OverlayPanel(
     val density = LocalDensity.current
     val imeBottom = WindowInsets.ime.getBottom(density)
     val keyboardVisible = imeBottom > with(density) { 96.dp.toPx() }
-    val isCollapsedComposer = effectiveMode == OverlayPanelMode.COMPOSER && !keyboardVisible
+    val isCollapsedPill = ((effectiveMode == OverlayPanelMode.COMPOSER && !keyboardVisible) ||
+        effectiveMode == OverlayPanelMode.WORKING ||
+        effectiveMode == OverlayPanelMode.ATTENTION) && !previewVisible
 
-    val panelShape = if (isCollapsedComposer) CircleShape else RoundedCornerShape(28.dp)
+    val panelShape = if (isCollapsedPill) CircleShape else RoundedCornerShape(28.dp)
     val panelDescription = when (effectiveMode) {
         OverlayPanelMode.COMPOSER -> "DHD assistant. Ready for a request."
         OverlayPanelMode.RESULT -> "DHD assistant. Result ready."
@@ -554,12 +556,12 @@ fun OverlayPanel(
     }
 
     val horizontalPadding = when {
-        isCollapsedComposer -> 36.dp
+        isCollapsedPill -> 36.dp
         effectiveMode == OverlayPanelMode.COMPOSER -> 14.dp
         else -> 12.dp
     }
     val bottomPadding = when {
-        isCollapsedComposer -> 10.dp
+        isCollapsedPill -> 10.dp
         keyboardVisible -> 20.dp
         else -> 16.dp
     }
@@ -578,7 +580,7 @@ fun OverlayPanel(
             .semantics { contentDescription = panelDescription },
         contentAlignment = Alignment.BottomCenter,
     ) {
-        val composerWidthModifier = if (isCollapsedComposer) {
+        val composerWidthModifier = if (isCollapsedPill) {
             Modifier
                 .fillMaxWidth()
                 .widthIn(max = 320.dp)
@@ -648,7 +650,7 @@ fun OverlayPanel(
             }
 
             Canvas(Modifier.matchParentSize()) {
-                val baseCornerPx = if (isCollapsedComposer) size.height / 2f else with(density) { 28.dp.toPx() }
+                val baseCornerPx = if (isCollapsedPill) size.height / 2f else with(density) { 28.dp.toPx() }
                 val sweepBrush = Brush.sweepGradient(
                     *stops.toTypedArray(),
                     center = Offset(size.width / 2f, size.height / 2f),
@@ -722,7 +724,7 @@ fun OverlayPanel(
                         shape = panelShape,
                     ),
             ) {
-            if (effectiveMode != OverlayPanelMode.COMPOSER) {
+            if (effectiveMode != OverlayPanelMode.COMPOSER && !isCollapsedPill) {
                 PanelHeader(
                     mode = effectiveMode,
                     orbWorking = state is SessionState.Running && !state.needsAttention(),
@@ -769,11 +771,33 @@ fun OverlayPanel(
                     )
                     OverlayPanelMode.WORKING,
                     OverlayPanelMode.ATTENTION,
-                    -> WorkingContent(
-                        state = state,
-                        calls = calls,
-                        onStop = onStop,
-                    )
+                    -> {
+                        if (previewVisible) {
+                            OverlayVirtualDisplayPreview(
+                                previewState = previewState,
+                                onHide = { previewVisible = false },
+                                onContinue = onContinueInDhd,
+                                onSurfaceAvailable = onTaskPreviewSurfaceAvailable,
+                                onSurfaceDestroyed = onTaskPreviewSurfaceDestroyed,
+                            )
+                        }
+                        if (isCollapsedPill) {
+                            WorkingRow(
+                                state = state,
+                                calls = calls,
+                                onStop = onStop,
+                                onContinueInDhd = onContinueInDhd,
+                                onCollapse = onCollapse,
+                                onShowPreview = { previewVisible = true },
+                            )
+                        } else {
+                            WorkingContent(
+                                state = state,
+                                calls = calls,
+                                onStop = onStop,
+                            )
+                        }
+                    }
                     OverlayPanelMode.BUBBLE -> Unit
             }
         }
@@ -1501,13 +1525,123 @@ private fun OverlayVirtualDisplayPreview(
 }
 
 @Composable
+private fun WorkingRow(
+    state: SessionState,
+    calls: List<DhdToolCall>,
+    onStop: () -> Unit,
+    onContinueInDhd: () -> Unit,
+    onCollapse: () -> Unit,
+    onShowPreview: (() -> Unit)? = null,
+) {
+    val colors = LocalAssistantColors.current
+    val sessionCalls = calls.filter {
+        it.sessionId == state.sessionIdOrNull() &&
+            !it.toolName.equals("dhd_close_display", ignoreCase = true) &&
+            !it.toolName.equals("close_display", ignoreCase = true)
+    }
+    val runningCall = sessionCalls.lastOrNull { it.status == DhdToolCallStatus.RUNNING }
+    val attention = state.needsAttention()
+    val attentionReason = state.attentionReasonOrNull()
+    val rawTask = runningCall?.purpose
+        ?: state.currentPurposeOrNull()?.takeIf { it.isNotBlank() }
+        ?: "DHD is planning"
+
+    val activeTask = when {
+        attention -> attentionReason ?: "Needs your attention"
+        rawTask.equals("Codex is planning", ignoreCase = true) ||
+            rawTask.equals("DHD is planning", ignoreCase = true) -> "DHD is planning"
+        else -> rawTask
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(
+                start = 12.dp,
+                end = 12.dp,
+                top = 12.dp,
+                bottom = 12.dp,
+            ),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(48.dp)
+                .pointerInput(onContinueInDhd, onCollapse, onShowPreview) {
+                    detectTapGestures(
+                        onTap = { onContinueInDhd() },
+                        onDoubleTap = { onCollapse() },
+                        onLongPress = { onShowPreview?.invoke() },
+                    )
+                }
+                .semantics {
+                    contentDescription =
+                        "DHD is working. Tap to continue in DHD, double tap to collapse."
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            DhdIdentity(
+                modifier = Modifier.fillMaxSize(),
+                working = state is SessionState.Running && !attention,
+                attention = attention,
+                animated = state !is SessionState.Paused && !attention,
+            )
+        }
+
+        Spacer(Modifier.width(8.dp))
+
+        AnimatedContent(
+            targetState = activeTask,
+            transitionSpec = {
+                (fadeIn(animationSpec = tween(220)) + slideInVertically(animationSpec = tween(220)) { it / 3 })
+                    .togetherWith(fadeOut(animationSpec = tween(140)) + slideOutVertically(animationSpec = tween(140)) { -it / 3 })
+            },
+            modifier = Modifier
+                .weight(1f)
+                .clickable(
+                    role = Role.Button,
+                    onClickLabel = "Continue in DHD",
+                    onClick = onContinueInDhd,
+                )
+                .semantics { contentDescription = "Active task: $activeTask" },
+            contentAlignment = Alignment.CenterStart,
+            label = "working-task-progress",
+        ) { text ->
+            Text(
+                text = text,
+                color = if (attention) colors.warningAmber else colors.textPrimary,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+
+        Spacer(Modifier.width(8.dp))
+
+        GlyphButton(
+            label = "Stop assistant",
+            glyph = "stop",
+            onClick = onStop,
+            filled = true,
+            buttonSize = 48.dp,
+            iconSize = 20.dp,
+        )
+    }
+}
+
+@Composable
 private fun WorkingContent(
     state: SessionState,
     calls: List<DhdToolCall>,
     onStop: () -> Unit,
 ) {
     val colors = LocalAssistantColors.current
-    val sessionCalls = calls.filter { it.sessionId == state.sessionIdOrNull() }
+    val sessionCalls = calls.filter {
+        it.sessionId == state.sessionIdOrNull() &&
+            !it.toolName.equals("dhd_close_display", ignoreCase = true) &&
+            !it.toolName.equals("close_display", ignoreCase = true)
+    }
     val attention = state.needsAttention()
     val paused = state is SessionState.Paused
     val current = sessionCalls.lastOrNull { it.status == DhdToolCallStatus.RUNNING }
