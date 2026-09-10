@@ -1,5 +1,6 @@
 package com.phonecontrol.assistant.overlay
 
+import com.phonecontrol.assistant.session.SessionState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -61,4 +62,72 @@ class OverlayVisibilityGateTest {
             ),
         )
     }
+
+    @Test
+    fun `active updates preserve an explicit bubble collapse`() {
+        val first = runningState("Opening the app")
+        val next = first.copy(currentPurpose = "Tapping the search field")
+
+        assertEquals(
+            OverlayPanelMode.BUBBLE,
+            nextOverlayPanelMode(OverlayPanelMode.BUBBLE, first, next),
+        )
+    }
+
+    @Test
+    fun `attention expands once but later updates preserve collapse`() {
+        val working = runningState("Opening the app")
+        val attention = working.copy(
+            currentPurpose = "Needs your attention",
+            attentionReason = "Please confirm the visible prompt.",
+        )
+        val attentionUpdate = attention.copy(attentionReason = "The prompt is still waiting.")
+
+        assertEquals(
+            OverlayPanelMode.ATTENTION,
+            nextOverlayPanelMode(OverlayPanelMode.WORKING, working, attention),
+        )
+        assertEquals(
+            OverlayPanelMode.BUBBLE,
+            nextOverlayPanelMode(OverlayPanelMode.BUBBLE, attention, attentionUpdate),
+        )
+    }
+
+    @Test
+    fun `bubble expansion opens active work and never an idle composer`() {
+        assertEquals(
+            OverlayPanelMode.WORKING,
+            overlayPanelModeForUserExpand(runningState("Working")),
+        )
+        assertEquals(
+            OverlayPanelMode.ATTENTION,
+            overlayPanelModeForUserExpand(runningState("Needs your attention")),
+        )
+        assertEquals(
+            OverlayPanelMode.COMPOSER,
+            overlayPanelModeForUserExpand(SessionState.Idle),
+        )
+    }
+
+    @Test
+    fun `active terminal transition shows result even after collapse`() {
+        val running = runningState("Working")
+        val stopped = SessionState.Stopped(
+            sessionId = running.sessionId,
+            reason = "Stopped from the notification.",
+        )
+
+        assertEquals(
+            OverlayPanelMode.RESULT,
+            nextOverlayPanelMode(OverlayPanelMode.BUBBLE, running, stopped),
+        )
+    }
+
+    private fun runningState(purpose: String): SessionState.Running =
+        SessionState.Running(
+            sessionId = "overlay-test-session",
+            request = "Test request",
+            currentPurpose = purpose,
+            startedAtEpochMs = 0L,
+        )
 }

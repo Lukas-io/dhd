@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
+import android.view.Surface
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
@@ -24,7 +25,9 @@ import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.phonecontrol.assistant.MainActivity
 import com.phonecontrol.assistant.data.DHD_CONVERSATION_ID
+import com.phonecontrol.assistant.developer.TaskPreviewState
 import com.phonecontrol.assistant.domain.ReasoningEffort
+import com.phonecontrol.assistant.execution.TaskDisplaySession
 import com.phonecontrol.assistant.session.AssistantForegroundService
 import com.phonecontrol.assistant.session.SessionCoordinator
 import com.phonecontrol.assistant.session.SessionState
@@ -42,11 +45,19 @@ class OverlayWindowController(
     context: Context,
     private val coordinator: SessionCoordinator,
     private val visibilityGate: OverlayVisibilityGate,
+    private val taskPreviewState: StateFlow<TaskPreviewState>,
+    private val onTaskPreviewSurfaceAvailable: (TaskDisplaySession, Surface) -> Unit,
+    private val onTaskPreviewSurfaceDestroyed: (TaskDisplaySession, Surface) -> Unit,
 ) {
+    private companion object {
+        const val BUBBLE_SIZE_DP = 64
+    }
+
     private val appContext = context.applicationContext
     private val windowManager = appContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private val _panelMode = MutableStateFlow(OverlayPanelMode.BUBBLE)
     private val _resultMessage = MutableStateFlow<String?>(null)
+    private val _glowTrigger = MutableStateFlow(0L)
 
     private var panelView: ComposeView? = null
     private var glowView: ComposeView? = null
@@ -57,15 +68,29 @@ class OverlayWindowController(
 
     val panelMode: StateFlow<OverlayPanelMode> = _panelMode.asStateFlow()
     val resultMessage: StateFlow<String?> = _resultMessage.asStateFlow()
+    val glowTrigger: StateFlow<Long> = _glowTrigger.asStateFlow()
 
     fun show(): Boolean {
-        if (!Settings.canDrawOverlays(appContext)) return false
-        if (panelView == null || glowView == null) {
+        if (!Settings.canDrawOverlays(appContext)) {
+            if (panelView != null || glowView != null || panelParams != null || viewTreeOwner != null) {
+                removeViews()
+            }
+            return false
+        }
+        val viewsAttached = panelView?.isAttachedToWindow == true && glowView?.isAttachedToWindow == true
+        if (!viewsAttached || panelParams == null || viewTreeOwner == null) {
+            if (panelView != null || glowView != null || panelParams != null || viewTreeOwner != null) {
+                removeViews()
+            }
             createViews()
         }
+        if (panelView == null || glowView == null || panelParams == null) return false
         onSessionState(coordinator.state.value)
+        // onSessionState may be a no-op when the state and panel mode survived a
+        // view recreation; always reconcile the new window with that mode.
+        updatePanelLayout(_panelMode.value != OverlayPanelMode.BUBBLE)
         setHidden(hidden)
-        return panelView != null && glowView != null
+        return true
     }
 
     fun hide() {
@@ -86,35 +111,42 @@ class OverlayWindowController(
     }
 
     fun onSessionState(state: SessionState) {
-        val wasActive = lastState.isActiveForOverlay()
-        val isActive = state.isActiveForOverlay()
+        val previousState = lastState
         lastState = state
+        val isActive = state.isActiveForOverlay()
+        val nextMode = nextOverlayPanelMode(_panelMode.value, previousState, state)
 
-        when {
-            isActive -> {
-                _resultMessage.value = null
-                setPanelMode(
-                    if (state.needsAttention()) OverlayPanelMode.ATTENTION else OverlayPanelMode.WORKING,
-                )
+        if (isActive) {
+            _resultMessage.value = null
+        } else if (previousState.isActiveForOverlay() && state is SessionState.Completed) {
+            _resultMessage.value = state.message
+        } else if (previousState.isActiveForOverlay() && state is SessionState.Stopped) {
+            _resultMessage.value = state.reason
+        }
+        if (state is SessionState.Completed || state is SessionState.Stopped) {
+            if (previousState.isActiveForOverlay()) {
+                setPanelMode(nextMode)
             }
-            wasActive && state is SessionState.Completed -> {
-                _resultMessage.value = state.message
-                setPanelMode(OverlayPanelMode.RESULT)
-            }
-            wasActive && state is SessionState.Stopped -> {
-                _resultMessage.value = state.reason
-                setPanelMode(OverlayPanelMode.RESULT)
-            }
+        } else if (isActive) {
+            setPanelMode(nextMode)
         }
     }
 
     fun openComposer() {
-        if (coordinator.state.value.isActiveForOverlay()) return
+        val state = coordinator.state.value
+        _glowTrigger.value = System.currentTimeMillis()
+        if (state.isActiveForOverlay()) {
+            setPanelMode(overlayPanelModeForUserExpand(state))
+            return
+        }
         _resultMessage.value = null
+        panelView?.clearFocus()
+        hideKeyboard()
         setPanelMode(OverlayPanelMode.COMPOSER)
     }
 
     fun showBubble() {
+        panelView?.clearFocus()
         hideKeyboard()
         setPanelMode(OverlayPanelMode.BUBBLE)
     }
@@ -129,8 +161,8 @@ class OverlayWindowController(
             y = params.y + deltaY.roundToInt(),
             displayWidth = metrics.widthPixels,
             displayHeight = metrics.heightPixels,
-            bubbleWidth = params.width.takeIf { it > 0 } ?: dp(64),
-            bubbleHeight = params.height.takeIf { it > 0 } ?: dp(64),
+            bubbleWidth = params.width.takeIf { it > 0 } ?: bubbleSizePx(),
+            bubbleHeight = params.height.takeIf { it > 0 } ?: bubbleSizePx(),
             topInset = insets.top,
             bottomInset = insets.bottom,
         )
@@ -141,16 +173,27 @@ class OverlayWindowController(
     }
 
     private fun setPanelMode(mode: OverlayPanelMode) {
-        if (_panelMode.value == mode) return
+        val changed = _panelMode.value != mode
         _panelMode.value = mode
         updatePanelLayout(mode != OverlayPanelMode.BUBBLE)
+        if (changed) {
+            // WindowManager may measure the old Compose content before the state
+            // flow recomposition lands. Reconcile once more on the next UI turn.
+            panelView?.post {
+                if (_panelMode.value == mode) {
+                    updatePanelLayout(mode != OverlayPanelMode.BUBBLE)
+                }
+            }
+        }
     }
 
     private fun createViews() {
         if (!Settings.canDrawOverlays(appContext)) return
         val colors = assistantColors()
         val lifecycleOwner = OverlayViewTreeOwner()
+        val initialVisibility = if (hidden) View.GONE else View.VISIBLE
         val panel = ComposeView(appContext).apply {
+            visibility = initialVisibility
             setViewTreeLifecycleOwner(lifecycleOwner)
             setViewTreeSavedStateRegistryOwner(lifecycleOwner)
             setContent {
@@ -166,32 +209,57 @@ class OverlayWindowController(
                         onDrag = ::moveBubble,
                         onStop = ::stopSession,
                         onContinueInDhd = ::continueInDhd,
+                        onCollapse = ::showBubble,
+                        taskPreviewState = taskPreviewState,
+                        onTaskPreviewSurfaceAvailable = onTaskPreviewSurfaceAvailable,
+                        onTaskPreviewSurfaceDestroyed = onTaskPreviewSurfaceDestroyed,
                     )
                 }
             }
         }
+        val screenBounds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = windowManager.maximumWindowMetrics.bounds
+            android.graphics.Rect(0, 0, bounds.width(), bounds.height())
+        } else {
+            val metrics = android.util.DisplayMetrics()
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.getRealMetrics(metrics)
+            android.graphics.Rect(0, 0, metrics.widthPixels, metrics.heightPixels)
+        }
         val glow = ComposeView(appContext).apply {
+            fitsSystemWindows = false
+            visibility = initialVisibility
             setViewTreeLifecycleOwner(lifecycleOwner)
             setViewTreeSavedStateRegistryOwner(lifecycleOwner)
             setContent {
                 CompositionLocalProvider(LocalAssistantColors provides colors) {
                     OverlayGlow(
                         sessionState = coordinator.state,
+                        panelMode = panelMode,
+                        glowTrigger = glowTrigger,
                         hidden = visibilityGate.hidden,
                     )
                 }
             }
         }
         val glowLayout = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
+            screenBounds.width(),
+            screenBounds.height(),
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
         }
         val savedPosition = OverlayPreferences.bubblePosition(appContext)
         val insets = bubbleInsets()
@@ -200,8 +268,8 @@ class OverlayWindowController(
             y = savedPosition.y,
             displayWidth = appContext.resources.displayMetrics.widthPixels,
             displayHeight = appContext.resources.displayMetrics.heightPixels,
-            bubbleWidth = dp(64),
-            bubbleHeight = dp(64),
+            bubbleWidth = bubbleSizePx(),
+            bubbleHeight = bubbleSizePx(),
             topInset = insets.top,
             bottomInset = insets.bottom,
         )
@@ -246,7 +314,8 @@ class OverlayWindowController(
             params.y = 0
             params.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-            params.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+            params.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN or
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
         } else {
             val savedPosition = OverlayPreferences.bubblePosition(appContext)
             val insets = bubbleInsets()
@@ -255,8 +324,8 @@ class OverlayWindowController(
                 y = savedPosition.y,
                 displayWidth = appContext.resources.displayMetrics.widthPixels,
                 displayHeight = appContext.resources.displayMetrics.heightPixels,
-                bubbleWidth = dp(64),
-                bubbleHeight = dp(64),
+                bubbleWidth = bubbleSizePx(),
+                bubbleHeight = bubbleSizePx(),
                 topInset = insets.top,
                 bottomInset = insets.bottom,
             )
@@ -268,7 +337,8 @@ class OverlayWindowController(
             params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-            params.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+            params.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN or
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
         }
         runCatching { windowManager.updateViewLayout(panel, params) }
     }
@@ -328,9 +398,14 @@ class OverlayWindowController(
     }
 
     private fun hideKeyboard() {
-        panelView?.windowToken?.let { token ->
-            appContext.getSystemService(InputMethodManager::class.java)
-                ?.hideSoftInputFromWindow(token, 0)
+        panelView?.let { view ->
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                view.windowInsetsController?.hide(android.view.WindowInsets.Type.ime())
+            }
+            view.windowToken?.let { token ->
+                appContext.getSystemService(InputMethodManager::class.java)
+                    ?.hideSoftInputFromWindow(token, 0)
+            }
         }
     }
 
@@ -349,6 +424,8 @@ class OverlayWindowController(
 
     private fun dp(value: Int): Int =
         (value * appContext.resources.displayMetrics.density).roundToInt()
+
+    private fun bubbleSizePx(): Int = dp(BUBBLE_SIZE_DP)
 
     private fun bubbleInsets(): BubbleInsets {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return BubbleInsets()
@@ -397,4 +474,49 @@ private fun SessionState.needsAttention(): Boolean =
         is SessionState.Running -> currentPurpose.equals("Needs your attention", ignoreCase = true)
         is SessionState.Paused -> currentPurpose.equals("Needs your attention", ignoreCase = true)
         else -> false
+    }
+
+private fun SessionState.overlaySessionIdOrNull(): String? = when (this) {
+    is SessionState.Running -> sessionId
+    is SessionState.Paused -> sessionId
+    is SessionState.Stopped -> sessionId
+    is SessionState.Completed -> sessionId
+    SessionState.Idle -> null
+}
+
+internal fun nextOverlayPanelMode(
+    currentMode: OverlayPanelMode,
+    previousState: SessionState,
+    state: SessionState,
+): OverlayPanelMode {
+    val wasActive = previousState.isActiveForOverlay()
+    val isActive = state.isActiveForOverlay()
+    if (isActive) {
+        val newSession = !wasActive ||
+            previousState.overlaySessionIdOrNull() != state.overlaySessionIdOrNull()
+        val attentionStarted = state.needsAttention() && !previousState.needsAttention()
+        return when {
+            attentionStarted -> OverlayPanelMode.ATTENTION
+            newSession -> if (state.needsAttention()) {
+                OverlayPanelMode.ATTENTION
+            } else {
+                OverlayPanelMode.WORKING
+            }
+            currentMode == OverlayPanelMode.BUBBLE -> OverlayPanelMode.BUBBLE
+            state.needsAttention() -> OverlayPanelMode.ATTENTION
+            else -> OverlayPanelMode.WORKING
+        }
+    }
+    return if (wasActive && (state is SessionState.Completed || state is SessionState.Stopped)) {
+        OverlayPanelMode.RESULT
+    } else {
+        currentMode
+    }
+}
+
+internal fun overlayPanelModeForUserExpand(state: SessionState): OverlayPanelMode =
+    if (state.isActiveForOverlay()) {
+        if (state.needsAttention()) OverlayPanelMode.ATTENTION else OverlayPanelMode.WORKING
+    } else {
+        OverlayPanelMode.COMPOSER
     }

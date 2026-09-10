@@ -1,51 +1,59 @@
 package com.phonecontrol.assistant.overlay
 
-import androidx.compose.foundation.BorderStroke
+import android.os.Build
+import android.view.Surface as AndroidSurface
+import android.provider.Settings
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalTextToolbar
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.TextToolbar
+import androidx.compose.ui.platform.TextToolbarStatus
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
@@ -54,55 +62,384 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
+import com.phonecontrol.assistant.developer.TaskPreviewState
+import com.phonecontrol.assistant.domain.ReasoningEffort
+import com.phonecontrol.assistant.execution.TaskDisplaySession
 import com.phonecontrol.assistant.session.DhdToolCall
 import com.phonecontrol.assistant.session.DhdToolCallStatus
 import com.phonecontrol.assistant.session.SessionState
+import com.phonecontrol.assistant.ui.AssistantColorScheme
+import com.phonecontrol.assistant.ui.FastModeButton
+import com.phonecontrol.assistant.ui.LiveDisplayPreview
+import com.phonecontrol.assistant.ui.LiveDisplayPreviewState
 import com.phonecontrol.assistant.ui.LocalAssistantColors
+import com.phonecontrol.assistant.ui.ReasoningEffortButton
+import com.phonecontrol.assistant.ui.ReasoningEffortTrack
 import kotlinx.coroutines.flow.StateFlow
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.exp
+import kotlin.math.pow
+import kotlin.math.roundToInt
+import kotlin.math.sin
+import kotlin.random.Random
 
-enum class OverlayPanelMode {
-    BUBBLE,
-    COMPOSER,
-    WORKING,
-    ATTENTION,
-    RESULT,
+enum class OverlayPanelMode { BUBBLE, COMPOSER, WORKING, ATTENTION, RESULT }
+
+private const val MAX_DRAFT_LENGTH = 4_000
+
+@Composable
+private fun motionPhase(
+    label: String,
+    duration: Int = 6_000,
+    enabled: Boolean = true,
+): State<Float> {
+    val context = LocalContext.current
+    val systemScale = remember(context) {
+        runCatching {
+            Settings.Global.getFloat(
+                context.contentResolver,
+                Settings.Global.ANIMATOR_DURATION_SCALE,
+                1f,
+            )
+        }.getOrDefault(1f)
+    }
+    val shouldAnimate = enabled && systemScale > 0f
+    if (!shouldAnimate) {
+        return remember(label) { mutableStateOf(0f) }
+    }
+    val scaledDuration = (duration * systemScale.coerceIn(0.1f, 2f))
+        .roundToInt()
+        .coerceAtLeast(1)
+    val motion = rememberInfiniteTransition(label = label)
+    val animationSpec: InfiniteRepeatableSpec<Float> = infiniteRepeatable(
+        animation = tween<Float>(scaledDuration, easing = LinearEasing),
+    )
+    return motion.animateFloat(
+        initialValue = 0f,
+        targetValue = (2 * PI).toFloat(),
+        animationSpec = animationSpec,
+        label = label,
+    )
 }
+
+private data class StardustParticle(
+    val xRatio: Float,
+    val yRatio: Float,
+    val radiusDp: Float,
+    val baseAlpha: Float,
+    val floatSpeedDp: Float,
+    val swayAmplitudeDp: Float,
+    val twinklePhase: Float,
+)
 
 @Composable
 fun OverlayGlow(
     sessionState: StateFlow<SessionState>,
+    panelMode: StateFlow<OverlayPanelMode>,
+    glowTrigger: StateFlow<Long>,
     hidden: StateFlow<Boolean>,
 ) {
     val state by sessionState.collectAsState()
+    val mode by panelMode.collectAsState()
     val isHidden by hidden.collectAsState()
-    val colors = LocalAssistantColors.current
-    val active = state is SessionState.Running || state is SessionState.Paused
-    if (!active || isHidden) return
+    val trigger by glowTrigger.collectAsState()
 
-    val attention = state.needsAttention()
-    val glowColor = if (attention) colors.warningAmber else colors.accentBlue
-    val transition = rememberInfiniteTransition(label = "dhd-edge-glow")
-    val outerAlpha by transition.animateFloat(
-        initialValue = 0.12f,
-        targetValue = 0.38f,
-        animationSpec = infiniteRepeatable(tween(1_200), RepeatMode.Reverse),
-        label = "dhd-edge-glow-alpha",
-    )
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(2.dp)
-            .border(
-                BorderStroke(10.dp, glowColor.copy(alpha = outerAlpha)),
-                RoundedCornerShape(34.dp),
+    val isComposerOpen = mode != OverlayPanelMode.BUBBLE
+    val anim = remember { Animatable(1f) }
+
+    LaunchedEffect(trigger, mode) {
+        if (!isHidden && isComposerOpen) {
+            anim.snapTo(0f)
+            anim.animateTo(
+                targetValue = 1f,
+                animationSpec = tween(durationMillis = 2_600, easing = LinearEasing),
             )
-            .border(
-                BorderStroke(2.dp, glowColor.copy(alpha = 0.82f)),
-                RoundedCornerShape(34.dp),
+        } else {
+            anim.snapTo(1f)
+        }
+    }
+
+    val progress = anim.value
+    if (progress >= 1f || isHidden || !isComposerOpen) return
+
+    // Organic liquid alpha curve: liquid pour-in (0.0 -> 0.18), fluid slosh/shimmer (0.18 -> 0.42), viscous decay (0.42 -> 1.0)
+    val overallAlpha = when {
+        progress < 0.18f -> (progress / 0.18f).pow(0.85f)
+        progress <= 0.42f -> 1f
+        else -> {
+            val decay = (progress - 0.42f) / 0.58f
+            (1f - decay).pow(2.0f)
+        }
+    }.coerceIn(0f, 1f)
+
+    if (overallAlpha <= 0.005f) return
+
+    val colors = LocalAssistantColors.current
+    val view = LocalView.current
+    val density = LocalDensity.current
+    val attention = state.needsAttention()
+
+    val deviceCornerRadius = remember(view) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            runCatching {
+                val insets = view.rootWindowInsets
+                insets?.getRoundedCorner(android.view.RoundedCorner.POSITION_TOP_LEFT)?.radius?.toFloat()
+            }.getOrNull()
+        } else null
+    }
+    val cornerRadiusPx = deviceCornerRadius?.takeIf { it > 0f }
+        ?: with(density) { 34.dp.toPx() }
+
+    // Multi-color spectrum from Gemini:
+    // Right (Green) -> Bottom-Right (Purple) -> Bottom (Coral Red) -> Bottom-Left (Amber) -> Left (Blue) -> Top (Cyan)
+    val colorGreen = if (attention) colors.warningAmber else Color(0xFF10B981)
+    val colorPurple = if (attention) colors.warningAmber else Color(0xFF8B5CF6)
+    val colorCoral = if (attention) colors.warningAmber else Color(0xFFEF4444)
+    val colorAmber = if (attention) colors.warningAmber else Color(0xFFF59E0B)
+    val colorBlue = if (attention) colors.warningAmber else Color(0xFF2563EB)
+    val colorCyan = if (attention) colors.warningAmber else Color(0xFF06B6D4)
+
+    val stardust = remember {
+        val random = Random(2026)
+        List(75) {
+            StardustParticle(
+                xRatio = 0.05f + random.nextFloat() * 0.90f,
+                yRatio = 0.58f + random.nextFloat() * 0.40f,
+                radiusDp = 0.8f + random.nextFloat() * 1.5f,
+                baseAlpha = 0.35f + random.nextFloat() * 0.55f,
+                floatSpeedDp = 20f + random.nextFloat() * 32f,
+                swayAmplitudeDp = 5f + random.nextFloat() * 10f,
+                twinklePhase = random.nextFloat() * 6.28f,
+            )
+        }
+    }
+
+    Canvas(Modifier.fillMaxSize()) {
+        // 1. 360 SOFT AMBIENT LIGHT BLEED (NOT A LINE - pure inward diffusion from physical screen bezels)
+        // Bleeds 28dp inward from screen edges, fading smoothly to 0 opacity with no hard stroke line
+        val edgeBleedWidth = with(density) { (24.dp + 4.dp * sin(progress * 4f)).toPx() }
+        val topBleedHeight = with(density) { 32.dp.toPx() }
+
+        // Left Edge Ambient Light Bleed (Electric Blue & Amber)
+        drawRect(
+            brush = Brush.horizontalGradient(
+                colors = listOf(
+                    colorBlue.copy(alpha = 0.30f * overallAlpha),
+                    colorBlue.copy(alpha = 0.12f * overallAlpha),
+                    Color.Transparent,
+                ),
+                startX = 0f,
+                endX = edgeBleedWidth,
             ),
-    )
+            topLeft = Offset.Zero,
+            size = Size(edgeBleedWidth, size.height),
+        )
+
+        // Right Edge Ambient Light Bleed (Emerald Green & Purple)
+        drawRect(
+            brush = Brush.horizontalGradient(
+                colors = listOf(
+                    Color.Transparent,
+                    colorGreen.copy(alpha = 0.12f * overallAlpha),
+                    colorGreen.copy(alpha = 0.28f * overallAlpha),
+                ),
+                startX = size.width - edgeBleedWidth,
+                endX = size.width,
+            ),
+            topLeft = Offset(size.width - edgeBleedWidth, 0f),
+            size = Size(edgeBleedWidth, size.height),
+        )
+
+        // Top Edge Ambient Light Bleed (Cyan / Status bar glow)
+        drawRect(
+            brush = Brush.verticalGradient(
+                colors = listOf(
+                    colorCyan.copy(alpha = 0.24f * overallAlpha),
+                    colorCyan.copy(alpha = 0.08f * overallAlpha),
+                    Color.Transparent,
+                ),
+                startY = 0f,
+                endY = topBleedHeight,
+            ),
+            topLeft = Offset.Zero,
+            size = Size(size.width, topBleedHeight),
+        )
+
+        // Top-Left Corner Ambient Light Bleed
+        val cornerRadius = cornerRadiusPx * 1.6f
+        drawCircle(
+            brush = Brush.radialGradient(
+                colors = listOf(
+                    colorCyan.copy(alpha = 0.30f * overallAlpha),
+                    colorBlue.copy(alpha = 0.14f * overallAlpha),
+                    Color.Transparent,
+                ),
+                center = Offset(0f, 0f),
+                radius = cornerRadius,
+            ),
+            radius = cornerRadius,
+            center = Offset(0f, 0f),
+        )
+
+        // Top-Right Corner Ambient Light Bleed
+        drawCircle(
+            brush = Brush.radialGradient(
+                colors = listOf(
+                    colorGreen.copy(alpha = 0.28f * overallAlpha),
+                    colorPurple.copy(alpha = 0.12f * overallAlpha),
+                    Color.Transparent,
+                ),
+                center = Offset(size.width, 0f),
+                radius = cornerRadius,
+            ),
+            radius = cornerRadius,
+            center = Offset(size.width, 0f),
+        )
+
+        // 3. MORE AT THE BOTTOM: Rich flowing liquid light pool
+        val waveTime = progress * 2.2f * PI.toFloat()
+        val waveHeightPx = with(density) { 16.dp.toPx() }
+        val liquidSurge = sin(progress * PI.toFloat()).pow(0.75f)
+        val liquidBaseHeight = with(density) { 260.dp.toPx() } * (0.85f + 0.25f * liquidSurge)
+
+        val wavePath = Path().apply {
+            moveTo(0f, size.height)
+            val startY = size.height - liquidBaseHeight + sin(waveTime) * waveHeightPx
+            lineTo(0f, startY)
+            val segments = 20
+            for (i in 1..segments) {
+                val segX = size.width * (i.toFloat() / segments)
+                val normX = i.toFloat() / segments
+                val waveY = size.height - liquidBaseHeight +
+                    sin(waveTime * 1.4f + normX * 5.8f) * waveHeightPx +
+                    cos(waveTime * 2.0f + normX * 8.6f) * (waveHeightPx * 0.5f)
+                lineTo(segX, waveY)
+            }
+            lineTo(size.width, size.height)
+            close()
+        }
+
+        // Fill flowing liquid body with vertical gradient
+        drawPath(
+            path = wavePath,
+            brush = Brush.verticalGradient(
+                colors = listOf(
+                    Color.Transparent,
+                    colorCoral.copy(alpha = 0.12f * overallAlpha),
+                    colorAmber.copy(alpha = 0.26f * overallAlpha),
+                    colorCoral.copy(alpha = 0.38f * overallAlpha),
+                ),
+                startY = size.height - liquidBaseHeight - waveHeightPx,
+                endY = size.height,
+            ),
+        )
+
+        // Deep bottom radial light blooms (expanded coverage, liquid radiance)
+        val bottomRadius = size.width * 0.85f
+
+        // Bottom-Left Liquid Bloom (Amber & Electric Blue)
+        drawCircle(
+            brush = Brush.radialGradient(
+                colors = listOf(
+                    colorAmber.copy(alpha = 0.50f * overallAlpha),
+                    colorBlue.copy(alpha = 0.28f * overallAlpha),
+                    Color.Transparent,
+                ),
+                center = Offset(size.width * 0.05f, size.height),
+                radius = bottomRadius,
+            ),
+            radius = bottomRadius,
+            center = Offset(size.width * 0.05f, size.height),
+        )
+
+        // Bottom-Center Liquid Bloom (Warm Coral Red & Crimson)
+        val centerBottomRadius = size.width * 0.72f
+        drawCircle(
+            brush = Brush.radialGradient(
+                colors = listOf(
+                    colorCoral.copy(alpha = 0.48f * overallAlpha),
+                    Color(0xFFE11D48).copy(alpha = 0.26f * overallAlpha),
+                    Color.Transparent,
+                ),
+                center = Offset(size.width * 0.5f, size.height),
+                radius = centerBottomRadius,
+            ),
+            radius = centerBottomRadius,
+            center = Offset(size.width * 0.5f, size.height),
+        )
+
+        // Bottom-Right Liquid Bloom (Violet & Emerald Green)
+        drawCircle(
+            brush = Brush.radialGradient(
+                colors = listOf(
+                    colorPurple.copy(alpha = 0.48f * overallAlpha),
+                    colorGreen.copy(alpha = 0.24f * overallAlpha),
+                    Color.Transparent,
+                ),
+                center = Offset(size.width * 0.95f, size.height),
+                radius = bottomRadius,
+            ),
+            radius = bottomRadius,
+            center = Offset(size.width * 0.95f, size.height),
+        )
+
+        // Right Edge subtle fluid accent
+        val rightRadius = size.width * 0.45f
+        drawCircle(
+            brush = Brush.radialGradient(
+                colors = listOf(
+                    colorGreen.copy(alpha = 0.20f * overallAlpha),
+                    Color.Transparent,
+                ),
+                center = Offset(size.width, size.height * 0.38f),
+                radius = rightRadius,
+            ),
+            radius = rightRadius,
+            center = Offset(size.width, size.height * 0.38f),
+        )
+
+        // Subtle Top / Status bar accent (very thin and light)
+        val topGlowHeight = with(density) { 40.dp.toPx() }
+        drawRect(
+            brush = Brush.verticalGradient(
+                colors = listOf(
+                    colorCyan.copy(alpha = 0.08f * overallAlpha),
+                    Color.Transparent,
+                ),
+                startY = 0f,
+                endY = topGlowHeight,
+            ),
+            topLeft = Offset.Zero,
+            size = Size(size.width, topGlowHeight),
+        )
+
+        // 4. Subtle Monochrome White Starlight Specks (clean, gentle floating star dust)
+        val stardustColor = Color.White
+        for (star in stardust) {
+            val swayPx = with(density) {
+                (sin(progress * 4f + star.twinklePhase) * star.swayAmplitudeDp).dp.toPx()
+            }
+            val x = star.xRatio * size.width + swayPx
+            val y = star.yRatio * size.height - with(density) { (progress * star.floatSpeedDp).dp.toPx() }
+            val twinkle = (sin(progress * 10f + star.twinklePhase) + 1f) / 2f
+            val dotAlpha = (star.baseAlpha * overallAlpha * (0.40f + 0.60f * twinkle)).coerceIn(0f, 1f)
+
+            if (dotAlpha > 0.02f && y in 0f..size.height && x in 0f..size.width) {
+                drawCircle(
+                    color = stardustColor.copy(alpha = dotAlpha),
+                    radius = with(density) { star.radiusDp.dp.toPx() },
+                    center = Offset(x, y),
+                )
+            }
+        }
+    }
 }
 
 @Composable
@@ -117,46 +454,386 @@ fun OverlayPanel(
     onDrag: (Float, Float) -> Unit,
     onStop: () -> Unit,
     onContinueInDhd: () -> Unit,
+    onCollapse: () -> Unit,
+    taskPreviewState: StateFlow<TaskPreviewState>,
+    onTaskPreviewSurfaceAvailable: (TaskDisplaySession, AndroidSurface) -> Unit,
+    onTaskPreviewSurfaceDestroyed: (TaskDisplaySession, AndroidSurface) -> Unit,
 ) {
     val state by sessionState.collectAsState()
     val calls by toolCalls.collectAsState()
     val mode by panelMode.collectAsState()
     val result by resultMessage.collectAsState()
-    val colors = LocalAssistantColors.current
+    val previewState by taskPreviewState.collectAsState()
     val active = state is SessionState.Running || state is SessionState.Paused
+    val context = LocalContext.current
+    val preferences = remember(context) {
+        context.getSharedPreferences(OverlayPreferences.PREFS_NAME, android.content.Context.MODE_PRIVATE)
+    }
+    var previewVisible by rememberSaveable { mutableStateOf(false) }
+    var fastMode by rememberSaveable {
+        mutableStateOf(preferences.getBoolean(OverlayPreferences.KEY_FAST_MODE, false))
+    }
+    var reasoningEffortValue by rememberSaveable {
+        mutableStateOf(
+            ReasoningEffort.fromStorage(
+                preferences.getString(
+                    OverlayPreferences.KEY_REASONING_EFFORT,
+                    ReasoningEffort.default.storageValue,
+                ),
+            ).storageValue,
+        )
+    }
+    val visibleReasoningEfforts = remember(
+        preferences.getString(OverlayPreferences.KEY_VISIBLE_REASONING_EFFORTS, null),
+    ) {
+        reasoningEffortsFromStorage(
+            preferences.getString(OverlayPreferences.KEY_VISIBLE_REASONING_EFFORTS, null),
+        )
+    }
+    val reasoningEffort = ReasoningEffort.fromStorage(reasoningEffortValue)
+        .takeIf { it in visibleReasoningEfforts }
+        ?: visibleReasoningEfforts.first()
+    LaunchedEffect(reasoningEffortValue, reasoningEffort, visibleReasoningEfforts) {
+        if (reasoningEffortValue != reasoningEffort.storageValue) {
+            reasoningEffortValue = reasoningEffort.storageValue
+            preferences.edit()
+                .putString(OverlayPreferences.KEY_REASONING_EFFORT, reasoningEffort.storageValue)
+                .apply()
+        }
+    }
+    val setFastMode: (Boolean) -> Unit = { enabled ->
+        fastMode = enabled
+        preferences.edit().putBoolean(OverlayPreferences.KEY_FAST_MODE, enabled).apply()
+    }
+    val setReasoningEffort: (ReasoningEffort) -> Unit = { effort ->
+        if (effort in visibleReasoningEfforts) {
+            reasoningEffortValue = effort.storageValue
+            preferences.edit().putString(OverlayPreferences.KEY_REASONING_EFFORT, effort.storageValue).apply()
+        }
+    }
+
+    // An explicit collapse request wins over the session state. The perimeter glow is separate.
     val effectiveMode = when {
+        mode == OverlayPanelMode.BUBBLE -> OverlayPanelMode.BUBBLE
         active && state.needsAttention() -> OverlayPanelMode.ATTENTION
         active -> OverlayPanelMode.WORKING
         else -> mode
     }
 
-    when (effectiveMode) {
-        OverlayPanelMode.BUBBLE -> BubbleButton(
+    val focusManager = LocalFocusManager.current
+    LaunchedEffect(effectiveMode) {
+        if (effectiveMode == OverlayPanelMode.BUBBLE) {
+            focusManager.clearFocus(force = true)
+        }
+    }
+
+    if (effectiveMode == OverlayPanelMode.BUBBLE) {
+        BubbleButton(
             onClick = onExpand,
             onDrag = onDrag,
+            running = state is SessionState.Running,
+            attention = state.needsAttention(),
+            animated = state is SessionState.Running && !state.needsAttention(),
         )
-        OverlayPanelMode.COMPOSER -> ComposerSurface(
-            onSubmit = onSubmit,
-        )
-        OverlayPanelMode.WORKING -> WorkingSurface(
-            state = state,
-            calls = calls,
-            colors = colors,
-            onStop = onStop,
-            onContinueInDhd = onContinueInDhd,
-        )
-        OverlayPanelMode.ATTENTION -> AttentionSurface(
-            state = state,
-            calls = calls,
-            colors = colors,
-            onStop = onStop,
-            onContinueInDhd = onContinueInDhd,
-        )
-        OverlayPanelMode.RESULT -> ResultSurface(
-            message = result ?: terminalMessage(state),
-            colors = colors,
-            onNewRequest = onNewRequest,
-            onContinueInDhd = onContinueInDhd,
+        return
+    }
+
+    val colors = LocalAssistantColors.current
+    val density = LocalDensity.current
+    val imeBottom = WindowInsets.ime.getBottom(density)
+    val keyboardVisible = imeBottom > with(density) { 96.dp.toPx() }
+    val isCollapsedComposer = effectiveMode == OverlayPanelMode.COMPOSER && !keyboardVisible
+
+    val panelShape = if (isCollapsedComposer) CircleShape else RoundedCornerShape(28.dp)
+    val panelDescription = when (effectiveMode) {
+        OverlayPanelMode.COMPOSER -> "DHD assistant. Ready for a request."
+        OverlayPanelMode.RESULT -> "DHD assistant. Result ready."
+        OverlayPanelMode.ATTENTION -> "DHD assistant needs your attention."
+        OverlayPanelMode.WORKING -> "DHD assistant is working."
+        OverlayPanelMode.BUBBLE -> "DHD assistant."
+    }
+
+    val horizontalPadding = when {
+        isCollapsedComposer -> 36.dp
+        effectiveMode == OverlayPanelMode.COMPOSER -> 14.dp
+        else -> 12.dp
+    }
+    val bottomPadding = when {
+        isCollapsedComposer -> 10.dp
+        keyboardVisible -> 20.dp
+        else -> 16.dp
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+            .imePadding()
+            .padding(
+                start = horizontalPadding,
+                end = horizontalPadding,
+                top = 10.dp,
+                bottom = bottomPadding,
+            )
+            .semantics { contentDescription = panelDescription },
+        contentAlignment = Alignment.BottomCenter,
+    ) {
+        val composerWidthModifier = if (isCollapsedComposer) {
+            Modifier
+                .fillMaxWidth()
+                .widthIn(max = 320.dp)
+        } else {
+            Modifier
+                .fillMaxWidth()
+                .widthIn(max = 520.dp)
+        }
+
+        Box(
+            modifier = composerWidthModifier,
+            contentAlignment = Alignment.Center,
+        ) {
+            val glowOrbitPhase by motionPhase(
+                label = "composer-orbit-glow",
+                duration = 3_400,
+                enabled = true,
+            )
+            val glowBreathPhase by motionPhase(
+                label = "composer-ambient-glow",
+                duration = 4_500,
+                enabled = true,
+            )
+            val breath = 0.88f + 0.12f * sin(glowBreathPhase)
+            val glowBase = if (colors.isDark) Color.White else Color(0xFF1E293B)
+            val glowAccent = if (colors.isDark) Color(0xFF93C5FD) else Color(0xFF3B82F6)
+
+            val chromaticColors = if (state.needsAttention()) {
+                listOf(
+                    colors.warningAmber,
+                    Color(0xFFFBBF24),
+                    colors.warningAmber,
+                    Color(0xFFFBBF24),
+                    colors.warningAmber,
+                    Color(0xFFFBBF24),
+                )
+            } else {
+                listOf(
+                    Color(0xFF10B981), // Emerald Green
+                    Color(0xFF06B6D4), // Cyan
+                    Color(0xFF3B82F6), // Electric Blue
+                    Color(0xFF8B5CF6), // Purple
+                    Color(0xFFEF4444), // Coral Red
+                    Color(0xFFF59E0B), // Amber Gold
+                )
+            }
+
+            val shift = (glowOrbitPhase / (2 * PI.toFloat())) % 1f
+            val stops = List(17) { i ->
+                val frac = i.toFloat() / 16f
+                val sampleFrac = ((frac - shift) % 1f + 1f) % 1f
+                val scaled = sampleFrac * 6f
+                val idx = scaled.toInt() % 6
+                val nextIdx = (idx + 1) % 6
+                val blend = scaled - scaled.toInt()
+                val c1 = chromaticColors[idx]
+                val c2 = chromaticColors[nextIdx]
+                val baseRed = c1.red + (c2.red - c1.red) * blend
+                val baseGreen = c1.green + (c2.green - c1.green) * blend
+                val baseBlue = c1.blue + (c2.blue - c1.blue) * blend
+                val distFromHead = abs(((sampleFrac) % 1f + 1.5f) % 1f - 0.5f)
+                val pulse = (1f - distFromHead * 2f).coerceIn(0f, 1f).pow(2.2f) * 0.40f
+                val r = (baseRed + pulse).coerceAtMost(1f)
+                val g = (baseGreen + pulse).coerceAtMost(1f)
+                val b = (baseBlue + pulse).coerceAtMost(1f)
+                frac to Color(r, g, b)
+            }
+
+            Canvas(Modifier.matchParentSize()) {
+                val baseCornerPx = if (isCollapsedComposer) size.height / 2f else with(density) { 28.dp.toPx() }
+                val sweepBrush = Brush.sweepGradient(
+                    *stops.toTypedArray(),
+                    center = Offset(size.width / 2f, size.height / 2f),
+                )
+
+                // 1. Soft atmospheric outer ambient glow (14dp spread)
+                val outerSpread = with(density) { 14.dp.toPx() }
+                drawRoundRect(
+                    brush = Brush.radialGradient(
+                        colors = listOf(
+                            glowAccent.copy(alpha = 0.05f * breath),
+                            glowBase.copy(alpha = 0.02f * breath),
+                            Color.Transparent,
+                        ),
+                        center = Offset(size.width / 2f, size.height / 2f),
+                        radius = (size.width / 2f) + outerSpread,
+                    ),
+                    topLeft = Offset(-outerSpread, -outerSpread),
+                    size = Size(size.width + outerSpread * 2f, size.height + outerSpread * 2f),
+                    cornerRadius = CornerRadius(baseCornerPx + outerSpread),
+                )
+
+                // 2. Animated Orbiting Chromatic Glow (cycles colors around the capsule!)
+                // Layer A: Feathered outer chromatic halo (spread 4.5dp, stroke 5dp) - second line thingy!
+                val haloSpread = with(density) { 4.5.dp.toPx() }
+                drawRoundRect(
+                    brush = sweepBrush,
+                    topLeft = Offset(-haloSpread, -haloSpread),
+                    size = Size(size.width + haloSpread * 2f, size.height + haloSpread * 2f),
+                    cornerRadius = CornerRadius(baseCornerPx + haloSpread),
+                    style = Stroke(with(density) { 5.dp.toPx() }),
+                    alpha = 0.38f * breath,
+                )
+
+                // Layer B: Radiant core chromatic beam (spread 1.8dp, stroke 2.2dp)
+                val coreSpread = with(density) { 1.8.dp.toPx() }
+                drawRoundRect(
+                    brush = sweepBrush,
+                    topLeft = Offset(-coreSpread, -coreSpread),
+                    size = Size(size.width + coreSpread * 2f, size.height + coreSpread * 2f),
+                    cornerRadius = CornerRadius(baseCornerPx + coreSpread),
+                    style = Stroke(with(density) { 2.2.dp.toPx() }),
+                    alpha = 0.78f * breath,
+                )
+
+                // Layer C: Crisp luminous accent hugging the pill edge
+                val edgeSpread = with(density) { 0.4.dp.toPx() }
+                drawRoundRect(
+                    brush = sweepBrush,
+                    topLeft = Offset(-edgeSpread, -edgeSpread),
+                    size = Size(size.width + edgeSpread * 2f, size.height + edgeSpread * 2f),
+                    cornerRadius = CornerRadius(baseCornerPx + edgeSpread),
+                    style = Stroke(with(density) { 1.0.dp.toPx() }),
+                    alpha = 0.90f * breath,
+                )
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .shadow(24.dp, panelShape, clip = false)
+                    .clip(panelShape)
+                    .background(
+                        colors.composerBackground.copy(
+                            alpha = if (colors.isDark) 0.98f else 0.97f,
+                        ),
+                    )
+                    .border(
+                        width = 0.8.dp,
+                        color = colors.borderColor.copy(alpha = if (colors.isDark) 0.9f else 0.95f),
+                        shape = panelShape,
+                    ),
+            ) {
+            if (effectiveMode != OverlayPanelMode.COMPOSER) {
+                PanelHeader(
+                    mode = effectiveMode,
+                    orbWorking = state is SessionState.Running && !state.needsAttention(),
+                    orbAnimated = state !is SessionState.Paused && !state.needsAttention(),
+                    onCollapse = onCollapse,
+                    onIdentityClick = onContinueInDhd,
+                )
+            }
+
+            when (effectiveMode) {
+                    OverlayPanelMode.COMPOSER -> Composer(
+                        onSubmit = onSubmit,
+                        onContinueInDhd = onContinueInDhd,
+                        onCollapse = onCollapse,
+                        onShowPreview = { previewVisible = true },
+                        onHidePreview = { previewVisible = false },
+                        previewVisible = previewVisible,
+                        previewState = previewState,
+                        onTaskPreviewSurfaceAvailable = onTaskPreviewSurfaceAvailable,
+                        onTaskPreviewSurfaceDestroyed = onTaskPreviewSurfaceDestroyed,
+                        fastMode = fastMode,
+                        onSetFastMode = setFastMode,
+                        reasoningEffort = reasoningEffort,
+                        visibleReasoningEfforts = visibleReasoningEfforts,
+                        onSelectReasoningEffort = setReasoningEffort,
+                    )
+                    OverlayPanelMode.RESULT -> ResultContent(
+                        message = result ?: terminalMessage(state),
+                        state = state,
+                        onSubmit = onSubmit,
+                        onContinue = onContinueInDhd,
+                        onCollapse = onCollapse,
+                        onShowPreview = { previewVisible = true },
+                        onHidePreview = { previewVisible = false },
+                        previewVisible = previewVisible,
+                        previewState = previewState,
+                        onTaskPreviewSurfaceAvailable = onTaskPreviewSurfaceAvailable,
+                        onTaskPreviewSurfaceDestroyed = onTaskPreviewSurfaceDestroyed,
+                        fastMode = fastMode,
+                        onSetFastMode = setFastMode,
+                        reasoningEffort = reasoningEffort,
+                        visibleReasoningEfforts = visibleReasoningEfforts,
+                        onSelectReasoningEffort = setReasoningEffort,
+                    )
+                    OverlayPanelMode.WORKING,
+                    OverlayPanelMode.ATTENTION,
+                    -> WorkingContent(
+                        state = state,
+                        calls = calls,
+                        onStop = onStop,
+                    )
+                    OverlayPanelMode.BUBBLE -> Unit
+            }
+        }
+    }
+}
+}
+
+@Composable
+private fun PanelHeader(
+    mode: OverlayPanelMode,
+    orbWorking: Boolean,
+    orbAnimated: Boolean,
+    onCollapse: () -> Unit,
+    onIdentityClick: () -> Unit,
+) {
+    val showIdentity = mode != OverlayPanelMode.COMPOSER
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(
+                start = if (showIdentity) 16.dp else 4.dp,
+        end = 4.dp,
+                top = 2.dp,
+                bottom = 0.dp,
+            ),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (showIdentity) {
+            Box(
+                modifier = Modifier
+                    .size(32.dp)
+                    .clip(CircleShape)
+                    .clickable(
+                        role = Role.Button,
+                        onClickLabel = "Continue in DHD",
+                        onClick = onIdentityClick,
+                    )
+                    .semantics { contentDescription = "Continue in DHD" },
+                contentAlignment = Alignment.Center,
+            ) {
+                DhdIdentity(
+                    modifier = Modifier.fillMaxSize(),
+                    working = orbWorking,
+                    animated = orbAnimated,
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = "dhd",
+                color = LocalAssistantColors.current.textPrimary,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold,
+                letterSpacing = 0.2.sp,
+            )
+        }
+        Spacer(Modifier.weight(1f))
+        GlyphButton(
+            label = "Minimize assistant",
+            glyph = "down",
+            onClick = onCollapse,
         )
     }
 }
@@ -165,224 +842,519 @@ fun OverlayPanel(
 private fun BubbleButton(
     onClick: () -> Unit,
     onDrag: (Float, Float) -> Unit,
+    running: Boolean,
+    attention: Boolean,
+    animated: Boolean,
 ) {
-    val colors = LocalAssistantColors.current
-    Surface(
+    Box(
         modifier = Modifier
             .size(64.dp)
-            .semantics { contentDescription = "Open DHD overlay" }
-            .clickable(onClick = onClick)
+            .semantics { contentDescription = "Open DHD assistant. Drag to move." }
             .pointerInput(Unit) {
-                detectDragGestures { change, dragAmount ->
+                detectDragGestures { change, delta ->
                     change.consume()
-                    onDrag(dragAmount.x, dragAmount.y)
+                    onDrag(delta.x, delta.y)
                 }
             },
-        shape = CircleShape,
-        color = colors.composerBackground,
-        border = BorderStroke(2.dp, colors.accentBlue.copy(alpha = 0.8f)),
-        shadowElevation = 14.dp,
+        contentAlignment = Alignment.Center,
     ) {
-        Box(contentAlignment = Alignment.Center) {
-            Text(
-                text = "✦",
-                color = colors.accentBlue,
-                fontSize = 28.sp,
-                fontWeight = FontWeight.Bold,
+        DhdIdentity(
+            modifier = Modifier.fillMaxSize(),
+            working = running && !attention,
+            attention = attention,
+            animated = animated,
+        )
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .clickable(
+                    role = Role.Button,
+                    onClickLabel = "Open assistant",
+                    onClick = onClick,
+                )
+                .semantics { contentDescription = "Open DHD assistant" },
+        )
+    }
+}
+
+@Composable
+private fun DhdIdentity(
+    modifier: Modifier,
+    working: Boolean,
+    attention: Boolean = false,
+    animated: Boolean = true,
+) {
+    val colors = LocalAssistantColors.current
+    val phase by motionPhase(
+        label = "dhd-identity-" + if (working) "working" else "idle",
+        duration = if (working) 3_800 else 8_000,
+        enabled = animated,
+    )
+    val haloColor = if (attention) colors.warningAmber else colors.accentBlue
+
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        Canvas(Modifier.fillMaxSize()) {
+            val radius = size.minDimension * 0.48f
+            val breath = (sin(phase) + 1f) / 2f
+            drawCircle(
+                brush = Brush.radialGradient(
+                    colors = listOf(
+                        haloColor.copy(alpha = 0.18f + breath * 0.04f),
+                        Color.Transparent,
+                    ),
+                    radius = radius,
+                ),
+                radius = radius,
+                center = center,
             )
+            drawCircle(
+                color = haloColor.copy(alpha = 0.12f + breath * 0.05f),
+                radius = radius * 0.84f,
+                style = Stroke(1.1.dp.toPx()),
+            )
+            drawArc(
+                color = haloColor.copy(alpha = if (working) 0.38f else 0.2f),
+                startAngle = if (animated) phase * 57.29578f else -90f,
+                sweepAngle = if (working) 72f else 42f,
+                useCenter = false,
+                style = Stroke(1.2.dp.toPx(), cap = StrokeCap.Round),
+            )
+        }
+        DhdIcon(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(1.dp),
+        )
+    }
+}
+
+@Composable
+private fun DhdIcon(modifier: Modifier) {
+    val context = LocalContext.current
+    val icon = remember(context) {
+        context.packageManager.getApplicationIcon(context.packageName)
+    }
+    Box(
+        modifier = modifier.clip(CircleShape),
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(Modifier.fillMaxSize()) {
+            drawIntoCanvas { canvas ->
+                icon.setBounds(0, 0, size.width.toInt(), size.height.toInt())
+                icon.draw(canvas.nativeCanvas)
+            }
         }
     }
 }
 
 @Composable
-private fun ComposerSurface(
+private fun Composer(
     onSubmit: (String) -> Unit,
+    onContinueInDhd: () -> Unit,
+    onCollapse: () -> Unit,
+    onShowPreview: () -> Unit,
+    onHidePreview: () -> Unit,
+    previewVisible: Boolean,
+    previewState: TaskPreviewState,
+    onTaskPreviewSurfaceAvailable: (TaskDisplaySession, AndroidSurface) -> Unit,
+    onTaskPreviewSurfaceDestroyed: (TaskDisplaySession, AndroidSurface) -> Unit,
+    fastMode: Boolean,
+    onSetFastMode: (Boolean) -> Unit,
+    reasoningEffort: ReasoningEffort,
+    visibleReasoningEfforts: List<ReasoningEffort>,
+    onSelectReasoningEffort: (ReasoningEffort) -> Unit,
+    hint: String = "Ask DHD",
 ) {
     val colors = LocalAssistantColors.current
-    val focusManager = LocalFocusManager.current
     var draft by rememberSaveable { mutableStateOf("") }
+    var reasoningSelectorOpen by rememberSaveable { mutableStateOf(false) }
+    val focus = LocalFocusManager.current
+    val density = LocalDensity.current
+    val clipboardManager = LocalClipboardManager.current
+    val textToolbar = remember(clipboardManager) {
+        OverlayTextToolbar(clipboardManager) { clipText ->
+            draft = (draft + clipText).take(MAX_DRAFT_LENGTH)
+        }
+    }
+    val imeBottom = WindowInsets.ime.getBottom(density)
+    // Do not let the row appear during the IME's first few animation frames.
+    // That intermediate layout pass was what made the overlay bounce while the
+    // keyboard was opening and closing.
+    val keyboardVisible = imeBottom > with(density) { 96.dp.toPx() }
+
+    LaunchedEffect(keyboardVisible) {
+        if (!keyboardVisible) {
+            reasoningSelectorOpen = false
+            textToolbar.hide()
+        }
+    }
 
     fun submit() {
+        textToolbar.hide()
         val request = draft.trim()
-        if (request.isBlank()) return
+        if (request.isEmpty()) return
         draft = ""
-        focusManager.clearFocus()
+        focus.clearFocus()
         onSubmit(request)
     }
 
-    Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .navigationBarsPadding()
-            .imePadding()
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-        color = colors.composerBackground.copy(alpha = 0.97f),
-        shape = RoundedCornerShape(28.dp),
-        border = BorderStroke(1.dp, colors.borderColor),
-        shadowElevation = 18.dp,
-    ) {
+    CompositionLocalProvider(LocalTextToolbar provides textToolbar) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+        if (previewVisible) {
+            OverlayVirtualDisplayPreview(
+                previewState = previewState,
+                onHide = onHidePreview,
+                onContinue = onContinueInDhd,
+                onSurfaceAvailable = onTaskPreviewSurfaceAvailable,
+                onSurfaceDestroyed = onTaskPreviewSurfaceDestroyed,
+            )
+        }
+
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = 18.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
+                .padding(
+                    start = if (keyboardVisible) 14.dp else 12.dp,
+                    end = if (keyboardVisible) 14.dp else 12.dp,
+                    top = when {
+                        previewVisible -> 8.dp
+                        keyboardVisible -> 14.dp
+                        else -> 12.dp
+                    },
+                    bottom = if (keyboardVisible) 8.dp else 12.dp,
+                ),
+            verticalAlignment = if (keyboardVisible) Alignment.Top else Alignment.CenterVertically,
         ) {
+            Box(
+                modifier = Modifier
+                    .size(if (keyboardVisible) 42.dp else 48.dp)
+                    .pointerInput(onContinueInDhd, onCollapse, onShowPreview) {
+                        detectTapGestures(
+                            onTap = { onContinueInDhd() },
+                            onDoubleTap = {
+                                focus.clearFocus(force = true)
+                                onCollapse()
+                            },
+                            onLongPress = { onShowPreview() },
+                        )
+                    }
+                    .semantics {
+                        contentDescription =
+                            "DHD. Tap to continue in DHD, double tap to collapse, long press to show the virtual display."
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                DhdIdentity(
+                    modifier = Modifier.fillMaxSize(),
+                    working = false,
+                    // Keep the idle composer static. The working perimeter
+                    // glow carries the motion; a continuously invalidated
+                    // icon competes with the IME and live preview for frames.
+                    animated = false,
+                )
+            }
+            Spacer(Modifier.width(8.dp))
             BasicTextField(
                 value = draft,
-                onValueChange = { draft = it.take(4_000) },
+                onValueChange = { draft = it.take(MAX_DRAFT_LENGTH) },
                 modifier = Modifier
                     .weight(1f)
-                    .padding(vertical = 8.dp)
-                    .semantics { contentDescription = "Ask DHD input" },
+                    .then(
+                        if (keyboardVisible) {
+                            Modifier.heightIn(min = 38.dp, max = 126.dp)
+                        } else {
+                            Modifier
+                        }
+                    )
+                .semantics { contentDescription = "Message DHD assistant" },
                 textStyle = TextStyle(
                     color = colors.textPrimary,
                     fontSize = 16.sp,
                     lineHeight = 22.sp,
                 ),
+                cursorBrush = Brush.verticalGradient(
+                    listOf(colors.accentBlue, colors.accentBlue.copy(alpha = 0.55f)),
+                ),
                 minLines = 1,
-                maxLines = 5,
+                maxLines = if (keyboardVisible) 4 else 1,
                 keyboardOptions = KeyboardOptions(
                     capitalization = KeyboardCapitalization.Sentences,
                     keyboardType = KeyboardType.Text,
-                    imeAction = ImeAction.Send,
+                    imeAction = ImeAction.Default,
                 ),
                 keyboardActions = KeyboardActions(onSend = { submit() }),
-                decorationBox = { innerTextField ->
-                    Box {
-                        if (draft.isBlank()) {
+                decorationBox = { field ->
+                    Box(
+                        contentAlignment = if (keyboardVisible) Alignment.TopStart else Alignment.CenterStart,
+                        modifier = if (keyboardVisible) Modifier.padding(top = 8.dp) else Modifier,
+                    ) {
+                        if (draft.isEmpty()) {
                             Text(
-                                text = "Ask DHD",
+                                text = hint,
                                 color = colors.textSecondary,
                                 fontSize = 16.sp,
+                                lineHeight = 22.sp,
                             )
                         }
-                        innerTextField()
+                        field()
                     }
                 },
             )
-            Spacer(Modifier.width(10.dp))
-            Surface(
-                modifier = Modifier
-                    .size(42.dp)
-                    .clip(CircleShape)
-                    .clickable(enabled = draft.isNotBlank(), onClick = ::submit),
-                shape = CircleShape,
-                color = if (draft.isNotBlank()) colors.sendButtonActiveBg else colors.sendButtonInactiveBg,
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Text(
-                        text = "↑",
-                        color = if (draft.isNotBlank()) colors.sendButtonActiveIcon else colors.sendButtonInactiveIcon,
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.Bold,
-                    )
-                }
+            if (!keyboardVisible) {
+                Spacer(Modifier.width(8.dp))
+                GlyphButton(
+                    label = "Send request",
+                    glyph = "send",
+                    onClick = ::submit,
+                    enabled = draft.isNotBlank(),
+                    filled = true,
+                    buttonSize = 48.dp,
+                    iconSize = 24.dp,
+                )
             }
         }
-    }
-}
 
-@Composable
-private fun WorkingSurface(
-    state: SessionState,
-    calls: List<DhdToolCall>,
-    colors: com.phonecontrol.assistant.ui.AssistantColorScheme,
-    onStop: () -> Unit,
-    onContinueInDhd: () -> Unit,
-    attentionOverride: Boolean = false,
-) {
-    val sessionId = state.sessionIdOrNull()
-    val sessionCalls = calls.filter { it.sessionId == sessionId }
-    val currentCall = sessionCalls.lastOrNull { it.status == DhdToolCallStatus.RUNNING }
-    val currentPurpose = currentCall?.purpose ?: state.currentPurposeOrNull() ?: "Working on the phone"
-    val attention = attentionOverride || state.needsAttention()
-
-    Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .navigationBarsPadding()
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-        color = colors.composerBackground.copy(alpha = 0.97f),
-        shape = RoundedCornerShape(24.dp),
-        border = BorderStroke(1.dp, if (attention) colors.warningAmber else colors.accentBlue),
-        shadowElevation = 18.dp,
-    ) {
-        Column(
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = if (attention) "DHD needs your attention" else "DHD is working",
-                    color = if (attention) colors.warningAmber else colors.accentBlue,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.weight(1f),
-                )
-                Text(
-                    text = "⋯",
-                    color = colors.textSecondary,
-                    fontSize = 22.sp,
-                )
-            }
-            Text(
-                text = currentPurpose,
-                color = colors.textPrimary,
-                fontSize = 16.sp,
-                lineHeight = 22.sp,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-            if (sessionCalls.isNotEmpty()) {
-                LazyColumn(
-                    modifier = Modifier.heightIn(max = 174.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    items(sessionCalls.takeLast(3), key = { it.id }) { call ->
-                        ToolCallRow(call = call, colors = colors)
-                    }
-                }
-            }
+        if (keyboardVisible) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 14.dp, end = 12.dp, bottom = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Surface(
-                    modifier = Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(14.dp))
-                        .clickable(onClick = onContinueInDhd),
-                    color = colors.accentBlue,
-                    shape = RoundedCornerShape(14.dp),
+                Spacer(Modifier.weight(1f))
+                FastModeButton(
+                    enabled = true,
+                    selected = fastMode,
+                    onToggle = { onSetFastMode(!fastMode) },
+                )
+                Spacer(Modifier.width(8.dp))
+                ReasoningEffortButton(
+                    effort = reasoningEffort,
+                    visibleEfforts = visibleReasoningEfforts,
+                    enabled = true,
+                    expanded = reasoningSelectorOpen,
+                    onClick = { reasoningSelectorOpen = !reasoningSelectorOpen },
+                )
+                Spacer(Modifier.width(10.dp))
+                GlyphButton(
+                    label = "Send request",
+                    glyph = "send",
+                    onClick = ::submit,
+                    enabled = draft.isNotBlank(),
+                    filled = true,
+                    buttonSize = 36.dp,
+                    iconSize = 18.dp,
+                )
+            }
+            if (reasoningSelectorOpen) {
+                // This is deliberately a non-focusable popup. A selector that
+                // participates in the composer layout changes the overlay
+                // window height and Android responds by dismissing/reopening
+                // the IME. Keeping it in its own touchable window preserves
+                // both the keyboard and the compact composer geometry.
+                Popup(
+                    alignment = Alignment.BottomEnd,
+                    offset = with(density) {
+                        IntOffset(0, -56.dp.roundToPx())
+                    },
+                    onDismissRequest = { reasoningSelectorOpen = false },
+                    properties = PopupProperties(
+                        focusable = false,
+                        dismissOnBackPress = false,
+                        dismissOnClickOutside = true,
+                        clippingEnabled = false,
+                    ),
                 ) {
-                    Box(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 11.dp),
-                        contentAlignment = Alignment.Center,
+                    Surface(
+                        modifier = Modifier
+                            .width(286.dp)
+                            .shadow(18.dp, RoundedCornerShape(22.dp)),
+                        shape = RoundedCornerShape(22.dp),
+                        color = colors.composerBackground,
+                        border = androidx.compose.foundation.BorderStroke(
+                            0.8.dp,
+                            colors.borderColor,
+                        ),
                     ) {
-                        Text(
-                            text = "Continue in DHD",
-                            color = Color.White,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            maxLines = 1,
-                        )
+                        Column(
+                            modifier = Modifier.padding(
+                                start = 14.dp,
+                                top = 12.dp,
+                                end = 14.dp,
+                                bottom = 12.dp,
+                            ),
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 9.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = "${reasoningEffort.label} reasoning",
+                                    color = colors.textPrimary,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Spacer(Modifier.weight(1f))
+                                Box(
+                                    modifier = Modifier
+                                        .size(24.dp)
+                                        .clip(CircleShape)
+                                        .clickable(
+                                            role = Role.Button,
+                                            onClickLabel = "Close reasoning selector",
+                                            onClick = { reasoningSelectorOpen = false },
+                                        )
+                                        .semantics { contentDescription = "Close reasoning selector" },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = "×",
+                                        color = colors.textSecondary,
+                                        fontSize = 18.sp,
+                                        lineHeight = 18.sp,
+                                    )
+                                }
+                            }
+                            ReasoningEffortTrack(
+                                selectedEffort = reasoningEffort,
+                                visibleEfforts = visibleReasoningEfforts,
+                                onSelect = {
+                                    onSelectReasoningEffort(it)
+                                },
+                            )
+                        }
                     }
                 }
-                Surface(
-                    modifier = Modifier
-                        .size(44.dp)
-                        .clip(RoundedCornerShape(14.dp))
-                        .clickable(onClick = onStop),
-                    color = colors.surfaceCard,
-                    shape = RoundedCornerShape(14.dp),
-                    border = BorderStroke(1.dp, colors.borderColor),
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Text(
-                            text = "■",
-                            color = colors.errorRed,
-                            fontSize = 15.sp,
-                        )
+            }
+        }
+    }
+    textToolbar.currentMenu?.let { menu ->
+            TextToolbarPopup(menu = menu, onDismiss = { textToolbar.hide() })
+        }
+    }
+}
+
+internal data class TextToolbarMenu(
+    val rect: Rect,
+    val onCopy: (() -> Unit)?,
+    val onPaste: (() -> Unit)?,
+    val onCut: (() -> Unit)?,
+    val onSelectAll: (() -> Unit)?,
+)
+
+internal class OverlayTextToolbar(
+    private val clipboardManager: androidx.compose.ui.platform.ClipboardManager,
+    private val onFallbackPaste: (String) -> Unit,
+) : TextToolbar {
+    var currentMenu by mutableStateOf<TextToolbarMenu?>(null)
+        private set
+
+    override val status: TextToolbarStatus
+        get() = if (currentMenu != null) TextToolbarStatus.Shown else TextToolbarStatus.Hidden
+
+    override fun showMenu(
+        rect: Rect,
+        onCopyRequested: (() -> Unit)?,
+        onPasteRequested: (() -> Unit)?,
+        onCutRequested: (() -> Unit)?,
+        onSelectAllRequested: (() -> Unit)?,
+    ) {
+        val hasClip = clipboardManager.hasText()
+        val pasteAction = onPasteRequested ?: if (hasClip) {
+            {
+                val text = clipboardManager.getText()?.text
+                if (!text.isNullOrEmpty()) {
+                    onFallbackPaste(text)
+                }
+            }
+        } else null
+
+        currentMenu = TextToolbarMenu(
+            rect = rect,
+            onCopy = onCopyRequested,
+            onPaste = pasteAction,
+            onCut = onCutRequested,
+            onSelectAll = onSelectAllRequested,
+        )
+    }
+
+    override fun hide() {
+        currentMenu = null
+    }
+}
+
+@Composable
+private fun TextToolbarPopup(
+    menu: TextToolbarMenu,
+    onDismiss: () -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    val density = LocalDensity.current
+
+    val hasActions = menu.onCut != null || menu.onCopy != null || menu.onPaste != null || menu.onSelectAll != null
+    if (!hasActions) return
+
+    val toolbarHeight = with(density) { 48.dp.roundToPx() }
+    val spacingPx = with(density) { 8.dp.roundToPx() }
+    val yOffset = if (menu.rect.top > toolbarHeight + spacingPx) {
+        (menu.rect.top - toolbarHeight - spacingPx).roundToInt()
+    } else {
+        (menu.rect.bottom + spacingPx).roundToInt()
+    }.coerceAtLeast(with(density) { 6.dp.roundToPx() })
+    val xOffset = (menu.rect.left - with(density) { 12.dp.roundToPx() }).roundToInt()
+        .coerceAtLeast(with(density) { 10.dp.roundToPx() })
+
+    Popup(
+        offset = IntOffset(xOffset, yOffset),
+        onDismissRequest = onDismiss,
+        properties = PopupProperties(
+            focusable = false,
+            dismissOnBackPress = false,
+            dismissOnClickOutside = true,
+            clippingEnabled = false,
+        ),
+    ) {
+        Surface(
+            shape = RoundedCornerShape(20.dp),
+            color = colors.composerBackground,
+            border = androidx.compose.foundation.BorderStroke(0.8.dp, colors.borderColor),
+            shadowElevation = 12.dp,
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                var needsDivider = false
+                if (menu.onCut != null) {
+                    TextToolbarItem("Cut") {
+                        menu.onCut.invoke()
+                        onDismiss()
+                    }
+                    needsDivider = true
+                }
+                if (menu.onCopy != null) {
+                    if (needsDivider) ToolbarDivider()
+                    TextToolbarItem("Copy") {
+                        menu.onCopy.invoke()
+                        onDismiss()
+                    }
+                    needsDivider = true
+                }
+                if (menu.onPaste != null) {
+                    if (needsDivider) ToolbarDivider()
+                    TextToolbarItem("Paste") {
+                        menu.onPaste.invoke()
+                        onDismiss()
+                    }
+                    needsDivider = true
+                }
+                if (menu.onSelectAll != null) {
+                    if (needsDivider) ToolbarDivider()
+                    TextToolbarItem("Select all") {
+                        menu.onSelectAll.invoke()
+                        onDismiss()
                     }
                 }
             }
@@ -391,134 +1363,430 @@ private fun WorkingSurface(
 }
 
 @Composable
-private fun AttentionSurface(
-    state: SessionState,
-    calls: List<DhdToolCall>,
-    colors: com.phonecontrol.assistant.ui.AssistantColorScheme,
-    onStop: () -> Unit,
-    onContinueInDhd: () -> Unit,
-) {
-    WorkingSurface(
-        state = state,
-        calls = calls,
-        colors = colors,
-        onStop = onStop,
-        onContinueInDhd = onContinueInDhd,
-        attentionOverride = true,
+private fun ToolbarDivider() {
+    val colors = LocalAssistantColors.current
+    Box(
+        modifier = Modifier
+            .width(0.8.dp)
+            .height(16.dp)
+            .background(colors.borderColor.copy(alpha = 0.7f)),
     )
 }
 
 @Composable
-private fun ToolCallRow(
-    call: DhdToolCall,
-    colors: com.phonecontrol.assistant.ui.AssistantColorScheme,
+private fun TextToolbarItem(
+    label: String,
+    onClick: () -> Unit,
 ) {
-    val statusColor = when (call.status) {
-        DhdToolCallStatus.COMPLETED -> colors.accentGreen
-        DhdToolCallStatus.FAILED -> colors.errorRed
-        DhdToolCallStatus.ATTENTION -> colors.warningAmber
-        DhdToolCallStatus.RUNNING -> colors.accentBlue
-    }
-    Row(
+    val colors = LocalAssistantColors.current
+    Box(
         modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(10.dp))
-            .background(colors.surfaceCard.copy(alpha = 0.82f))
-            .padding(horizontal = 10.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+            .clip(RoundedCornerShape(14.dp))
+            .clickable(
+                role = Role.Button,
+                onClickLabel = label,
+                onClick = onClick,
+            )
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center,
     ) {
         Text(
-            text = when (call.status) {
-                DhdToolCallStatus.COMPLETED -> "✓"
-                DhdToolCallStatus.FAILED -> "!"
-                DhdToolCallStatus.ATTENTION -> "?"
-                DhdToolCallStatus.RUNNING -> "•"
-            },
-            color = statusColor,
-            fontSize = 15.sp,
-            fontWeight = FontWeight.Bold,
+            text = label,
+            color = colors.textPrimary,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Medium,
         )
-        Column(modifier = Modifier.weight(1f)) {
+    }
+}
+
+@Composable
+private fun OverlayVirtualDisplayPreview(
+    previewState: TaskPreviewState,
+    onHide: () -> Unit,
+    onContinue: () -> Unit,
+    onSurfaceAvailable: (TaskDisplaySession, AndroidSurface) -> Unit,
+    onSurfaceDestroyed: (TaskDisplaySession, AndroidSurface) -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    val live = when (previewState) {
+        is TaskPreviewState.Connecting -> LiveDisplayPreviewState.connecting(
+            appLabel = previewState.session.packageName.takeIf(String::isNotBlank),
+            aspectRatio = previewState.session.geometry.width.toFloat() /
+                previewState.session.geometry.height.toFloat(),
+            sessionKey = previewState.session.sessionKey,
+        )
+        is TaskPreviewState.Attached -> LiveDisplayPreviewState.live(
+            appLabel = previewState.session.packageName.takeIf(String::isNotBlank),
+            aspectRatio = previewState.session.geometry.width.toFloat() /
+                previewState.session.geometry.height.toFloat(),
+            sessionKey = previewState.session.sessionKey,
+        )
+        else -> null
+    }
+    val session = when (previewState) {
+        is TaskPreviewState.Connecting -> previewState.session
+        is TaskPreviewState.Attached -> previewState.session
+        else -> null
+    }
+    val statusMessage = when (previewState) {
+        TaskPreviewState.Detached -> "The virtual display will appear when a task opens one."
+        is TaskPreviewState.Error -> previewState.message
+        else -> null
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 2.dp, bottom = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             Text(
-                text = call.purpose,
+                text = "Live view",
                 color = colors.textPrimary,
-                fontSize = 12.5.sp,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
             )
-            Text(
-                text = call.toolName,
-                color = colors.textSecondary,
-                fontSize = 10.5.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+            Spacer(Modifier.weight(1f))
+            Box(
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(CircleShape)
+                    .clickable(role = Role.Button, onClickLabel = "Hide live view", onClick = onHide)
+                    .semantics { contentDescription = "Hide live view" },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "×",
+                    color = colors.textSecondary,
+                    fontSize = 20.sp,
+                    lineHeight = 20.sp,
+                )
+            }
+        }
+        if (live != null && session != null) {
+            LiveDisplayPreview(
+                state = live,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 248.dp),
+                onSurfaceAvailable = { surface -> onSurfaceAvailable(session, surface) },
+                onSurfaceDestroyed = { surface -> onSurfaceDestroyed(session, surface) },
+                onExpand = onContinue,
             )
+        } else {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 70.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(colors.surfaceCard.copy(alpha = 0.78f))
+                    .border(0.8.dp, colors.borderColor, RoundedCornerShape(18.dp))
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                contentAlignment = Alignment.CenterStart,
+            ) {
+                Text(
+                    text = statusMessage ?: "No virtual display is attached yet.",
+                    color = colors.textSecondary,
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp,
+                )
+            }
         }
     }
 }
 
 @Composable
-private fun ResultSurface(
-    message: String,
-    colors: com.phonecontrol.assistant.ui.AssistantColorScheme,
-    onNewRequest: () -> Unit,
-    onContinueInDhd: () -> Unit,
+private fun WorkingContent(
+    state: SessionState,
+    calls: List<DhdToolCall>,
+    onStop: () -> Unit,
 ) {
-    Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .navigationBarsPadding()
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-        color = colors.composerBackground.copy(alpha = 0.97f),
-        shape = RoundedCornerShape(24.dp),
-        border = BorderStroke(1.dp, colors.borderColor),
-        shadowElevation = 18.dp,
+    val colors = LocalAssistantColors.current
+    val sessionCalls = calls.filter { it.sessionId == state.sessionIdOrNull() }
+    val attention = state.needsAttention()
+    val paused = state is SessionState.Paused
+    val current = sessionCalls.lastOrNull { it.status == DhdToolCallStatus.RUNNING }
+        ?: sessionCalls.lastOrNull {
+            attention && it.status == DhdToolCallStatus.ATTENTION
+        }
+    val purpose = current?.purpose
+        ?: state.currentPurposeOrNull()?.takeIf { it.isNotBlank() }
+        ?: "Taking care of that…"
+    val attentionReason = state.attentionReasonOrNull()
+    val recent = sessionCalls
+        .filter { it.id != current?.id && it.status != DhdToolCallStatus.RUNNING }
+        .takeLast(3)
+    val headline = when {
+        attention -> "A moment for you"
+        paused -> "Ready when you are"
+        else -> purpose
+    }
+    val secondary = when {
+        attention -> attentionReason ?: purpose
+        paused -> purpose
+        else -> null
+    }
+    val headlineColor = if (attention) colors.warningAmber else colors.textPrimary
+
+    Column(
+        modifier = Modifier.padding(start = 20.dp, end = 16.dp, bottom = 13.dp),
     ) {
-        Column(
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
+        AnimatedContent(
+            targetState = headline,
+            transitionSpec = {
+                (fadeIn(tween(220)) + slideInVertically(tween(220)) { 8 })
+                    .togetherWith(fadeOut(tween(110)) + slideOutVertically(tween(110)) { -8 })
+            },
+            label = "live-purpose",
+        ) { text ->
             Text(
-                text = message,
-                color = colors.textPrimary,
-                fontSize = 15.sp,
-                lineHeight = 21.sp,
-                maxLines = 3,
+                text = text,
+                color = headlineColor,
+                fontSize = 22.sp,
+                lineHeight = 28.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = (-0.45).sp,
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 8.dp, bottom = if (secondary == null) 8.dp else 5.dp),
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Surface(
-                    modifier = Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(14.dp))
-                        .clickable(onClick = onNewRequest),
-                    color = colors.accentBlue,
-                    shape = RoundedCornerShape(14.dp),
-                ) {
-                    Box(
-                        modifier = Modifier.padding(vertical = 11.dp),
-                        contentAlignment = Alignment.Center,
+        }
+
+        if (secondary != null) {
+            Text(
+                text = secondary,
+                color = colors.textSecondary,
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(bottom = 7.dp),
+            )
+        }
+
+        if (recent.isNotEmpty()) {
+            Column(
+                modifier = Modifier.padding(top = 2.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                recent.forEach { call ->
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text("Ask another thing", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        StatusMark(call.status, callTint(call.status, colors))
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = call.purpose,
+                            color = colors.textSecondary.copy(alpha = 0.82f),
+                            fontSize = 12.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                     }
                 }
-                Surface(
-                    modifier = Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(14.dp))
-                        .clickable(onClick = onContinueInDhd),
-                    color = colors.surfaceCard,
-                    shape = RoundedCornerShape(14.dp),
-                    border = BorderStroke(1.dp, colors.borderColor),
-                ) {
-                    Box(
-                        modifier = Modifier.padding(vertical = 11.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text("Open DHD", color = colors.textPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                    }
+            }
+        }
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 15.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.End,
+        ) {
+            GlyphButton(label = "Stop assistant", glyph = "stop", onClick = onStop)
+        }
+    }
+}
+
+@Composable
+private fun ResultContent(
+    message: String,
+    state: SessionState,
+    onSubmit: (String) -> Unit,
+    onContinue: () -> Unit,
+    onCollapse: () -> Unit,
+    onShowPreview: () -> Unit,
+    onHidePreview: () -> Unit,
+    previewVisible: Boolean,
+    previewState: TaskPreviewState,
+    onTaskPreviewSurfaceAvailable: (TaskDisplaySession, AndroidSurface) -> Unit,
+    onTaskPreviewSurfaceDestroyed: (TaskDisplaySession, AndroidSurface) -> Unit,
+    fastMode: Boolean,
+    onSetFastMode: (Boolean) -> Unit,
+    reasoningEffort: ReasoningEffort,
+    visibleReasoningEfforts: List<ReasoningEffort>,
+    onSelectReasoningEffort: (ReasoningEffort) -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    val completed = state is SessionState.Completed
+    val accent = if (completed) colors.accentGreen else colors.warningAmber
+    val title = if (completed) "All set" else "Stopped here"
+    val visibleMessage = message.ifBlank { if (completed) "Done." else "The request was stopped." }
+
+    Column(
+        modifier = Modifier.padding(bottom = 5.dp),
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 20.dp, end = 16.dp, top = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            StatusMark(
+                status = if (completed) DhdToolCallStatus.COMPLETED else DhdToolCallStatus.ATTENTION,
+                color = accent,
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(title, color = accent, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        }
+        Text(
+            text = visibleMessage,
+            color = colors.textPrimary,
+            fontSize = 17.sp,
+            lineHeight = 24.sp,
+            maxLines = 3,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(start = 20.dp, end = 16.dp, top = 7.dp, bottom = 1.dp),
+        )
+        Composer(
+            onSubmit = onSubmit,
+            onContinueInDhd = onContinue,
+            onCollapse = onCollapse,
+            onShowPreview = onShowPreview,
+            onHidePreview = onHidePreview,
+            previewVisible = previewVisible,
+            previewState = previewState,
+            onTaskPreviewSurfaceAvailable = onTaskPreviewSurfaceAvailable,
+            onTaskPreviewSurfaceDestroyed = onTaskPreviewSurfaceDestroyed,
+            fastMode = fastMode,
+            onSetFastMode = onSetFastMode,
+            reasoningEffort = reasoningEffort,
+            visibleReasoningEfforts = visibleReasoningEfforts,
+            onSelectReasoningEffort = onSelectReasoningEffort,
+        )
+    }
+}
+
+@Composable
+private fun StatusMark(status: DhdToolCallStatus, color: Color) {
+    Canvas(Modifier.size(12.dp)) {
+        when (status) {
+            DhdToolCallStatus.COMPLETED -> {
+                val path = Path().apply {
+                    moveTo(size.width * 0.12f, size.height * 0.5f)
+                    lineTo(size.width * 0.4f, size.height * 0.76f)
+                    lineTo(size.width * 0.88f, size.height * 0.22f)
                 }
+                drawPath(path, color, style = Stroke(1.5.dp.toPx(), cap = StrokeCap.Round))
+            }
+            DhdToolCallStatus.FAILED -> {
+                drawLine(
+                    color = color,
+                    start = Offset(size.width * 0.25f, size.height * 0.25f),
+                    end = Offset(size.width * 0.75f, size.height * 0.75f),
+                    strokeWidth = 1.5.dp.toPx(),
+                    cap = StrokeCap.Round,
+                )
+                drawLine(
+                    color = color,
+                    start = Offset(size.width * 0.75f, size.height * 0.25f),
+                    end = Offset(size.width * 0.25f, size.height * 0.75f),
+                    strokeWidth = 1.5.dp.toPx(),
+                    cap = StrokeCap.Round,
+                )
+            }
+            DhdToolCallStatus.ATTENTION -> drawCircle(color, 2.8.dp.toPx())
+            DhdToolCallStatus.RUNNING -> {
+                drawCircle(color.copy(alpha = 0.28f), 4.2.dp.toPx())
+                drawCircle(color, 2.1.dp.toPx())
+            }
+        }
+    }
+}
+
+private fun callTint(status: DhdToolCallStatus, colors: AssistantColorScheme): Color = when (status) {
+    DhdToolCallStatus.COMPLETED -> colors.accentGreen
+    DhdToolCallStatus.FAILED -> colors.warningAmber
+    DhdToolCallStatus.ATTENTION -> colors.warningAmber
+    DhdToolCallStatus.RUNNING -> colors.accentBlue
+}
+
+private fun reasoningEffortsFromStorage(value: String?): List<ReasoningEffort> {
+    val stored = value
+        ?.split(",")
+        ?.map(String::trim)
+        ?.filter(String::isNotEmpty)
+        ?.toSet()
+        .orEmpty()
+    return ReasoningEffort.entries
+        .filter { it.storageValue in stored }
+        .ifEmpty { ReasoningEffort.entries }
+}
+
+@Composable
+private fun GlyphButton(
+    label: String,
+    glyph: String,
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+    filled: Boolean = false,
+    buttonSize: androidx.compose.ui.unit.Dp = 48.dp,
+    iconSize: androidx.compose.ui.unit.Dp = 20.dp,
+) {
+    val colors = LocalAssistantColors.current
+    val tint = when {
+        filled && enabled -> colors.sendButtonActiveBg
+        filled -> colors.sendButtonInactiveBg
+        enabled -> colors.surfaceCard.copy(alpha = 0.78f)
+        else -> colors.surfaceCard.copy(alpha = 0.45f)
+    }
+    Box(
+        modifier = Modifier
+            .size(buttonSize)
+            .clip(CircleShape)
+            .background(tint)
+            .clickable(
+                enabled = enabled,
+                role = Role.Button,
+                onClickLabel = label,
+                onClick = onClick,
+            )
+            .semantics { contentDescription = label },
+        contentAlignment = Alignment.Center,
+    ) {
+        if (glyph == "send") {
+            Icon(
+                painter = painterResource(com.phonecontrol.assistant.R.drawable.ic_send_arrow),
+                contentDescription = null,
+                tint = if (enabled) colors.sendButtonActiveIcon else colors.sendButtonInactiveIcon,
+                modifier = Modifier.size(iconSize),
+            )
+        } else Canvas(Modifier.size(iconSize)) {
+            val color = when {
+                !enabled -> colors.sendButtonInactiveIcon
+                filled -> colors.sendButtonActiveIcon
+                glyph == "stop" -> colors.textPrimary.copy(alpha = 0.78f)
+                else -> colors.textSecondary
+            }
+            val path = Path()
+            when (glyph) {
+                "down" -> {
+                    path.moveTo(size.width * 0.25f, size.height * 0.4f)
+                    path.lineTo(size.width * 0.5f, size.height * 0.65f)
+                    path.lineTo(size.width * 0.75f, size.height * 0.4f)
+                    drawPath(path, color, style = Stroke(1.8.dp.toPx(), cap = StrokeCap.Round))
+                }
+                "stop" -> drawRoundRect(
+                    color,
+                    topLeft = Offset(size.width * 0.27f, size.height * 0.27f),
+                    size = Size(size.width * 0.46f, size.height * 0.46f),
+                    cornerRadius = CornerRadius(2.5.dp.toPx()),
+                )
+                else -> Unit
             }
         }
     }
@@ -538,11 +1806,17 @@ private fun SessionState.currentPurposeOrNull(): String? = when (this) {
     else -> null
 }
 
+private fun SessionState.attentionReasonOrNull(): String? = when (this) {
+    is SessionState.Running -> attentionReason?.takeIf { it.isNotBlank() }
+    is SessionState.Paused -> attentionReason?.takeIf { it.isNotBlank() }
+    else -> null
+}
+
 private fun SessionState.needsAttention(): Boolean =
     currentPurposeOrNull()?.equals("Needs your attention", ignoreCase = true) == true
 
 private fun terminalMessage(state: SessionState): String = when (state) {
     is SessionState.Completed -> state.message
     is SessionState.Stopped -> state.reason
-    else -> "DHD is ready for another request."
+    else -> "Ready for your next request."
 }

@@ -8,6 +8,7 @@ object OverlayPreferences {
     const val KEY_BUBBLE_X = "pref_overlay_bubble_x"
     const val KEY_BUBBLE_Y = "pref_overlay_bubble_y"
     const val KEY_REASONING_EFFORT = "pref_reasoning_effort"
+    const val KEY_VISIBLE_REASONING_EFFORTS = "pref_visible_reasoning_efforts"
     const val KEY_FAST_MODE = "pref_fast_mode"
     const val KEY_THEME_MODE = "pref_theme_mode"
 

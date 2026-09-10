@@ -2024,7 +2024,7 @@ private fun AttachButton(
 }
 
 @Composable
-private fun FastModeButton(
+internal fun FastModeButton(
     enabled: Boolean,
     selected: Boolean,
     onToggle: () -> Unit,
@@ -2060,7 +2060,7 @@ private fun FastModeButton(
 }
 
 @Composable
-private fun ReasoningEffortButton(
+internal fun ReasoningEffortButton(
     effort: ReasoningEffort,
     visibleEfforts: List<ReasoningEffort>,
     enabled: Boolean,
@@ -2091,7 +2091,7 @@ private fun ReasoningEffortButton(
 }
 
 @Composable
-private fun ReasoningMeterIcon(
+internal fun ReasoningMeterIcon(
     effort: ReasoningEffort,
     visibleEfforts: List<ReasoningEffort> = ReasoningEffort.entries,
     tint: Color,
@@ -2212,7 +2212,7 @@ private fun ReasoningEffortOverlay(
 }
 
 @Composable
-private fun ReasoningEffortTrack(
+internal fun ReasoningEffortTrack(
     selectedEffort: ReasoningEffort,
     visibleEfforts: List<ReasoningEffort>,
     onSelect: (ReasoningEffort) -> Unit,

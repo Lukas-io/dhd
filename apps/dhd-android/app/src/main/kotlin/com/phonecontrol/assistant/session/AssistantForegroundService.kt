@@ -37,7 +37,19 @@ class AssistantForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannels()
-        overlayWindowController = OverlayWindowController(this, coordinator, overlayVisibilityGate)
+        val application = application as PhoneControlApplication
+        overlayWindowController = OverlayWindowController(
+            context = this,
+            coordinator = coordinator,
+            visibilityGate = overlayVisibilityGate,
+            taskPreviewState = application.taskDisplayBackend.previewState,
+            onTaskPreviewSurfaceAvailable = { session, surface ->
+                application.attachTaskPreview(session, surface)
+            },
+            onTaskPreviewSurfaceDestroyed = { session, surface ->
+                application.detachTaskPreview(session, surface)
+            },
+        )
         startForegroundCompat(buildNotification(coordinator.state.value))
         serviceScope.launch {
             coordinator.state.collectLatest { state ->
