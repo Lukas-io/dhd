@@ -151,11 +151,13 @@ fun OverlayGlow(
     val isHidden by hidden.collectAsState()
     val trigger by glowTrigger.collectAsState()
 
-    val isComposerOpen = mode != OverlayPanelMode.BUBBLE
+    val isWorking = state is SessionState.Running || state is SessionState.Paused ||
+        mode == OverlayPanelMode.WORKING || mode == OverlayPanelMode.ATTENTION
+    val shouldGlow = !isHidden && mode == OverlayPanelMode.COMPOSER && !isWorking
     val anim = remember { Animatable(1f) }
 
     LaunchedEffect(trigger, mode) {
-        if (!isHidden && isComposerOpen) {
+        if (shouldGlow) {
             anim.snapTo(0f)
             anim.animateTo(
                 targetValue = 1f,
@@ -167,7 +169,7 @@ fun OverlayGlow(
     }
 
     val progress = anim.value
-    if (progress >= 1f || isHidden || !isComposerOpen) return
+    if (progress >= 1f || !shouldGlow) return
 
     // Organic liquid alpha curve: liquid pour-in (0.0 -> 0.18), fluid slosh/shimmer (0.18 -> 0.42), viscous decay (0.42 -> 1.0)
     val overallAlpha = when {
@@ -594,7 +596,8 @@ fun OverlayPanel(
             modifier = composerWidthModifier,
             contentAlignment = Alignment.Center,
         ) {
-            val glowOrbitPhase by motionPhase(
+            if (effectiveMode == OverlayPanelMode.COMPOSER) {
+                val glowOrbitPhase by motionPhase(
                 label = "composer-orbit-glow",
                 duration = 3_400,
                 enabled = true,
@@ -706,6 +709,7 @@ fun OverlayPanel(
                     style = Stroke(with(density) { 1.0.dp.toPx() }),
                     alpha = 0.90f * breath,
                 )
+            }
             }
 
             Column(

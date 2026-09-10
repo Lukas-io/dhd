@@ -363,21 +363,18 @@ class DevBridgeServer(
                     "observe" -> withDhdTool(
                         json = json,
                         fallbackToolName = DHD_OBSERVE_TOOL,
-                        hideDuringObservation = true,
                     ) {
                         observe(requestId, json, writer)
                     }
                     "execute_action" -> withDhdTool(
                         json = json,
                         fallbackToolName = fallbackActionToolName(json),
-                        hideDuringObservation = true,
                     ) {
                         phoneActionMutex.withLock { executeAction(requestId, json, writer) }
                     }
                     "execute_sequence" -> withDhdTool(
                         json = json,
                         fallbackToolName = "dhd_execute_sequence",
-                        hideDuringObservation = true,
                     ) {
                         phoneActionMutex.withLock { executeSequence(requestId, json, writer) }
                     }

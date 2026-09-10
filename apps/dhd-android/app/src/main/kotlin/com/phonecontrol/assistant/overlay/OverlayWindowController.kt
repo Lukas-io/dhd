@@ -134,11 +134,11 @@ class OverlayWindowController(
 
     fun openComposer() {
         val state = coordinator.state.value
-        _glowTrigger.value = System.currentTimeMillis()
         if (state.isActiveForOverlay()) {
             setPanelMode(overlayPanelModeForUserExpand(state))
             return
         }
+        _glowTrigger.value = System.currentTimeMillis()
         _resultMessage.value = null
         panelView?.clearFocus()
         hideKeyboard()
