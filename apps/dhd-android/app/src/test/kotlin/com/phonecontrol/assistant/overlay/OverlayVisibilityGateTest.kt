@@ -110,6 +110,42 @@ class OverlayVisibilityGateTest {
     }
 
     @Test
+    fun `full screen glow is hidden as soon as composer leaves idle state`() {
+        assertTrue(shouldShowOverlayGlow(OverlayPanelMode.COMPOSER, SessionState.Idle, hidden = false))
+        assertFalse(shouldShowOverlayGlow(OverlayPanelMode.BUBBLE, SessionState.Idle, hidden = false))
+        assertFalse(shouldShowOverlayGlow(OverlayPanelMode.COMPOSER, SessionState.Idle, hidden = true))
+        assertFalse(shouldShowOverlayGlow(OverlayPanelMode.COMPOSER, runningState("Working"), hidden = false))
+    }
+
+    @Test
+    fun `horizontal swipe places bubble on the matching display edge`() {
+        val current = BubblePosition(x = 420, y = 600)
+
+        assertEquals(
+            BubblePosition(x = 12, y = 600),
+            bubblePositionForHorizontalSwipe(
+                direction = OverlaySwipeDirection.LEFT,
+                currentPosition = current,
+                displayWidth = 1080,
+                displayHeight = 2400,
+                bubbleWidth = 64,
+                bubbleHeight = 64,
+            ),
+        )
+        assertEquals(
+            BubblePosition(x = 1004, y = 600),
+            bubblePositionForHorizontalSwipe(
+                direction = OverlaySwipeDirection.RIGHT,
+                currentPosition = current,
+                displayWidth = 1080,
+                displayHeight = 2400,
+                bubbleWidth = 64,
+                bubbleHeight = 64,
+            ),
+        )
+    }
+
+    @Test
     fun `active terminal transition shows result even after collapse`() {
         val running = runningState("Working")
         val stopped = SessionState.Stopped(

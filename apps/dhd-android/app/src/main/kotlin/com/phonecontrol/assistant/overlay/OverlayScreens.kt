@@ -44,6 +44,8 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -91,6 +93,8 @@ import kotlin.math.sin
 import kotlin.random.Random
 
 enum class OverlayPanelMode { BUBBLE, COMPOSER, WORKING, ATTENTION, RESULT }
+
+enum class OverlaySwipeDirection { LEFT, RIGHT }
 
 private const val MAX_DRAFT_LENGTH = 4_000
 
@@ -151,19 +155,19 @@ fun OverlayGlow(
     val isHidden by hidden.collectAsState()
     val trigger by glowTrigger.collectAsState()
 
-    val isWorking = state is SessionState.Running || state is SessionState.Paused ||
-        mode == OverlayPanelMode.WORKING || mode == OverlayPanelMode.ATTENTION
-    val shouldGlow = !isHidden && mode == OverlayPanelMode.COMPOSER && !isWorking
+    val shouldGlow = shouldShowOverlayGlow(mode, state, isHidden)
     val anim = remember { Animatable(1f) }
 
-    LaunchedEffect(trigger, mode) {
+    LaunchedEffect(trigger, shouldGlow) {
         if (shouldGlow) {
+            anim.stop()
             anim.snapTo(0f)
             anim.animateTo(
                 targetValue = 1f,
                 animationSpec = tween(durationMillis = 2_600, easing = LinearEasing),
             )
         } else {
+            anim.stop()
             anim.snapTo(1f)
         }
     }
@@ -457,6 +461,7 @@ fun OverlayPanel(
     onStop: () -> Unit,
     onContinueInDhd: () -> Unit,
     onCollapse: () -> Unit,
+    onHorizontalSwipeDismiss: (OverlaySwipeDirection, Int) -> Unit,
     taskPreviewState: StateFlow<TaskPreviewState>,
     onTaskPreviewSurfaceAvailable: (TaskDisplaySession, AndroidSurface) -> Unit,
     onTaskPreviewSurfaceDestroyed: (TaskDisplaySession, AndroidSurface) -> Unit,
@@ -567,6 +572,49 @@ fun OverlayPanel(
         keyboardVisible -> 20.dp
         else -> 16.dp
     }
+    var composerOriginX by remember { mutableStateOf(0) }
+    val latestComposerOriginX by rememberUpdatedState(composerOriginX)
+    val swipeDismissThresholdPx = with(density) { 56.dp.toPx() }
+    val swipeDismissModifier = if (effectiveMode != OverlayPanelMode.BUBBLE) {
+        Modifier.pointerInput(onCollapse, onHorizontalSwipeDismiss) {
+            var totalDragX = 0f
+            var totalDragY = 0f
+            var lastPointerX = 0f
+            detectDragGestures(
+                onDragStart = { startOffset ->
+                    totalDragX = 0f
+                    totalDragY = 0f
+                    lastPointerX = startOffset.x
+                },
+                onDrag = { change, dragAmount ->
+                    totalDragX += dragAmount.x
+                    totalDragY += dragAmount.y
+                    lastPointerX = change.position.x
+                    change.consume()
+                },
+                onDragEnd = {
+                    val horizontalSwipe = abs(totalDragX) >= swipeDismissThresholdPx &&
+                        abs(totalDragX) > abs(totalDragY)
+                    val downwardSwipe = totalDragY >= swipeDismissThresholdPx &&
+                        totalDragY > abs(totalDragX)
+                    if (horizontalSwipe) {
+                        onHorizontalSwipeDismiss(
+                            if (totalDragX < 0f) {
+                                OverlaySwipeDirection.LEFT
+                            } else {
+                                OverlaySwipeDirection.RIGHT
+                            },
+                            latestComposerOriginX + lastPointerX.roundToInt(),
+                        )
+                    } else if (downwardSwipe) {
+                        onCollapse()
+                    }
+                },
+            )
+        }
+    } else {
+        Modifier
+    }
 
     Box(
         modifier = Modifier
@@ -676,38 +724,18 @@ fun OverlayPanel(
                     cornerRadius = CornerRadius(baseCornerPx + outerSpread),
                 )
 
-                // 2. Animated Orbiting Chromatic Glow (cycles colors around the capsule!)
-                // Layer A: Feathered outer chromatic halo (spread 4.5dp, stroke 5dp) - second line thingy!
-                val haloSpread = with(density) { 4.5.dp.toPx() }
+                // 2. One animated chromatic rim. The panel supplies its own
+                // neutral border; keeping one chromatic stroke avoids the
+                // stacked double-ring effect while the ambient bloom above
+                // still gives the capsule a soft presence.
+                val rimSpread = with(density) { 0.9.dp.toPx() }
                 drawRoundRect(
                     brush = sweepBrush,
-                    topLeft = Offset(-haloSpread, -haloSpread),
-                    size = Size(size.width + haloSpread * 2f, size.height + haloSpread * 2f),
-                    cornerRadius = CornerRadius(baseCornerPx + haloSpread),
-                    style = Stroke(with(density) { 5.dp.toPx() }),
-                    alpha = 0.38f * breath,
-                )
-
-                // Layer B: Radiant core chromatic beam (spread 1.8dp, stroke 2.2dp)
-                val coreSpread = with(density) { 1.8.dp.toPx() }
-                drawRoundRect(
-                    brush = sweepBrush,
-                    topLeft = Offset(-coreSpread, -coreSpread),
-                    size = Size(size.width + coreSpread * 2f, size.height + coreSpread * 2f),
-                    cornerRadius = CornerRadius(baseCornerPx + coreSpread),
-                    style = Stroke(with(density) { 2.2.dp.toPx() }),
-                    alpha = 0.78f * breath,
-                )
-
-                // Layer C: Crisp luminous accent hugging the pill edge
-                val edgeSpread = with(density) { 0.4.dp.toPx() }
-                drawRoundRect(
-                    brush = sweepBrush,
-                    topLeft = Offset(-edgeSpread, -edgeSpread),
-                    size = Size(size.width + edgeSpread * 2f, size.height + edgeSpread * 2f),
-                    cornerRadius = CornerRadius(baseCornerPx + edgeSpread),
-                    style = Stroke(with(density) { 1.0.dp.toPx() }),
-                    alpha = 0.90f * breath,
+                    topLeft = Offset(-rimSpread, -rimSpread),
+                    size = Size(size.width + rimSpread * 2f, size.height + rimSpread * 2f),
+                    cornerRadius = CornerRadius(baseCornerPx + rimSpread),
+                    style = Stroke(with(density) { 2.6.dp.toPx() }),
+                    alpha = 0.84f * breath,
                 )
             }
             }
@@ -715,6 +743,10 @@ fun OverlayPanel(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .then(swipeDismissModifier)
+                    .onGloballyPositioned { coordinates ->
+                        composerOriginX = coordinates.positionInRoot().x.roundToInt()
+                    }
                     .shadow(24.dp, panelShape, clip = false)
                     .clip(panelShape)
                     .background(
@@ -1766,7 +1798,7 @@ private fun WorkingRow(
                 onClick = onStop,
                 filled = true,
                 buttonSize = 44.dp,
-                iconSize = 22.dp,
+                iconSize = 25.dp,
             )
         }
     }

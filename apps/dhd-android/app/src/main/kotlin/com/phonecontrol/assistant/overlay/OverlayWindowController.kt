@@ -1,5 +1,6 @@
 package com.phonecontrol.assistant.overlay
 
+import android.animation.ValueAnimator
 import android.content.Context
 import android.content.res.Configuration
 import android.graphics.PixelFormat
@@ -11,6 +12,7 @@ import android.view.Surface
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
+import android.view.animation.DecelerateInterpolator
 import android.view.inputmethod.InputMethodManager
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.platform.ComposeView
@@ -62,6 +64,7 @@ class OverlayWindowController(
     private var panelView: ComposeView? = null
     private var glowView: ComposeView? = null
     private var panelParams: WindowManager.LayoutParams? = null
+    private var bubblePositionAnimator: ValueAnimator? = null
     private var viewTreeOwner: OverlayViewTreeOwner? = null
     private var lastState: SessionState = coordinator.state.value
     private var hidden = visibilityGate.hidden.value
@@ -105,9 +108,8 @@ class OverlayWindowController(
     fun setHidden(value: Boolean) {
         hidden = value
         if (value) hideKeyboard()
-        val visibility = if (value) View.GONE else View.VISIBLE
-        glowView?.visibility = visibility
-        panelView?.visibility = visibility
+        panelView?.visibility = if (value) View.GONE else View.VISIBLE
+        updateGlowVisibility()
     }
 
     fun onSessionState(state: SessionState) {
@@ -146,9 +148,71 @@ class OverlayWindowController(
     }
 
     fun showBubble() {
+        bubblePositionAnimator?.cancel()
         panelView?.clearFocus()
         hideKeyboard()
         setPanelMode(OverlayPanelMode.BUBBLE)
+    }
+
+    private fun dismissAfterHorizontalSwipe(direction: OverlaySwipeDirection, swipeEndX: Int) {
+        val metrics = appContext.resources.displayMetrics
+        val insets = bubbleInsets()
+        val bubbleWidth = bubbleSizePx()
+        val bubbleHeight = bubbleSizePx()
+        val savedPosition = OverlayPreferences.bubblePosition(appContext)
+        val position = bubblePositionForHorizontalSwipe(
+            direction = direction,
+            currentPosition = savedPosition,
+            displayWidth = metrics.widthPixels,
+            displayHeight = metrics.heightPixels,
+            bubbleWidth = bubbleWidth,
+            bubbleHeight = bubbleHeight,
+            topInset = insets.top,
+            bottomInset = insets.bottom,
+        )
+        val startPosition = clampBubblePosition(
+            x = swipeEndX - bubbleWidth / 2,
+            y = position.y,
+            displayWidth = metrics.widthPixels,
+            displayHeight = metrics.heightPixels,
+            bubbleWidth = bubbleWidth,
+            bubbleHeight = bubbleHeight,
+            topInset = insets.top,
+            bottomInset = insets.bottom,
+        )
+        // Save before switching the window back to bubble mode because the
+        // layout reconciliation reads the persisted position.
+        OverlayPreferences.setBubblePosition(appContext, position)
+        showBubble()
+        animateBubbleFrom(startPosition, position)
+    }
+
+    private fun animateBubbleFrom(start: BubblePosition, target: BubblePosition) {
+        val panel = panelView ?: return
+        panel.post {
+            if (_panelMode.value != OverlayPanelMode.BUBBLE || panelView !== panel) return@post
+            val params = panelParams ?: return@post
+            params.x = start.x
+            params.y = start.y
+            runCatching { windowManager.updateViewLayout(panel, params) }
+
+            bubblePositionAnimator?.cancel()
+            bubblePositionAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 240L
+                interpolator = DecelerateInterpolator()
+                addUpdateListener { animator ->
+                    if (_panelMode.value != OverlayPanelMode.BUBBLE || panelView !== panel) {
+                        animator.cancel()
+                    } else {
+                        val fraction = animator.animatedFraction
+                        params.x = (start.x + (target.x - start.x) * fraction).roundToInt()
+                        params.y = (start.y + (target.y - start.y) * fraction).roundToInt()
+                        runCatching { windowManager.updateViewLayout(panel, params) }
+                    }
+                }
+                start()
+            }
+        }
     }
 
     fun moveBubble(deltaX: Float, deltaY: Float) {
@@ -174,7 +238,11 @@ class OverlayWindowController(
 
     private fun setPanelMode(mode: OverlayPanelMode) {
         val changed = _panelMode.value != mode
+        if (mode != OverlayPanelMode.BUBBLE) {
+            bubblePositionAnimator?.cancel()
+        }
         _panelMode.value = mode
+        updateGlowVisibility()
         updatePanelLayout(mode != OverlayPanelMode.BUBBLE)
         if (changed) {
             // WindowManager may measure the old Compose content before the state
@@ -185,6 +253,15 @@ class OverlayWindowController(
                 }
             }
         }
+    }
+
+    private fun updateGlowVisibility() {
+        val visible = shouldShowOverlayGlow(
+            mode = _panelMode.value,
+            state = coordinator.state.value,
+            hidden = hidden,
+        )
+        glowView?.visibility = if (visible) View.VISIBLE else View.GONE
     }
 
     private fun createViews() {
@@ -210,6 +287,7 @@ class OverlayWindowController(
                         onStop = ::stopSession,
                         onContinueInDhd = ::continueInDhd,
                         onCollapse = ::showBubble,
+                        onHorizontalSwipeDismiss = ::dismissAfterHorizontalSwipe,
                         taskPreviewState = taskPreviewState,
                         onTaskPreviewSurfaceAvailable = onTaskPreviewSurfaceAvailable,
                         onTaskPreviewSurfaceDestroyed = onTaskPreviewSurfaceDestroyed,
@@ -344,6 +422,8 @@ class OverlayWindowController(
     }
 
     private fun removeViews() {
+        bubblePositionAnimator?.cancel()
+        bubblePositionAnimator = null
         panelView?.let { runCatching { windowManager.removeViewImmediate(it) } }
         glowView?.let { runCatching { windowManager.removeViewImmediate(it) } }
         panelView = null
@@ -520,3 +600,35 @@ internal fun overlayPanelModeForUserExpand(state: SessionState): OverlayPanelMod
     } else {
         OverlayPanelMode.COMPOSER
     }
+
+internal fun shouldShowOverlayGlow(
+    mode: OverlayPanelMode,
+    state: SessionState,
+    hidden: Boolean,
+): Boolean = !hidden && mode == OverlayPanelMode.COMPOSER && !state.isActiveForOverlay()
+
+internal fun bubblePositionForHorizontalSwipe(
+    direction: OverlaySwipeDirection,
+    currentPosition: BubblePosition,
+    displayWidth: Int,
+    displayHeight: Int,
+    bubbleWidth: Int,
+    bubbleHeight: Int,
+    topInset: Int = 0,
+    bottomInset: Int = 0,
+): BubblePosition {
+    val edgeX = when (direction) {
+        OverlaySwipeDirection.LEFT -> 12
+        OverlaySwipeDirection.RIGHT -> displayWidth - bubbleWidth - 12
+    }
+    return clampBubblePosition(
+        x = edgeX,
+        y = currentPosition.y,
+        displayWidth = displayWidth,
+        displayHeight = displayHeight,
+        bubbleWidth = bubbleWidth,
+        bubbleHeight = bubbleHeight,
+        topInset = topInset,
+        bottomInset = bottomInset,
+    )
+}
