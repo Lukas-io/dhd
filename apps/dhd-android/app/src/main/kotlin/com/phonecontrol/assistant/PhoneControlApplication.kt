@@ -9,6 +9,7 @@ import com.phonecontrol.assistant.developer.DhdAdbController
 import com.phonecontrol.assistant.developer.DhdAdbProcessRunner
 import com.phonecontrol.assistant.developer.DhdTaskDisplayBackend
 import com.phonecontrol.assistant.developer.DhdVirtualDisplayManager
+import com.phonecontrol.assistant.overlay.OverlayVisibilityGate
 import com.phonecontrol.assistant.policy.PolicyEngine
 import com.phonecontrol.assistant.session.SessionCoordinator
 import com.phonecontrol.assistant.execution.PhoneObservationProvider
@@ -37,6 +38,8 @@ class PhoneControlApplication : Application() {
     lateinit var conversationStore: ConversationStore
         private set
     lateinit var devBridgeServer: DevBridgeServer
+        private set
+    lateinit var overlayVisibilityGate: OverlayVisibilityGate
         private set
 
     fun attachTaskPreview(session: TaskDisplaySession, surface: Surface) {
@@ -106,6 +109,7 @@ class PhoneControlApplication : Application() {
             }
         }
         observationProvider = PhoneObservationProvider(this, processRunner, taskDisplayBackend)
+        overlayVisibilityGate = OverlayVisibilityGate()
         sessionCoordinator = SessionCoordinator(
             enabledPackagesProvider = { appPermissionRepository.enabledPackages() },
             // Structural observation checks are always enabled; guard-region

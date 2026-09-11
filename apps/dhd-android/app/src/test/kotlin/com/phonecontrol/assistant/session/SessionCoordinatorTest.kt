@@ -14,6 +14,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -296,6 +297,35 @@ class SessionCoordinatorTest {
 
         val event = coordinator.events.value.last()
         assertEquals("dhd_browse_app", event.toolName)
+    }
+
+    @Test
+    fun `tool call lifecycle exposes only bounded safe activity`() {
+        val coordinator = coordinator()
+        coordinator.start("Find a restaurant")
+
+        val callId = coordinator.beginToolCall("dhd_observe", "Inspecting the current screen")
+
+        assertNotNull(callId)
+        assertEquals(1, coordinator.toolCalls.value.size)
+        assertEquals("dhd_observe", coordinator.toolCalls.value.single().toolName)
+        assertEquals(DhdToolCallStatus.RUNNING, coordinator.toolCalls.value.single().status)
+        assertTrue(coordinator.finishToolCall(callId, DhdToolCallStatus.COMPLETED))
+        assertEquals(DhdToolCallStatus.COMPLETED, coordinator.toolCalls.value.single().status)
+        assertFalse(coordinator.finishToolCall(callId, DhdToolCallStatus.FAILED))
+    }
+
+    @Test
+    fun `tool call history is bounded to the most recent calls`() {
+        val coordinator = coordinator()
+        coordinator.start("Find a restaurant")
+
+        repeat(15) { index ->
+            assertNotNull(coordinator.beginToolCall("dhd_execute", "Step $index"))
+        }
+
+        assertEquals(12, coordinator.toolCalls.value.size)
+        assertEquals("Step 3", coordinator.toolCalls.value.first().purpose)
     }
 
     private fun coordinator(phoneActionsReady: () -> Boolean = { true }): SessionCoordinator = SessionCoordinator(

@@ -702,7 +702,9 @@ class ConversationStore(context: Context) {
         val messages = dao.listMessages(conversationId).map {
             TimelineItem.Message(it.id, it.runId, it.role, it.text, it.createdAtEpochMs)
         }
-        val activities = dao.listConversationActivities(conversationId).map {
+        val activities = dao.listConversationActivities(conversationId)
+            .filterNot { it.toolName.equals("dhd_close_display", ignoreCase = true) || it.toolName.equals("close_display", ignoreCase = true) }
+            .map {
             TimelineItem.Activity(
                 id = it.id,
                 runId = it.runId,

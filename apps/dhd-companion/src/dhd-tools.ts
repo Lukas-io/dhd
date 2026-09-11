@@ -686,6 +686,7 @@ export async function invokeDhdTool(
         const parsed = parseInput(schemas.dhdListAllowedAppsInputSchema, input);
         return requestBridge({
           type: "allowed_apps",
+          tool: "dhd_list_allowed_apps",
           requestId: randomUUID(),
           includeAll: parsed.includeAll
         });
@@ -695,6 +696,7 @@ export async function invokeDhdTool(
         const parsed = parseInput(schemas.dhdBrowseAppInputSchema, input);
         return requestBridge({
           type: "browse_apps",
+          tool: "dhd_browse_app",
           requestId: randomUUID(),
           query: parsed.query
         });
@@ -704,6 +706,7 @@ export async function invokeDhdTool(
         parseInput(schemas.dhdListDisplaysInputSchema, input);
         return requestBridge({
           type: "list_displays",
+          tool: "dhd_list_displays",
           requestId: randomUUID(),
         });
       });
@@ -712,6 +715,7 @@ export async function invokeDhdTool(
         const parsed = parseInput(schemas.dhdCloseDisplayInputSchema, input);
         return requestBridge({
           type: "close_display",
+          tool: "dhd_close_display",
           requestId: randomUUID(),
           displayRef: parsed.displayRef,
         });
@@ -721,6 +725,7 @@ export async function invokeDhdTool(
         const parsed = parseInput(schemas.dhdGetForegroundAppInputSchema, input);
         return requestBridge({
           type: "foreground_app",
+          tool: "dhd_get_foreground_app",
           requestId: randomUUID(),
           ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
         });
@@ -730,6 +735,7 @@ export async function invokeDhdTool(
         const parsed = parseInput(schemas.dhdObserveInputSchema, input);
         return requestBridge({
           type: "observe",
+          tool: "dhd_observe",
           requestId: randomUUID(),
           ...(parsed.purpose ? { purpose: parsed.purpose } : {}),
           ...(parsed.targetDescription ? { targetDescription: parsed.targetDescription } : {}),
@@ -746,6 +752,7 @@ export async function invokeDhdTool(
         };
         return requestBridge({
           type: "execute_action",
+          tool: "dhd_open_app",
           requestId: randomUUID(),
           ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
           action: {
@@ -763,6 +770,7 @@ export async function invokeDhdTool(
         executedAction = action as unknown as Record<string, unknown>;
         return requestBridge({
           type: "execute_action",
+          tool: "dhd_execute",
           requestId: randomUUID(),
           ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
           action,
@@ -775,6 +783,7 @@ export async function invokeDhdTool(
         sequenceActions = parsed.actions as readonly Record<string, unknown>[];
         return requestBridge({
           type: "execute_sequence",
+          tool: "dhd_execute_sequence",
           requestId: randomUUID(),
           observationId: parsed.observationId,
           ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
@@ -787,6 +796,7 @@ export async function invokeDhdTool(
         return requestBridge(
           {
             type: "request_attention",
+            tool: "dhd_request_attention",
             requestId: randomUUID(),
             reason: parsed.reason,
             ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
