@@ -183,6 +183,7 @@ class MainActivity : ComponentActivity() {
             }
             PhoneControlApp(
                 initialConversationId = initialConversationId,
+                initialRoute = intent.getStringExtra(EXTRA_OPEN_ROUTE),
                 onRunRequest = ::startSession,
                 onStopSession = ::stopSession,
                 onContinueSession = ::continueSession,
@@ -243,6 +244,10 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (intent.hasExtra(EXTRA_OPEN_ROUTE)) {
+            recreate()
+            return
+        }
         refreshOverlayState()
     }
 
@@ -361,6 +366,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_CONVERSATION_ID = "com.phonecontrol.assistant.extra.CONVERSATION_ID"
+        const val EXTRA_OPEN_ROUTE = "com.phonecontrol.assistant.extra.OPEN_ROUTE"
     }
 }
 

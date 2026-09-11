@@ -1,6 +1,8 @@
 package com.phonecontrol.assistant.overlay
 
 import com.phonecontrol.assistant.session.SessionState
+import com.phonecontrol.assistant.developer.DeveloperConnectionState
+import com.phonecontrol.assistant.developer.DeveloperModeStatus
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -118,6 +120,42 @@ class OverlayVisibilityGateTest {
     }
 
     @Test
+    fun `overlay recovery prioritizes attention over connection recovery`() {
+        val attention = runningState("Needs your attention").copy(
+            attentionReason = "Confirm the prompt.",
+        )
+
+        assertEquals(
+            OverlayRecoveryKind.ATTENTION,
+            overlayRecoveryKind(
+                state = attention,
+                developerStatus = DeveloperModeStatus(DeveloperConnectionState.WIRELESS_DEBUGGING_OFF),
+                companionConnected = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `overlay recovery exposes developer and companion states`() {
+        assertEquals(
+            OverlayRecoveryKind.DEVELOPER,
+            overlayRecoveryKind(
+                state = runningState("Opening an app"),
+                developerStatus = DeveloperModeStatus(DeveloperConnectionState.WIRELESS_DEBUGGING_OFF),
+                companionConnected = true,
+            ),
+        )
+        assertEquals(
+            OverlayRecoveryKind.COMPANION,
+            overlayRecoveryKind(
+                state = runningState("Waiting for desktop Codex bridge"),
+                developerStatus = DeveloperModeStatus(DeveloperConnectionState.READY),
+                companionConnected = false,
+            ),
+        )
+    }
+
+    @Test
     fun `horizontal swipe places bubble on the matching display edge`() {
         val current = BubblePosition(x = 420, y = 600)
 
@@ -146,7 +184,31 @@ class OverlayVisibilityGateTest {
     }
 
     @Test
-    fun `active terminal transition shows result even after collapse`() {
+    fun `bubble release snaps to the nearest display edge`() {
+        assertEquals(
+            BubblePosition(x = 12, y = 600),
+            bubblePositionOnNearestEdge(
+                currentPosition = BubblePosition(x = 420, y = 600),
+                displayWidth = 1080,
+                displayHeight = 2400,
+                bubbleWidth = 64,
+                bubbleHeight = 64,
+            ),
+        )
+        assertEquals(
+            BubblePosition(x = 1004, y = 600),
+            bubblePositionOnNearestEdge(
+                currentPosition = BubblePosition(x = 700, y = 600),
+                displayWidth = 1080,
+                displayHeight = 2400,
+                bubbleWidth = 64,
+                bubbleHeight = 64,
+            ),
+        )
+    }
+
+    @Test
+    fun `stopping an active run returns to the quiet bubble when collapsed`() {
         val running = runningState("Working")
         val stopped = SessionState.Stopped(
             sessionId = running.sessionId,
@@ -154,8 +216,22 @@ class OverlayVisibilityGateTest {
         )
 
         assertEquals(
-            OverlayPanelMode.RESULT,
+            OverlayPanelMode.BUBBLE,
             nextOverlayPanelMode(OverlayPanelMode.BUBBLE, running, stopped),
+        )
+    }
+
+    @Test
+    fun `stopping an expanded active run returns to the composer without a result`() {
+        val running = runningState("Working")
+        val stopped = SessionState.Stopped(
+            sessionId = running.sessionId,
+            reason = "Stopped from the notification.",
+        )
+
+        assertEquals(
+            OverlayPanelMode.COMPOSER,
+            nextOverlayPanelMode(OverlayPanelMode.WORKING, running, stopped),
         )
     }
 

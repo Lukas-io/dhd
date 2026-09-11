@@ -429,19 +429,32 @@ class DevBridgeServer(
     private fun toolPurpose(toolName: String, json: JSONObject): String = when (toolName) {
         DHD_OBSERVE_TOOL -> json.optString("purpose").trim().takeIf(String::isNotBlank)
             ?: defaultDhdToolPurpose(toolName)
-        DHD_OPEN_APP_TOOL -> {
-            val packageName = json.optJSONObject("action")?.optString("packageName")?.trim()
-            if (packageName.isNullOrBlank()) defaultDhdToolPurpose(toolName) else "Opening $packageName"
-        }
+        DHD_OPEN_APP_TOOL -> openingAppPurpose(json)
         DHD_EXECUTE_TOOL -> {
-            val purpose = json.optJSONObject("action")
-                ?.optJSONObject("metadata")
-                ?.optString("purpose")
-                ?.trim()
-            purpose?.takeIf(String::isNotBlank) ?: defaultDhdToolPurpose(toolName)
+            val action = json.optJSONObject("action")
+            if (action?.optString("type")?.equals("open_app", ignoreCase = true) == true) {
+                openingAppPurpose(json)
+            } else {
+                val purpose = action
+                    ?.optJSONObject("metadata")
+                    ?.optString("purpose")
+                    ?.trim()
+                purpose?.takeIf(String::isNotBlank) ?: defaultDhdToolPurpose(toolName)
+            }
         }
         "dhd_request_attention" -> defaultDhdToolPurpose(toolName)
         else -> defaultDhdToolPurpose(toolName)
+    }
+
+    private fun openingAppPurpose(json: JSONObject): String {
+        val packageName = json.optJSONObject("action")
+            ?.optString("packageName")
+            ?.trim()
+            ?.takeIf(String::isNotBlank)
+        val label = packageName
+            ?.let(::appLabel)
+            ?.takeIf { it.isNotBlank() && !it.equals(packageName, ignoreCase = true) }
+        return label?.let { "Opening $it" } ?: defaultDhdToolPurpose(DHD_OPEN_APP_TOOL)
     }
 
     private fun startSession(

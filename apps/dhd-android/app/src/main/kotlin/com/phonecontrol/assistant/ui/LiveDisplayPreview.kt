@@ -225,6 +225,7 @@ fun LiveDisplayPreview(
     onSurfaceAvailable: (AndroidSurface) -> Unit,
     onSurfaceDestroyed: (AndroidSurface) -> Unit,
     onExpand: () -> Unit = {},
+    showCardChrome: Boolean = true,
 ) {
     val latestOnSurfaceAvailable = rememberUpdatedState(onSurfaceAvailable)
     val latestOnSurfaceDestroyed = rememberUpdatedState(onSurfaceDestroyed)
@@ -253,12 +254,18 @@ fun LiveDisplayPreview(
     val previewAspectRatio = state.aspectRatio.takeIf { it.isFinite() && it > 0f }
         ?: DEFAULT_LIVE_DISPLAY_PREVIEW_ASPECT_RATIO
     val shape = RoundedCornerShape(FULLSCREEN_DISPLAY_CORNER_RADIUS_DP.dp)
+    val previewContainerModifier = if (showCardChrome) {
+        Modifier
+            .background(colors.surfaceCard, shape)
+            .clip(shape)
+    } else {
+        Modifier
+    }
     BoxWithConstraints(
         modifier = modifier
             .fillMaxWidth()
             .heightIn(min = 160.dp, max = 360.dp)
-            .background(colors.surfaceCard, shape)
-            .clip(shape)
+            .then(previewContainerModifier)
             .semantics { contentDescription = "Live app preview" },
         contentAlignment = Alignment.Center,
     ) {
@@ -272,8 +279,8 @@ fun LiveDisplayPreview(
                 .width(previewWidth)
                 .height(previewHeight),
             shape = shape,
-            color = colors.surfaceCard,
-            shadowElevation = 2.dp,
+            color = if (showCardChrome) colors.surfaceCard else Color.Transparent,
+            shadowElevation = if (showCardChrome) 2.dp else 0.dp,
         ) {
             Box(modifier = Modifier.fillMaxSize()) {
                 AndroidView(
@@ -287,7 +294,13 @@ fun LiveDisplayPreview(
                         // The preview is not an input surface for the agent. It
                         // consumes taps so a preview cannot accidentally become a
                         // second control path.
-                        .background(colors.surfaceCard),
+                        .then(
+                            if (showCardChrome) {
+                                Modifier.background(colors.surfaceCard)
+                            } else {
+                                Modifier
+                            },
+                        ),
                     update = { view ->
                         view.contentDescription = "Live app preview"
                     },

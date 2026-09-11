@@ -42,6 +42,8 @@ class AssistantForegroundService : Service() {
             context = this,
             coordinator = coordinator,
             visibilityGate = overlayVisibilityGate,
+            developerStatus = application.developerModeController.status,
+            companionConnected = application.devBridgeServer.companionConnected,
             taskPreviewState = application.taskDisplayBackend.previewState,
             onTaskPreviewSurfaceAvailable = { session, surface ->
                 application.attachTaskPreview(session, surface)

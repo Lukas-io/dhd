@@ -162,6 +162,7 @@ object AppRoutes {
 @Composable
 fun PhoneControlApp(
     initialConversationId: String? = null,
+    initialRoute: String? = null,
     onRunRequest: (String, String?, String?, Boolean) -> Unit,
     onStopSession: () -> Unit,
     onContinueSession: () -> Unit = {},
@@ -267,6 +268,15 @@ fun PhoneControlApp(
     val apps = remember { InstalledAppsRepository(context).listLaunchableUserApps() }
 
     val navController = rememberNavController()
+    val initialNavigationRoute = when (initialRoute) {
+        AppRoutes.SETTINGS,
+        AppRoutes.TASK_DISPLAYS,
+        AppRoutes.PAIRING,
+        AppRoutes.APPROVED_APPS,
+        AppRoutes.COMPANION,
+        -> initialRoute
+        else -> null
+    }
     var viewerSessionKey by rememberSaveable { mutableStateOf<String?>(null) }
     var taskDisplaysSheetVisible by rememberSaveable { mutableStateOf(false) }
     val openTaskDisplays: () -> Unit = { taskDisplaysSheetVisible = true }
@@ -455,6 +465,14 @@ fun PhoneControlApp(
                             permissions = permissions,
                             onBack = { navController.popBackStack() },
                         )
+                    }
+                }
+
+                LaunchedEffect(initialNavigationRoute) {
+                    initialNavigationRoute?.let { route ->
+                        navController.navigate(route) {
+                            launchSingleTop = true
+                        }
                     }
                 }
 

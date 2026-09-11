@@ -1296,7 +1296,7 @@ private fun thinkingDetail(currentPurpose: String, elapsedSeconds: Long): String
     else -> currentPurpose.ifBlank { "Preparing the next step" }
 }
 
-private val THINKING_WORDS = listOf(
+internal val THINKING_WORDS = listOf(
     "Thinking…",
     "DHD-ing…",
     "Discombobulating…",

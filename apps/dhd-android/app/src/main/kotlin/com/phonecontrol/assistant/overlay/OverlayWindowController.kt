@@ -27,6 +27,7 @@ import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.phonecontrol.assistant.MainActivity
 import com.phonecontrol.assistant.data.DHD_CONVERSATION_ID
+import com.phonecontrol.assistant.developer.DeveloperModeStatus
 import com.phonecontrol.assistant.developer.TaskPreviewState
 import com.phonecontrol.assistant.domain.ReasoningEffort
 import com.phonecontrol.assistant.execution.TaskDisplaySession
@@ -34,6 +35,7 @@ import com.phonecontrol.assistant.session.AssistantForegroundService
 import com.phonecontrol.assistant.session.SessionCoordinator
 import com.phonecontrol.assistant.session.SessionState
 import com.phonecontrol.assistant.ui.DarkAssistantColors
+import com.phonecontrol.assistant.ui.AppRoutes
 import com.phonecontrol.assistant.ui.LightAssistantColors
 import com.phonecontrol.assistant.ui.LocalAssistantColors
 import com.phonecontrol.assistant.ui.ThemeMode
@@ -47,12 +49,14 @@ class OverlayWindowController(
     context: Context,
     private val coordinator: SessionCoordinator,
     private val visibilityGate: OverlayVisibilityGate,
+    private val developerStatus: StateFlow<DeveloperModeStatus>,
+    private val companionConnected: StateFlow<Boolean>,
     private val taskPreviewState: StateFlow<TaskPreviewState>,
     private val onTaskPreviewSurfaceAvailable: (TaskDisplaySession, Surface) -> Unit,
     private val onTaskPreviewSurfaceDestroyed: (TaskDisplaySession, Surface) -> Unit,
 ) {
     private companion object {
-        const val BUBBLE_SIZE_DP = 64
+        const val BUBBLE_SIZE_DP = 56
     }
 
     private val appContext = context.applicationContext
@@ -123,7 +127,9 @@ class OverlayWindowController(
         } else if (previousState.isActiveForOverlay() && state is SessionState.Completed) {
             _resultMessage.value = state.message
         } else if (previousState.isActiveForOverlay() && state is SessionState.Stopped) {
-            _resultMessage.value = state.reason
+            // A user stop is a control action, not an assistant result. Keep the
+            // overlay quiet and return to the composer (or the collapsed bubble).
+            _resultMessage.value = null
         }
         if (state is SessionState.Completed || state is SessionState.Stopped) {
             if (previousState.isActiveForOverlay()) {
@@ -241,6 +247,44 @@ class OverlayWindowController(
         OverlayPreferences.setBubblePosition(appContext, position)
     }
 
+    fun snapBubbleToNearestEdge() {
+        val panel = panelView ?: return
+        val params = panelParams ?: return
+        if (_panelMode.value != OverlayPanelMode.BUBBLE || hidden) return
+
+        val metrics = appContext.resources.displayMetrics
+        val insets = bubbleInsets()
+        val bubbleWidth = params.width.takeIf { it > 0 } ?: bubbleSizePx()
+        val bubbleHeight = params.height.takeIf { it > 0 } ?: bubbleSizePx()
+        val current = clampBubblePosition(
+            x = params.x,
+            y = params.y,
+            displayWidth = metrics.widthPixels,
+            displayHeight = metrics.heightPixels,
+            bubbleWidth = bubbleWidth,
+            bubbleHeight = bubbleHeight,
+            topInset = insets.top,
+            bottomInset = insets.bottom,
+        )
+        val target = bubblePositionOnNearestEdge(
+            currentPosition = current,
+            displayWidth = metrics.widthPixels,
+            displayHeight = metrics.heightPixels,
+            bubbleWidth = bubbleWidth,
+            bubbleHeight = bubbleHeight,
+            topInset = insets.top,
+            bottomInset = insets.bottom,
+        )
+        OverlayPreferences.setBubblePosition(appContext, target)
+        if (current != target) {
+            animateBubbleFrom(current, target)
+        } else {
+            params.x = target.x
+            params.y = target.y
+            runCatching { windowManager.updateViewLayout(panel, params) }
+        }
+    }
+
     private fun setPanelMode(mode: OverlayPanelMode) {
         val changed = _panelMode.value != mode
         if (mode != OverlayPanelMode.BUBBLE) {
@@ -285,11 +329,18 @@ class OverlayWindowController(
                         toolCalls = coordinator.toolCalls,
                         panelMode = panelMode,
                         resultMessage = resultMessage,
+                        developerStatus = developerStatus,
+                        companionConnected = companionConnected,
                         onExpand = ::openComposer,
                         onNewRequest = ::openComposer,
                         onSubmit = ::submitRequest,
                         onDrag = ::moveBubble,
+                        onBubbleDragEnd = ::snapBubbleToNearestEdge,
                         onStop = ::stopSession,
+                        onAcknowledgeAttention = ::acknowledgeAttention,
+                        onOpenSettings = { openDhdRoute(AppRoutes.SETTINGS) },
+                        onOpenDeveloperOptions = ::openDeveloperOptions,
+                        onOpenCompanion = { openDhdRoute(AppRoutes.COMPANION) },
                         onContinueInDhd = ::continueInDhd,
                         onCollapse = ::showBubble,
                         onDismissResult = ::dismissResult,
@@ -347,9 +398,8 @@ class OverlayWindowController(
         }
         val savedPosition = OverlayPreferences.bubblePosition(appContext)
         val insets = bubbleInsets()
-        val bubblePosition = clampBubblePosition(
-            x = savedPosition.x,
-            y = savedPosition.y,
+        val bubblePosition = bubblePositionOnNearestEdge(
+            currentPosition = savedPosition,
             displayWidth = appContext.resources.displayMetrics.widthPixels,
             displayHeight = appContext.resources.displayMetrics.heightPixels,
             bubbleWidth = bubbleSizePx(),
@@ -403,9 +453,8 @@ class OverlayWindowController(
         } else {
             val savedPosition = OverlayPreferences.bubblePosition(appContext)
             val insets = bubbleInsets()
-            val bubblePosition = clampBubblePosition(
-                x = savedPosition.x,
-                y = savedPosition.y,
+            val bubblePosition = bubblePositionOnNearestEdge(
+                currentPosition = savedPosition,
                 displayWidth = appContext.resources.displayMetrics.widthPixels,
                 displayHeight = appContext.resources.displayMetrics.heightPixels,
                 bubbleWidth = bubbleSizePx(),
@@ -461,6 +510,38 @@ class OverlayWindowController(
             android.content.Intent(appContext, AssistantForegroundService::class.java)
                 .setAction(AssistantForegroundService.ACTION_STOP),
         )
+    }
+
+    private fun acknowledgeAttention(): Boolean {
+        val acknowledged = coordinator.acknowledgeAttention()
+        if (acknowledged) {
+            AssistantForegroundService.removeAttentionNotification(appContext)
+        }
+        return acknowledged
+    }
+
+    private fun openDhdRoute(route: String) {
+        appContext.startActivity(
+            android.content.Intent(appContext, MainActivity::class.java).apply {
+                addFlags(
+                    android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                        android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                        android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP,
+                )
+                putExtra(MainActivity.EXTRA_OPEN_ROUTE, route)
+            },
+        )
+    }
+
+    private fun openDeveloperOptions() {
+        runCatching {
+            appContext.startActivity(
+                android.content.Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS).apply {
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    putExtra(":settings:fragment_args_key", "toggle_adb_wireless")
+                },
+            )
+        }
     }
 
     private fun continueInDhd() {
@@ -594,8 +675,16 @@ internal fun nextOverlayPanelMode(
             else -> OverlayPanelMode.WORKING
         }
     }
-    return if (wasActive && (state is SessionState.Completed || state is SessionState.Stopped)) {
-        OverlayPanelMode.RESULT
+    return if (wasActive) {
+        when (state) {
+            is SessionState.Completed -> OverlayPanelMode.RESULT
+            is SessionState.Stopped -> if (currentMode == OverlayPanelMode.BUBBLE) {
+                OverlayPanelMode.BUBBLE
+            } else {
+                OverlayPanelMode.COMPOSER
+            }
+            else -> currentMode
+        }
     } else {
         currentMode
     }
@@ -638,4 +727,30 @@ internal fun bubblePositionForHorizontalSwipe(
         topInset = topInset,
         bottomInset = bottomInset,
     )
+}
+
+internal fun bubblePositionOnNearestEdge(
+    currentPosition: BubblePosition,
+    displayWidth: Int,
+    displayHeight: Int,
+    bubbleWidth: Int,
+    bubbleHeight: Int,
+    topInset: Int = 0,
+    bottomInset: Int = 0,
+    margin: Int = 12,
+): BubblePosition {
+    val clamped = clampBubblePosition(
+        x = currentPosition.x,
+        y = currentPosition.y,
+        displayWidth = displayWidth,
+        displayHeight = displayHeight,
+        bubbleWidth = bubbleWidth,
+        bubbleHeight = bubbleHeight,
+        topInset = topInset,
+        bottomInset = bottomInset,
+        margin = margin,
+    )
+    val rightX = (displayWidth - bubbleWidth - margin).coerceAtLeast(margin)
+    val edgeX = if (clamped.x + bubbleWidth / 2 <= displayWidth / 2) margin else rightX
+    return BubblePosition(edgeX, clamped.y)
 }
