@@ -112,15 +112,18 @@ class MainActivity : ComponentActivity() {
                 val playbackForSession = previewStates[session.sessionKey]
                     ?: playback.forSession(session.sessionKey)
                 val error = playbackForSession as? TaskPreviewState.Error
+                val ended = playbackForSession as? TaskPreviewState.Ended
                 val appLabel = session.packageName.applicationLabel(appPackageManager)
                 LiveDisplayPreviewState(
                     status = when {
                         error?.sessionKey == session.sessionKey -> LiveDisplayPreviewStatus.ERROR
+                        ended?.session?.sessionKey == session.sessionKey -> LiveDisplayPreviewStatus.UNAVAILABLE
                         (playbackForSession as? TaskPreviewState.Attached)?.session == session ->
                             LiveDisplayPreviewStatus.LIVE
                         else -> LiveDisplayPreviewStatus.CONNECTING
                     },
-                    message = error?.takeIf { it.sessionKey == session.sessionKey }?.message,
+                    message = error?.takeIf { it.sessionKey == session.sessionKey }?.message
+                        ?: ended?.takeIf { it.session.sessionKey == session.sessionKey }?.message,
                     aspectRatio = session.geometry.width.toFloat() / session.geometry.height,
                     appLabel = appLabel,
                     sessionKey = session.sessionKey,
@@ -429,6 +432,12 @@ private fun TaskPreviewState?.toUiPreview(
             aspectRatio = ratio,
             sessionKey = sessionKey,
         ).copy(purpose = purpose, currentToolName = currentToolName)
+        is TaskPreviewState.Ended -> LiveDisplayPreviewState.unavailable(
+            message = message,
+            aspectRatio = ratio,
+            sessionKey = sessionKey,
+            currentToolName = currentToolName,
+        ).copy(appLabel = appLabel, purpose = purpose)
         else -> null
     }
 }
@@ -474,6 +483,7 @@ private fun TaskPreviewState.forSession(sessionKey: String): TaskPreviewState? =
     TaskPreviewState.Detached -> null
     is TaskPreviewState.Connecting -> takeIf { session.sessionKey == sessionKey }
     is TaskPreviewState.Attached -> takeIf { session.sessionKey == sessionKey }
+    is TaskPreviewState.Ended -> takeIf { session.sessionKey == sessionKey }
     is TaskPreviewState.Error -> takeIf { this.sessionKey == sessionKey }
 }
 

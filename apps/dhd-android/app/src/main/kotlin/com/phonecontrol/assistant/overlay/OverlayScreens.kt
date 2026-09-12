@@ -1957,6 +1957,7 @@ private fun OverlayVirtualDisplayPreview(
     }
     val statusMessage = when (previewState) {
         TaskPreviewState.Detached -> "The virtual display will appear when a task opens one."
+        is TaskPreviewState.Ended -> previewState.message
         is TaskPreviewState.Error -> previewState.message
         else -> null
     }

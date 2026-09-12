@@ -40,8 +40,46 @@ sealed interface TaskPreviewState {
     data object Detached : TaskPreviewState
     data class Connecting(val session: TaskDisplaySession) : TaskPreviewState
     data class Attached(val session: TaskDisplaySession) : TaskPreviewState
+    data class Ended(
+        val session: TaskDisplaySession,
+        val message: String,
+    ) : TaskPreviewState
     data class Error(val sessionKey: String?, val message: String) : TaskPreviewState
 }
+
+/**
+ * Returns whether [packageName] still has an activity/task on [displayId].
+ * A null result means the command output did not contain a recognizable
+ * section for that display, so callers must treat the observation as unknown.
+ */
+internal fun parseDisplayTaskPresence(
+    text: String,
+    displayId: Int,
+    packageName: String,
+): Boolean? {
+    if (displayId <= 0 || packageName.isBlank()) return null
+    val packagePattern = Regex(
+        "(?<![A-Za-z0-9_])${Regex.escape(packageName)}(?:/|(?=[^A-Za-z0-9_.]|$))",
+    )
+    var currentDisplay: Int? = null
+    var sawDisplay = false
+    for (line in text.lineSequence()) {
+        DISPLAY_ID_REGEX.find(line)?.let { match ->
+            currentDisplay = match.groupValues
+                .drop(1)
+                .firstOrNull(String::isNotBlank)
+                ?.toIntOrNull()
+            if (currentDisplay == displayId) sawDisplay = true
+        }
+        if (currentDisplay == displayId && packagePattern.containsMatchIn(line)) return true
+    }
+    return if (sawDisplay) false else null
+}
+
+private val DISPLAY_ID_REGEX = Regex(
+    "(?:\\bdisplayId\\s*[:=]?\\s*(\\d+))|(?:\\bmDisplayId\\s*[:=]?\\s*(\\d+))|(?:\\bDisplay\\s*#?\\s*(\\d+)\\b)",
+    RegexOption.IGNORE_CASE,
+)
 
 /**
  * Adapts the shell-UID native display service to the execution-layer contract.
@@ -70,8 +108,6 @@ class DhdTaskDisplayBackend(
     private val cancelledKeys = ConcurrentHashMap.newKeySet<String>()
     private val operationLocks = ConcurrentHashMap<String, Mutex>()
     private val liveHandles = mutableMapOf<String, LiveHandle>()
-    /** Sessions that have rendered at least one frame in this process. */
-    private val lastLivePreviewSessions = mutableSetOf<String>()
     private val previewStateJobs = mutableMapOf<String, Job>()
     private val _activeSession = MutableStateFlow<TaskDisplaySession?>(null)
     private val _previewState = MutableStateFlow<TaskPreviewState>(TaskPreviewState.Detached)
@@ -80,10 +116,15 @@ class DhdTaskDisplayBackend(
     private val expiryJobs = mutableMapOf<String, Job>()
     private val recordsLock = Any()
     private val reconciliationJob: Job
+    private val taskLivenessJob: Job
 
     init {
         restorePersistedRecords()
         reconciliationJob = scope.launch { reconcileNativeSessionsWithRetry() }
+        taskLivenessJob = scope.launch {
+            reconciliationJob.join()
+            monitorTaskLiveness()
+        }
     }
 
     /** The one task display currently shown by the DHD task UI, if any. */
@@ -140,7 +181,6 @@ class DhdTaskDisplayBackend(
                 if (cancelledKeys.contains(sessionKey)) {
                     true
                 } else {
-                    lastLivePreviewSessions.remove(sessionKey)
                     sessions[sessionKey] = bound
                     bindRunKey(sessionKey, sessionKey)
                     _activeSession.value = taskSession
@@ -448,11 +488,9 @@ class DhdTaskDisplayBackend(
                         ?.takeIf { it.taskSession == session }
                         ?: throw TaskDisplayException("The task display session is no longer active.")
                 }
-                val (previousHandle, preserveLiveWhileReconnecting) = stateLock.withLock {
-                    val preserve = lastLivePreviewSessions.contains(session.sessionKey) ||
-                        _previewStates.value[session.sessionKey] is TaskPreviewState.Attached
+                val previousHandle = stateLock.withLock {
                     previewStateJobs.remove(session.sessionKey)?.cancel()
-                    Pair(liveHandles.remove(session.sessionKey), preserve)
+                    liveHandles.remove(session.sessionKey)
                 }
                 // Closing the app-side decoder only closes its socket. The
                 // daemon must also clear its registered stream client before
@@ -471,16 +509,11 @@ class DhdTaskDisplayBackend(
                     liveHandles[session.sessionKey] = LiveHandle(surface, handle)
                     publishPreviewStateLocked(
                         session.sessionKey,
-                        if (preserveLiveWhileReconnecting) {
-                            TaskPreviewState.Attached(session)
-                        } else {
-                            TaskPreviewState.Connecting(session)
-                        },
+                        TaskPreviewState.Connecting(session),
                     )
                     previewStateJobs[session.sessionKey] = observePreviewState(
                         session = session,
                         handle = handle,
-                        preserveLiveWhileConnecting = preserveLiveWhileReconnecting,
                     )
                 }
             }
@@ -585,6 +618,71 @@ class DhdTaskDisplayBackend(
         reconcileNativeSessionsWithRetry(force = true)
     }
 
+    /**
+     * Keep the display lifecycle tied to the app task that was launched on it.
+     * The native display can outlive that task and continue producing an empty
+     * surface, so a decoder error alone is not enough to identify this case.
+     * Query failures are treated as unknown; three confirmed missing polls are
+     * required before ending a display to tolerate activity transitions.
+     */
+    private suspend fun monitorTaskLiveness() {
+        val missingPolls = mutableMapOf<String, Int>()
+        while (true) {
+            val candidates = stateLock.withLock {
+                sessions.values.map { it.taskSession }
+            }
+            if (candidates.isEmpty()) {
+                missingPolls.clear()
+                delay(TASK_LIVENESS_POLL_MS)
+                continue
+            }
+
+            val result = try {
+                processRunner.run(DUMPSYS_ACTIVITY_COMMAND)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                null
+            }
+            if (result?.exitCode == 0 && !result.timedOut) {
+                val output = result.stdout.toString(Charsets.UTF_8)
+                val currentKeys = candidates.mapTo(mutableSetOf()) { it.sessionKey }
+                missingPolls.keys.retainAll(currentKeys)
+                candidates.forEach { session ->
+                    when (parseDisplayTaskPresence(output, session.displayId, session.packageName)) {
+                        true -> missingPolls.remove(session.sessionKey)
+                        false -> {
+                            val count = (missingPolls[session.sessionKey] ?: 0) + 1
+                            if (count >= TASK_LIVENESS_MISSING_CONFIRMATIONS) {
+                                missingPolls.remove(session.sessionKey)
+                                endMissingAppTask(session)
+                            } else {
+                                missingPolls[session.sessionKey] = count
+                            }
+                        }
+                        null -> missingPolls.remove(session.sessionKey)
+                    }
+                }
+            } else {
+                missingPolls.clear()
+            }
+            delay(TASK_LIVENESS_POLL_MS)
+        }
+    }
+
+    private suspend fun endMissingAppTask(session: TaskDisplaySession) {
+        val stillCurrent = stateLock.withLock {
+            sessions[session.sessionKey]?.taskSession == session
+        }
+        if (!stillCurrent) return
+        closeInternal(
+            sessionKey = session.sessionKey,
+            finalStatus = TaskDisplayStatus.ENDED,
+            finalPurpose = "App task ended",
+            finalError = "The target app task is no longer present on the virtual display.",
+        )
+    }
+
     override suspend fun retain(
         sessionKey: String,
         status: TaskDisplayStatus,
@@ -668,20 +766,26 @@ class DhdTaskDisplayBackend(
     private suspend fun close(sessionKey: String, expected: TaskDisplaySession?) {
         val operationLock = operationLocks.getOrPut(sessionKey) { Mutex() }
         operationLock.withLock {
+            var endedSession: TaskDisplaySession? = null
             val shouldClose = stateLock.withLock {
                 val current = sessions[sessionKey]
                 if (expected != null && current?.taskSession != expected) {
                     false
                 } else {
-                    sessions.remove(sessionKey)
-                    lastLivePreviewSessions.remove(sessionKey)
+                    endedSession = sessions.remove(sessionKey)?.taskSession
                     previewStateJobs.remove(sessionKey)?.cancel()
                     liveHandles.remove(sessionKey)?.handle?.close()
                     if (_activeSession.value?.sessionKey == sessionKey) {
                         _activeSession.value = sessions.values.lastOrNull()?.taskSession
                     }
-                    if (_previewState.value.sessionKeyOrNull() == sessionKey) {
-                        publishPreviewStateLocked(sessionKey, TaskPreviewState.Detached)
+                    endedSession?.let { session ->
+                        publishPreviewStateLocked(
+                            sessionKey,
+                            TaskPreviewState.Ended(
+                                session = session,
+                                message = "The virtual display ended.",
+                            ),
+                        )
                     }
                     true
                 }
@@ -924,7 +1028,6 @@ class DhdTaskDisplayBackend(
             } else {
                 removed = true
                 sessions.remove(sessionKey)
-                lastLivePreviewSessions.remove(sessionKey)
                 previewStateJobs.remove(sessionKey)?.cancel()
                 if (_activeSession.value?.sessionKey == sessionKey) {
                     _activeSession.value = sessions.values.lastOrNull()?.taskSession
@@ -989,6 +1092,8 @@ class DhdTaskDisplayBackend(
         sessionKey: String,
         finalStatus: TaskDisplayStatus,
         expectedExpiry: Long? = null,
+        finalPurpose: String? = null,
+        finalError: String? = null,
     ) {
         val operationLock = operationLocks.getOrPut(sessionKey) { Mutex() }
         operationLock.withLock {
@@ -1005,16 +1110,26 @@ class DhdTaskDisplayBackend(
                 }
             }
             cancelledKeys += sessionKey
+            var endedSession: TaskDisplaySession? = null
             stateLock.withLock {
-                sessions.remove(sessionKey)
-                lastLivePreviewSessions.remove(sessionKey)
+                endedSession = sessions.remove(sessionKey)?.taskSession
                 previewStateJobs.remove(sessionKey)?.cancel()
                 liveHandles.remove(sessionKey)?.handle?.close()
                 if (_activeSession.value?.sessionKey == sessionKey) {
                     _activeSession.value = sessions.values.lastOrNull()?.taskSession
                 }
-                if (_previewState.value.sessionKeyOrNull() == sessionKey) {
-                    publishPreviewStateLocked(sessionKey, TaskPreviewState.Detached)
+                endedSession?.let { session ->
+                    publishPreviewStateLocked(
+                        sessionKey,
+                        if (finalStatus == TaskDisplayStatus.ENDED) {
+                            TaskPreviewState.Ended(
+                                session = session,
+                                message = finalError ?: "The virtual display ended.",
+                            )
+                        } else {
+                            TaskPreviewState.Detached
+                        },
+                    )
                 }
             }
             unbindOwner(sessionKey)
@@ -1026,6 +1141,8 @@ class DhdTaskDisplayBackend(
                         status = finalStatus,
                         terminalAtEpochMs = existing.terminalAtEpochMs ?: nowEpochMs(),
                         expiresAtEpochMs = existing.expiresAtEpochMs ?: nowEpochMs(),
+                        lastPurpose = finalPurpose ?: existing.lastPurpose,
+                        error = finalError ?: existing.error,
                     ),
                 )
             }
@@ -1142,21 +1259,13 @@ class DhdTaskDisplayBackend(
     private fun observePreviewState(
         session: TaskDisplaySession,
         handle: DhdLivePreviewHandle,
-        preserveLiveWhileConnecting: Boolean = false,
     ): Job = scope.launch {
         handle.state.collectLatest { state ->
             stateLock.withLock {
                 if (liveHandles[session.sessionKey]?.handle !== handle) return@withLock
                 publishPreviewStateLocked(session.sessionKey, when (state.phase) {
-                    DhdLivePreviewPhase.CONNECTING -> {
-                        if (preserveLiveWhileConnecting) {
-                            TaskPreviewState.Attached(session)
-                        } else {
-                            TaskPreviewState.Connecting(session)
-                        }
-                    }
+                    DhdLivePreviewPhase.CONNECTING -> TaskPreviewState.Connecting(session)
                     DhdLivePreviewPhase.LIVE -> {
-                        lastLivePreviewSessions += session.sessionKey
                         TaskPreviewState.Attached(session)
                     }
                     DhdLivePreviewPhase.ERROR -> TaskPreviewState.Error(
@@ -1259,6 +1368,7 @@ class DhdTaskDisplayBackend(
         TaskPreviewState.Detached -> null
         is TaskPreviewState.Connecting -> session.sessionKey
         is TaskPreviewState.Attached -> session.sessionKey
+        is TaskPreviewState.Ended -> session.sessionKey
         is TaskPreviewState.Error -> sessionKey
     }
 
@@ -1266,15 +1376,14 @@ class DhdTaskDisplayBackend(
 
     companion object {
         const val TERMINAL_RETENTION_MS: Long = 30 * 60 * 1000L
+        private const val TASK_LIVENESS_POLL_MS = 1_000L
+        private const val TASK_LIVENESS_MISSING_CONFIRMATIONS = 3
+        private val DUMPSYS_ACTIVITY_COMMAND = listOf("dumpsys", "activity", "activities")
         private const val DEFAULT_PURPOSE = "Preparing request"
         private const val MAX_RECORD_PURPOSE_CHARS = 240
         private const val MAX_RECORD_ERROR_CHARS = 4_000
         private const val RECONCILIATION_ATTEMPTS = 4
         private const val RECONCILIATION_RETRY_DELAY_MS = 250L
-        private val DISPLAY_ID_REGEX = Regex(
-            "(?:\\bdisplayId\\s*[:=]?\\s*(\\d+))|(?:\\bmDisplayId\\s*[:=]?\\s*(\\d+))|(?:\\bDisplay\\s*#?\\s*(\\d+)\\b)",
-            RegexOption.IGNORE_CASE,
-        )
         private val COMPONENT_REGEX = Regex(
             "\\b([A-Za-z][A-Za-z0-9_.$]*)/(\\.?[A-Za-z0-9_.$]+)",
         )
