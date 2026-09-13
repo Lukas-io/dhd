@@ -13,7 +13,9 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.security.MessageDigest
+import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -24,13 +26,14 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 
 enum class DhdLivePreviewPhase {
@@ -76,22 +79,29 @@ data class DhdLivePreviewState(
 }
 
 /**
- * Decodes the daemon's authenticated AVC stream into the supplied read-only
- * Surface. The stream is phone-local; the companion never sees video bytes.
- *
- * The codec is owned by the decode coroutine. [close] only cancels that
- * coroutine and closes its socket, so MediaCodec stop/release never races a
- * second owner on the Surface-destruction path.
+ * Owns one authenticated phone-local AVC stream for a task display. UI
+ * surfaces are short-lived subscribers: replacing inline with fullscreen
+ * replaces only the decoder target and replays the latest bounded GOP; it
+ * does not tear down the native stream connection.
  */
 class DhdLivePreviewHandle internal constructor(
     val session: DhdVirtualDisplaySession,
-    private val surface: Surface,
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
     private val socketReference = AtomicReference<Socket?>(null)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val stateFlow = MutableStateFlow(DhdLivePreviewState.connecting())
-    private val decodeJob: Job
+    private val streamHeader = MutableStateFlow<DhdVirtualDisplayProtocol.StreamHeader?>(null)
+    private val surfaceMutex = Mutex()
+    private val packetDispatchMutex = Mutex()
+    private val decoderLock = Any()
+    private var activeDecoder: ActiveDecoder? = null
+    private var desiredSurface: Surface? = null
+    private val nextDecoderId = AtomicLong(0L)
+    private val replayBuffer = DhdLivePreviewReplayBuffer()
+    @Volatile
+    private var connectionAttempt = 0
+    private val streamJob: Job
 
     /** Connecting becomes LIVE only after MediaCodec reports a rendered frame. */
     val state: StateFlow<DhdLivePreviewState> = stateFlow.asStateFlow()
@@ -100,7 +110,103 @@ class DhdLivePreviewHandle internal constructor(
     val playbackState: StateFlow<DhdLivePreviewState> = state
 
     init {
-        decodeJob = scope.launch { reconnectingDecodeLoop() }
+        streamJob = scope.launch { reconnectingStreamLoop() }
+    }
+
+    /** Attach a new UI surface without reconnecting the display stream. */
+    suspend fun attachSurface(surface: Surface) = surfaceMutex.withLock {
+        require(surface.isValid) { "The live preview surface is no longer valid." }
+        check(!closed.get()) { "The live preview controller is closed." }
+        synchronized(decoderLock) {
+            desiredSurface = surface
+        }
+        stateFlow.value = DhdLivePreviewState.connecting(connectionAttempt)
+        stopActiveDecoder()
+        // Do not hold the surface lease waiting for a network header. A
+        // destroyed view must be detachable even while the daemon is offline.
+        streamHeader.value?.let { attachDecoder(surface, it) }
+    }
+
+    private suspend fun attachDecoder(
+        surface: Surface,
+        header: DhdVirtualDisplayProtocol.StreamHeader,
+    ) {
+        stateFlow.value = DhdLivePreviewState.connecting(connectionAttempt)
+        stopActiveDecoder()
+        if (closed.get()) throw CancellationException("The live preview controller is closed.")
+
+        val channel = Channel<DhdVirtualDisplayProtocol.Packet>(
+            capacity = DhdVirtualDisplayProtocol.REPLAY_WINDOW_MAX_PACKETS +
+                DhdVirtualDisplayProtocol.DECODER_QUEUE_HEADROOM,
+        )
+        val decoderId = nextDecoderId.incrementAndGet()
+        val codec = MediaCodec.createDecoderByType(header.codecMime)
+        try {
+            val format = MediaFormat.createVideoFormat(header.codecMime, header.width, header.height)
+            header.csd0?.takeIf(ByteArray::isNotEmpty)?.let {
+                format.setByteBuffer("csd-0", ByteBuffer.wrap(it))
+            }
+            header.csd1?.takeIf(ByteArray::isNotEmpty)?.let {
+                format.setByteBuffer("csd-1", ByteBuffer.wrap(it))
+            }
+            codec.configure(format, surface, null, 0)
+            codec.setOnFrameRenderedListener(
+                object : MediaCodec.OnFrameRenderedListener {
+                    override fun onFrameRendered(
+                        codec: MediaCodec,
+                        presentationTimeUs: Long,
+                        nanoTime: Long,
+                    ) {
+                        if (isCurrentDecoder(decoderId) && !closed.get()) {
+                            stateFlow.value = DhdLivePreviewState.live(
+                                attempt = connectionAttempt,
+                                width = header.width,
+                                height = header.height,
+                            )
+                        }
+                    }
+                },
+                Handler(Looper.getMainLooper()),
+            )
+            codec.start()
+            val decoder = ActiveDecoder(
+                id = decoderId,
+                surface = surface,
+                channel = channel,
+                codec = codec,
+            )
+            packetDispatchMutex.withLock {
+                val replayPackets = replayBuffer.snapshot()
+                synchronized(decoderLock) {
+                    if (closed.get()) throw CancellationException("The live preview controller is closed.")
+                    activeDecoder = decoder
+                    replayPackets.forEach { packet ->
+                        check(channel.trySend(packet).isSuccess) {
+                            "The live preview replay window exceeded decoder queue capacity."
+                        }
+                    }
+                    decoder.job = scope.launch { decodePackets(decoder) }
+                }
+            }
+        } catch (error: Throwable) {
+            channel.close()
+            runCatching { codec.stop() }
+            runCatching { codec.release() }
+            if (error !is CancellationException && !closed.get()) {
+                publishError(previewFailureMessage(error), connectionAttempt)
+            }
+            throw error
+        }
+    }
+
+    /** Stop decoding into a destroyed UI surface but keep the stream alive. */
+    suspend fun detachSurface(surface: Surface) = surfaceMutex.withLock {
+        val matches = synchronized(decoderLock) {
+            val matches = desiredSurface === surface || activeDecoder?.surface === surface
+            if (desiredSurface === surface) desiredSurface = null
+            matches
+        }
+        if (matches) stopActiveDecoder()
     }
 
     override fun close() {
@@ -109,24 +215,54 @@ class DhdLivePreviewHandle internal constructor(
         socketReference.getAndSet(null)?.let { socket ->
             runCatching { socket.close() }
         }
-        // The decode coroutine owns MediaCodec teardown. Cancellation also
-        // wakes its packet reader and input-buffer wait loops.
-        decodeJob.cancel()
+        synchronized(decoderLock) {
+            activeDecoder?.channel?.close()
+            activeDecoder = null
+            desiredSurface = null
+        }
+        // Child decoder jobs own MediaCodec teardown. Cancellation wakes both
+        // the packet reader and any codec input-buffer wait loops.
+        streamJob.cancel()
         scope.cancel()
     }
 
-    private suspend fun reconnectingDecodeLoop() {
-        var lastFailure: Throwable? = null
-        for (attempt in 1..DhdVirtualDisplayProtocol.MAX_CONNECTION_ATTEMPTS) {
-            if (closed.get() || !currentCoroutineContext().isActive) return
-            if (!surface.isValid) {
-                publishError("The live preview surface is no longer valid.", attempt)
-                return
-            }
-
+    private suspend fun reconnectingStreamLoop() {
+        var failedAttempts = 0
+        while (!closed.get() && currentCoroutineContext().isActive) {
+            val attempt = failedAttempts + 1
+            connectionAttempt = attempt
             stateFlow.value = DhdLivePreviewState.connecting(attempt)
+            streamHeader.value = null
+            // A new TCP stream gets a fresh native keyframe. Do not replay a
+            // GOP from the previous connection while waiting for it; that
+            // GOP may represent the display before the reconnect.
+            replayBuffer.clear()
+            val socket = Socket()
+            socketReference.set(socket)
             try {
-                decodeOneConnection(attempt)
+                socket.tcpNoDelay = true
+                // The stream is allowed to be quiet while the app is static.
+                // Native close/EOF and the display-liveness monitor are the
+                // failure signals; an idle video interval is not.
+                socket.soTimeout = DhdVirtualDisplayProtocol.HEADER_READ_TIMEOUT_MS
+                socket.connect(
+                    InetSocketAddress("127.0.0.1", session.streamPort),
+                    DhdVirtualDisplayProtocol.CONNECT_TIMEOUT_MS,
+                )
+                val output = DataOutputStream(socket.getOutputStream())
+                DhdVirtualDisplayProtocol.writeClientHandshake(output, session.streamToken)
+                output.flush()
+                val input = DataInputStream(socket.getInputStream())
+                val header = DhdVirtualDisplayProtocol.readStreamHeader(input, session.streamToken)
+                validateHeader(header)
+                // Header readiness is bounded, but an established display
+                // may legitimately produce no bytes while its pixels remain
+                // unchanged.
+                socket.soTimeout = 0
+                streamHeader.value = header
+                failedAttempts = 0
+                attachDesiredSurfaceIfNeeded()
+                readPackets(input)
                 if (closed.get()) return
                 throw IOException("The live preview stream ended.")
             } catch (_: CancellationException) {
@@ -134,134 +270,94 @@ class DhdLivePreviewHandle internal constructor(
                 throw CancellationException("The live preview decoder was cancelled.")
             } catch (failure: Throwable) {
                 if (closed.get()) return
-                lastFailure = failure
-                if (attempt == DhdVirtualDisplayProtocol.MAX_CONNECTION_ATTEMPTS) {
-                    publishError(previewFailureMessage(failure), attempt)
-                    return
+                streamHeader.value = null
+                surfaceMutex.withLock { stopActiveDecoder() }
+                failedAttempts++
+                // Do not leave the UI marked LIVE while the decoder is gone;
+                // otherwise a reconnect can look like a healthy stale frame.
+                stateFlow.value = DhdLivePreviewState.connecting(failedAttempts)
+                if (failedAttempts >= DhdVirtualDisplayProtocol.MAX_CONNECTION_ATTEMPTS) {
+                    publishError(previewFailureMessage(failure), failedAttempts)
                 }
-                delay(DhdVirtualDisplayProtocol.reconnectDelayMs(attempt))
+                delay(DhdVirtualDisplayProtocol.reconnectDelayMs(failedAttempts))
+            } finally {
+                socketReference.compareAndSet(socket, null)
+                runCatching { socket.close() }
             }
-        }
-
-        if (!closed.get() && stateFlow.value.phase != DhdLivePreviewPhase.ERROR) {
-            publishError(
-                previewFailureMessage(lastFailure ?: IOException("The live preview failed.")),
-                DhdVirtualDisplayProtocol.MAX_CONNECTION_ATTEMPTS,
-            )
         }
     }
 
-    private suspend fun decodeOneConnection(attempt: Int) {
-        val socket = Socket()
-        socketReference.set(socket)
-        try {
-            socket.tcpNoDelay = true
-            socket.soTimeout = DhdVirtualDisplayProtocol.STREAM_READ_TIMEOUT_MS
-            socket.connect(
-                InetSocketAddress("127.0.0.1", session.streamPort),
-                DhdVirtualDisplayProtocol.CONNECT_TIMEOUT_MS,
-            )
-            // The daemon authenticates the stream client before it writes its
-            // header. Send the exact binary handshake first, then flush it so
-            // the server is not left waiting while the client waits for a
-            // header.
-            val output = DataOutputStream(socket.getOutputStream())
-            DhdVirtualDisplayProtocol.writeClientHandshake(output, session.streamToken)
-            output.flush()
-            val input = DataInputStream(socket.getInputStream())
-            val header = DhdVirtualDisplayProtocol.readStreamHeader(input, session.streamToken)
-            validateHeader(header)
+    /** Recreate the decoder after a stream reconnect without UI involvement. */
+    private suspend fun attachDesiredSurfaceIfNeeded() = surfaceMutex.withLock {
+        val surface = synchronized(decoderLock) {
+            desiredSurface?.takeUnless { activeDecoder != null }
+        } ?: return@withLock
+        if (!surface.isValid || closed.get()) {
             if (!surface.isValid) {
-                throw IOException("The live preview surface was destroyed before decoding started.")
+                synchronized(decoderLock) {
+                    if (desiredSurface === surface) desiredSurface = null
+                }
             }
+            return@withLock
+        }
+        streamHeader.value?.let { attachDecoder(surface, it) }
+    }
 
-            val codec = MediaCodec.createDecoderByType(header.codecMime)
-            val sessionActive = AtomicBoolean(true)
-            try {
-                val format = MediaFormat.createVideoFormat(header.codecMime, header.width, header.height)
-                header.csd0?.takeIf(ByteArray::isNotEmpty)?.let {
-                    format.setByteBuffer("csd-0", ByteBuffer.wrap(it))
+    private suspend fun readPackets(input: DataInputStream) {
+        while (!closed.get() && currentCoroutineContext().isActive) {
+            val packet = DhdVirtualDisplayProtocol.readPacket(input) ?: return
+            packetDispatchMutex.withLock {
+                replayBuffer.append(packet)
+                val decoder = synchronized(decoderLock) { activeDecoder }
+                if (decoder != null) {
+                    try {
+                        // Backpressure is intentional. Dropping an AVC packet
+                        // can break the current GOP and leave the surface blank;
+                        // if the decoder is being replaced, its closed channel
+                        // simply means this packet is no longer needed.
+                        decoder.channel.send(packet)
+                    } catch (_: kotlinx.coroutines.channels.ClosedSendChannelException) {
+                        // Surface handoff/detach closes only the decoder
+                        // channel; the authenticated stream remains connected.
+                    }
                 }
-                header.csd1?.takeIf(ByteArray::isNotEmpty)?.let {
-                    format.setByteBuffer("csd-1", ByteBuffer.wrap(it))
-                }
-                codec.configure(format, surface, null, 0)
-                codec.setOnFrameRenderedListener(
-                    object : MediaCodec.OnFrameRenderedListener {
-                        override fun onFrameRendered(
-                            codec: MediaCodec,
-                            presentationTimeUs: Long,
-                            nanoTime: Long,
-                        ) {
-                            if (sessionActive.get() && !closed.get()) {
-                                stateFlow.value = DhdLivePreviewState.live(
-                                    attempt = attempt,
-                                    width = header.width,
-                                    height = header.height,
-                                )
-                            }
-                        }
-                    },
-                    Handler(Looper.getMainLooper()),
-                )
-                codec.start()
-                decodePackets(input, codec)
-            } finally {
-                sessionActive.set(false)
-                // This is the sole MediaCodec owner. close() never touches it.
-                runCatching { codec.stop() }
-                runCatching { codec.release() }
             }
-        } finally {
-            socketReference.compareAndSet(socket, null)
-            runCatching { socket.close() }
         }
     }
 
-    private suspend fun decodePackets(
-        input: DataInputStream,
-        codec: MediaCodec,
-    ) = coroutineScope {
-        val packets = Channel<DhdVirtualDisplayProtocol.Packet>(capacity = 8)
-        val readerFailure = AtomicReference<Throwable?>(null)
-        val reader = launch(Dispatchers.IO) {
-            try {
-                while (!closed.get() && currentCoroutineContext().isActive) {
-                    val packet = DhdVirtualDisplayProtocol.readPacket(input) ?: break
-                    packets.send(packet)
-                }
-            } catch (failure: CancellationException) {
-                if (!closed.get()) readerFailure.set(failure)
-            } catch (failure: Throwable) {
-                readerFailure.set(failure)
-            } finally {
-                packets.close()
+    private suspend fun stopActiveDecoder() {
+        val decoder = synchronized(decoderLock) {
+            activeDecoder?.also {
+                activeDecoder = null
+                it.channel.close()
             }
-        }
+        } ?: return
+        decoder.job?.cancelAndJoin()
+    }
 
+    private fun isCurrentDecoder(decoderId: Long): Boolean = synchronized(decoderLock) {
+        activeDecoder?.id == decoderId
+    }
+
+    private suspend fun decodePackets(decoder: ActiveDecoder) {
         try {
             while (!closed.get() && currentCoroutineContext().isActive) {
-                // Keep draining while the reader is blocked. This is required
-                // for a static screen whose last packet is already queued.
-                drainDecoder(codec)
+                drainDecoder(decoder.codec)
                 val received = withTimeoutOrNull(DhdVirtualDisplayProtocol.DRAIN_POLL_MS) {
-                    packets.receiveCatching()
+                    decoder.channel.receiveCatching()
                 } ?: continue
-                if (received.isClosed) {
-                    readerFailure.get()?.let { throw it }
-                    break
-                }
+                if (received.isClosed) break
                 val packet = received.getOrNull() ?: break
-                val inputIndex = waitForInputBuffer(codec)
+                val inputIndex = waitForInputBuffer(decoder.codec)
                 if (inputIndex < 0) break
-                val inputBuffer = codec.getInputBuffer(inputIndex)
+                val inputBuffer = decoder.codec.getInputBuffer(inputIndex)
                     ?: throw IOException("The AVC decoder returned no input buffer.")
                 if (packet.data.size > inputBuffer.capacity()) {
                     throw IOException("The AVC packet exceeds the decoder input buffer.")
                 }
                 inputBuffer.clear()
                 inputBuffer.put(packet.data)
-                codec.queueInputBuffer(
+                decoder.codec.queueInputBuffer(
                     inputIndex,
                     0,
                     packet.data.size,
@@ -270,21 +366,29 @@ class DhdLivePreviewHandle internal constructor(
                 )
             }
 
-            // Give the codec a short drain window after EOF/last packet so a
-            // static screen still reaches the Surface even without new input.
             repeat(DhdVirtualDisplayProtocol.FINAL_DRAIN_POLLS) {
-                val rendered = drainDecoder(codec)
+                val rendered = drainDecoder(decoder.codec)
                 if (rendered == 0) delay(DhdVirtualDisplayProtocol.DRAIN_POLL_MS)
             }
-        } finally {
-            // DataInputStream.readFully can remain blocked until the socket
-            // timeout. Close the active connection before joining the reader
-            // so Surface destruction and reconnect cancellation are prompt.
-            socketReference.get()?.let { socket ->
-                runCatching { socket.close() }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            if (!closed.get() && isCurrentDecoder(decoder.id)) {
+                publishError(previewFailureMessage(error), connectionAttempt)
+                // A decoder failure can happen while the stream is quiet. Wake
+                // the blocking packet reader so the connection loop can create
+                // a fresh codec and request a new decodable GOP automatically.
+                socketReference.get()?.let { socket ->
+                    runCatching { socket.close() }
+                }
             }
-            reader.cancelAndJoin()
-            packets.cancel()
+        } finally {
+            decoder.channel.close()
+            synchronized(decoderLock) {
+                if (activeDecoder?.id == decoder.id) activeDecoder = null
+            }
+            runCatching { decoder.codec.stop() }
+            runCatching { decoder.codec.release() }
         }
     }
 
@@ -341,6 +445,66 @@ class DhdLivePreviewHandle internal constructor(
     private fun previewFailureMessage(error: Throwable): String =
         error.message?.trim()?.takeIf(String::isNotEmpty)
             ?: "The live preview stream could not be decoded."
+
+    private class ActiveDecoder(
+        val id: Long,
+        val surface: Surface,
+        val channel: Channel<DhdVirtualDisplayProtocol.Packet>,
+        val codec: MediaCodec,
+    ) {
+        @Volatile
+        var job: Job? = null
+    }
+}
+
+/**
+ * Keeps one complete, bounded AVC replay window. If the next delta would
+ * exceed a bound, the cached GOP is invalidated: retaining its old prefix
+ * while the live decoder advances would let a replacement decoder combine
+ * stale reference frames with newer deltas.
+ */
+internal class DhdLivePreviewReplayBuffer(
+    private val maxPackets: Int = DhdVirtualDisplayProtocol.REPLAY_WINDOW_MAX_PACKETS,
+    private val maxBytes: Int = DhdVirtualDisplayProtocol.REPLAY_WINDOW_MAX_BYTES,
+) {
+    private val packets = ArrayDeque<DhdVirtualDisplayProtocol.Packet>()
+    private var bytes = 0
+    private var acceptingDeltas = false
+
+    @Synchronized
+    fun append(packet: DhdVirtualDisplayProtocol.Packet) {
+        if ((packet.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) {
+            packets.clear()
+            if (packet.data.size <= maxBytes && maxPackets > 0) {
+                bytes = packet.data.size
+                packets.addLast(packet)
+                acceptingDeltas = true
+            } else {
+                bytes = 0
+                acceptingDeltas = false
+            }
+            return
+        }
+        if (!acceptingDeltas) return
+        if (packets.size >= maxPackets || packet.data.size > maxBytes - bytes) {
+            packets.clear()
+            bytes = 0
+            acceptingDeltas = false
+            return
+        }
+        packets.addLast(packet)
+        bytes += packet.data.size
+    }
+
+    @Synchronized
+    fun snapshot(): List<DhdVirtualDisplayProtocol.Packet> = packets.toList()
+
+    @Synchronized
+    fun clear() {
+        packets.clear()
+        bytes = 0
+        acceptingDeltas = false
+    }
 }
 
 internal object DhdVirtualDisplayProtocol {
@@ -356,9 +520,12 @@ internal object DhdVirtualDisplayProtocol {
     const val CODEC_AVC = "video/avc"
     const val STREAM_MAGIC = 0x44485631 // DHV1
     const val STREAM_VERSION = 1
-    const val STREAM_READ_TIMEOUT_MS = 30_000
     const val CONNECT_TIMEOUT_MS = 2_000
+    const val HEADER_READ_TIMEOUT_MS = 10_000
     const val MAX_CONNECTION_ATTEMPTS = 3
+    const val REPLAY_WINDOW_MAX_PACKETS = 180
+    const val REPLAY_WINDOW_MAX_BYTES = 8 * 1024 * 1024
+    const val DECODER_QUEUE_HEADROOM = 32
     const val INPUT_BUFFER_RETRY_DELAY_MS = 8L
     const val CODEC_TIMEOUT_US = 20_000L
     const val DRAIN_POLL_MS = 16L

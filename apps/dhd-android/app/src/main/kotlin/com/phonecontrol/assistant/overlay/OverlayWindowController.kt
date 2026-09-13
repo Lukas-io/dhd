@@ -52,8 +52,9 @@ class OverlayWindowController(
     private val developerStatus: StateFlow<DeveloperModeStatus>,
     private val companionConnected: StateFlow<Boolean>,
     private val taskPreviewState: StateFlow<TaskPreviewState>,
+    private val taskDisplaySession: StateFlow<TaskDisplaySession?>,
     private val onTaskPreviewSurfaceAvailable: (TaskDisplaySession, Surface) -> Unit,
-    private val onTaskPreviewSurfaceDestroyed: (TaskDisplaySession, Surface) -> Unit,
+    private val onTaskPreviewSurfaceDestroyed: (TaskDisplaySession, Surface, () -> Unit) -> Unit,
 ) {
     private companion object {
         const val BUBBLE_SIZE_DP = 56
@@ -331,6 +332,7 @@ class OverlayWindowController(
                         resultMessage = resultMessage,
                         developerStatus = developerStatus,
                         companionConnected = companionConnected,
+                        taskDisplaySession = taskDisplaySession,
                         onExpand = ::openComposer,
                         onNewRequest = ::openComposer,
                         onSubmit = ::submitRequest,
@@ -346,6 +348,7 @@ class OverlayWindowController(
                         onDismissResult = ::dismissResult,
                         onHorizontalSwipeDismiss = ::dismissAfterHorizontalSwipe,
                         taskPreviewState = taskPreviewState,
+                        overlayHidden = visibilityGate.hidden,
                         onTaskPreviewSurfaceAvailable = onTaskPreviewSurfaceAvailable,
                         onTaskPreviewSurfaceDestroyed = onTaskPreviewSurfaceDestroyed,
                     )

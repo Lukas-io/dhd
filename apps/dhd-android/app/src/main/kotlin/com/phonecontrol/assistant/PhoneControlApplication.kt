@@ -8,6 +8,7 @@ import com.phonecontrol.assistant.data.ConversationStore
 import com.phonecontrol.assistant.developer.DhdAdbController
 import com.phonecontrol.assistant.developer.DhdAdbProcessRunner
 import com.phonecontrol.assistant.developer.DhdTaskDisplayBackend
+import com.phonecontrol.assistant.developer.PreviewSurfaceDispatcher
 import com.phonecontrol.assistant.developer.DhdVirtualDisplayManager
 import com.phonecontrol.assistant.overlay.OverlayVisibilityGate
 import com.phonecontrol.assistant.policy.PolicyEngine
@@ -42,32 +43,29 @@ class PhoneControlApplication : Application() {
     lateinit var overlayVisibilityGate: OverlayVisibilityGate
         private set
 
+    private val previewSurfaces by lazy {
+        PreviewSurfaceDispatcher<TaskDisplaySession, Surface>(
+            scope = previewScope,
+            attach = { session, surface -> taskDisplayBackend.attachLiveSurface(session, surface) },
+            detach = { session, surface -> taskDisplayBackend.detachLiveSurface(session, surface) },
+            onFailure = { error -> android.util.Log.w("DhdPreview", "Surface lifecycle failed", error) },
+        )
+    }
+
     fun attachTaskPreview(session: TaskDisplaySession, surface: Surface) {
-        previewScope.launch {
-            // The backend publishes attachment errors to its preview state.
-            runCatching { taskDisplayBackend.attachLiveSurface(session, surface) }
-        }
+        previewSurfaces.attach(surface) { session }
     }
 
-    fun detachTaskPreview(session: TaskDisplaySession, surface: Surface) {
-        // Application ownership lets cleanup finish after Activity destruction.
-        previewScope.launch { taskDisplayBackend.detachLiveSurface(session, surface) }
+    fun detachTaskPreview(
+        surface: Surface,
+        releaseSurface: () -> Unit,
+    ) {
+        previewSurfaces.detach(surface, releaseSurface)
     }
 
-    /** Resolve a retained session by owner key before attaching a viewer surface. */
+    /** Session lookup and cleanup run in the same order as the UI callbacks. */
     fun attachTaskPreview(sessionKey: String, surface: Surface) {
-        previewScope.launch {
-            val session = taskDisplayBackend.current(sessionKey) ?: return@launch
-            runCatching { taskDisplayBackend.attachLiveSurface(session, surface) }
-        }
-    }
-
-    /** Resolve a retained session by owner key before detaching a viewer surface. */
-    fun detachTaskPreview(sessionKey: String, surface: Surface) {
-        previewScope.launch {
-            val session = taskDisplayBackend.current(sessionKey) ?: return@launch
-            taskDisplayBackend.detachLiveSurface(session, surface)
-        }
+        previewSurfaces.attach(surface) { taskDisplayBackend.current(sessionKey) }
     }
 
     fun retryTaskPreview(sessionKey: String) {

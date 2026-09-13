@@ -54,16 +54,35 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.phonecontrol.assistant.domain.TaskPointerEvent
 import com.phonecontrol.assistant.execution.TaskDisplayGeometry
 import com.phonecontrol.assistant.R
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * Surface destruction is asynchronous at the preview boundary. The owner
+ * releases the TextureView surface only after the decoder has stopped using it.
+ * The gate is idempotent because a TextureView can report destruction both
+ * while its callbacks are being cleared and from its listener afterwards.
+ */
+internal class PreviewSurfaceLease(
+    private val releaseAction: () -> Unit,
+) {
+    private val released = AtomicBoolean(false)
+
+    fun release() {
+        if (released.compareAndSet(false, true)) releaseAction()
+    }
+}
+
+internal typealias PreviewSurfaceDestroyed = (AndroidSurface, () -> Unit) -> Unit
 
 /**
  * The state rendered by [LiveDisplayPreview].
@@ -223,7 +242,7 @@ fun LiveDisplayPreview(
     state: LiveDisplayPreviewState,
     modifier: Modifier = Modifier,
     onSurfaceAvailable: (AndroidSurface) -> Unit,
-    onSurfaceDestroyed: (AndroidSurface) -> Unit,
+    onSurfaceDestroyed: PreviewSurfaceDestroyed,
     onExpand: () -> Unit = {},
     showCardChrome: Boolean = true,
 ) {
@@ -232,7 +251,8 @@ fun LiveDisplayPreview(
     var textureView by remember { mutableStateOf<ReadOnlyPreviewTextureView?>(null) }
     val colors = LocalAssistantColors.current
 
-    DisposableEffect(textureView, state.sessionKey) {
+    val previewLifecycle = LocalLifecycleOwner.current.lifecycle
+    DisposableEffect(textureView, state.sessionKey, previewLifecycle) {
         val view = textureView
         if (view == null) {
             onDispose { }
@@ -241,13 +261,17 @@ fun LiveDisplayPreview(
             // hierarchy. SurfaceView uses a separate window, which can go
             // blank while this preview is moved by the conversation's
             // LazyColumn during a scroll.
-            view.setSurfaceCallbacks(
-                onAvailable = { surface -> latestOnSurfaceAvailable.value(surface) },
-                onDestroyed = { surface -> latestOnSurfaceDestroyed.value(surface) },
+            val binding = PreviewLifecycleBinding(
+                lifecycle = previewLifecycle,
+                attach = {
+                    view.setSurfaceCallbacks(
+                        onAvailable = { surface -> latestOnSurfaceAvailable.value(surface) },
+                        onDestroyed = { surface, release -> latestOnSurfaceDestroyed.value(surface, release) },
+                    )
+                },
+                detach = view::clearSurfaceCallbacks,
             )
-            onDispose {
-                view.clearSurfaceCallbacks()
-            }
+            onDispose { binding.close() }
         }
     }
 
@@ -319,17 +343,16 @@ fun LiveDisplayPreview(
         // Keep the expand affordance in the letterbox outside the phone surface
         // so it never obscures the app or looks like an app control.
         MaterialSurface(
+            onClick = {
+                android.util.Log.d("DhdPreview", "Expand requested")
+                onExpand()
+            },
             modifier = Modifier
                 .align(Alignment.TopEnd)
                 .padding(6.dp)
                 .size(48.dp)
                 .zIndex(2f)
-                .clip(RoundedCornerShape(999.dp))
-                .clickable(
-                    role = Role.Button,
-                    onClickLabel = "Open full-screen viewer",
-                    onClick = onExpand,
-                ),
+                .clip(RoundedCornerShape(999.dp)),
             shape = RoundedCornerShape(999.dp),
             color = colors.composerBackground.copy(alpha = 0.92f),
         ) {
@@ -358,7 +381,7 @@ fun FullScreenLiveDisplayViewer(
     state: LiveDisplayPreviewState,
     onDismiss: () -> Unit,
     onSurfaceAvailable: (AndroidSurface) -> Unit,
-    onSurfaceDestroyed: (AndroidSurface) -> Unit,
+    onSurfaceDestroyed: PreviewSurfaceDestroyed,
     onRetry: () -> Unit = {},
     onAcknowledgeAttention: () -> Boolean = { false },
     onStopSession: () -> Unit = {},
@@ -617,7 +640,7 @@ private fun FullScreenPreviewSurface(
     width: androidx.compose.ui.unit.Dp,
     height: androidx.compose.ui.unit.Dp,
     onSurfaceAvailable: (AndroidSurface) -> Unit,
-    onSurfaceDestroyed: (AndroidSurface) -> Unit,
+    onSurfaceDestroyed: PreviewSurfaceDestroyed,
 ) {
     val latestOnSurfaceAvailable = rememberUpdatedState(onSurfaceAvailable)
     val latestOnSurfaceDestroyed = rememberUpdatedState(onSurfaceDestroyed)
@@ -625,16 +648,23 @@ private fun FullScreenPreviewSurface(
     val phoneShape = RoundedCornerShape(FULLSCREEN_DISPLAY_CORNER_RADIUS_DP.dp)
     val colors = LocalAssistantColors.current
 
-    DisposableEffect(textureView, state.sessionKey) {
+    val previewLifecycle = LocalLifecycleOwner.current.lifecycle
+    DisposableEffect(textureView, state.sessionKey, previewLifecycle) {
         val view = textureView
         if (view == null) {
             onDispose { }
         } else {
-            view.setSurfaceCallbacks(
-                onAvailable = { surface -> latestOnSurfaceAvailable.value(surface) },
-                onDestroyed = { surface -> latestOnSurfaceDestroyed.value(surface) },
+            val binding = PreviewLifecycleBinding(
+                lifecycle = previewLifecycle,
+                attach = {
+                    view.setSurfaceCallbacks(
+                        onAvailable = { surface -> latestOnSurfaceAvailable.value(surface) },
+                        onDestroyed = { surface, release -> latestOnSurfaceDestroyed.value(surface, release) },
+                    )
+                },
+                detach = view::clearSurfaceCallbacks,
             )
-            onDispose { view.clearSurfaceCallbacks() }
+            onDispose { binding.close() }
         }
     }
 
@@ -742,9 +772,13 @@ private fun PreviewStatusOverlay(state: LiveDisplayPreviewState) {
 /** A scroll-safe decoder target with no control semantics. */
 private class ReadOnlyPreviewTextureView(context: Context) : TextureView(context),
     TextureView.SurfaceTextureListener {
-    private var decoderSurface: AndroidSurface? = null
+    private val surfaceRecordsLock = Any()
+    private val pendingSurfaceReleases = java.util.IdentityHashMap<SurfaceTexture, DecoderSurface>()
+    private var decoderSurface: DecoderSurface? = null
+    private var availableTexture: SurfaceTexture? = null
+    private var surfaceCallbackGeneration = 0L
     private var onAvailable: ((AndroidSurface) -> Unit)? = null
-    private var onDestroyed: ((AndroidSurface) -> Unit)? = null
+    private var onDestroyed: PreviewSurfaceDestroyed? = null
 
     init {
         surfaceTextureListener = this
@@ -756,27 +790,119 @@ private class ReadOnlyPreviewTextureView(context: Context) : TextureView(context
 
     fun setSurfaceCallbacks(
         onAvailable: (AndroidSurface) -> Unit,
-        onDestroyed: (AndroidSurface) -> Unit,
+        onDestroyed: PreviewSurfaceDestroyed,
     ) {
-        this.onAvailable = onAvailable
-        this.onDestroyed = onDestroyed
-        decoderSurface?.takeIf(AndroidSurface::isValid)?.let(onAvailable)
+        var immediateSurface: AndroidSurface? = null
+        var immediateCallback: ((AndroidSurface) -> Unit)? = null
+        var pendingRelease: DecoderSurface? = null
+        var pendingTexture: SurfaceTexture? = null
+        var releaseImmediately: DecoderSurface? = null
+        var generation = 0L
+        synchronized(surfaceRecordsLock) {
+            generation = ++surfaceCallbackGeneration
+            this.onAvailable = onAvailable
+            this.onDestroyed = onDestroyed
+
+            val current = decoderSurface
+            if (current != null && !current.destroyNotified && current.surface.isValid) {
+                immediateSurface = current.surface
+                immediateCallback = onAvailable
+            } else {
+                // A session-key change can dispose and recreate this effect
+                // while TextureView keeps the same SurfaceTexture available.
+                // Wait for the old asynchronous detach before wrapping that
+                // texture again; otherwise its release can invalidate the
+                // replacement decoder's target.
+                val texture = availableTexture
+                if (current != null) {
+                    decoderSurface = null
+                    if (!current.destroyNotified) {
+                        notifySurfaceDestroyedLocked(current)
+                        if (this.onDestroyed == null) releaseImmediately = current
+                    }
+                }
+                if (texture != null) {
+                    pendingSurfaceReleases[texture]?.let { pending ->
+                        pendingRelease = pending
+                        pendingTexture = texture
+                    } ?: DecoderSurface(texture).also { created ->
+                        decoderSurface = created
+                        immediateSurface = created.surface
+                        immediateCallback = onAvailable
+                    }
+                }
+            }
+        }
+        releaseImmediately?.release()
+        invokeAvailableIfCurrent(immediateSurface, immediateCallback, generation)
+        if (pendingRelease != null && pendingTexture != null) {
+            val texture = pendingTexture!!
+            pendingRelease!!.whenReleased {
+                announceAvailableAfterRelease(texture, generation)
+            }
+        }
     }
 
     fun clearSurfaceCallbacks() {
-        decoderSurface?.let { surface -> onDestroyed?.invoke(surface) }
-        onAvailable = null
-        onDestroyed = null
+        var releaseImmediately = false
+        val current: DecoderSurface?
+        synchronized(surfaceRecordsLock) {
+            ++surfaceCallbackGeneration
+            current = decoderSurface?.also {
+                decoderSurface = null
+                if (!it.destroyNotified) {
+                    notifySurfaceDestroyedLocked(it)
+                    releaseImmediately = onDestroyed == null
+                }
+            }
+            onAvailable = null
+            onDestroyed = null
+        }
+        // If no callback was registered, the view still owns this record and
+        // must release it. Normal callers always release it from their async
+        // detach completion.
+        if (current != null && releaseImmediately) current.release()
     }
 
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-        decoderSurface?.let { previous ->
-            onDestroyed?.invoke(previous)
-            previous.release()
+        var immediateSurface: AndroidSurface? = null
+        var immediateCallback: ((AndroidSurface) -> Unit)? = null
+        var pendingRelease: DecoderSurface? = null
+        var releaseImmediately: DecoderSurface? = null
+        var generation = 0L
+        synchronized(surfaceRecordsLock) {
+            generation = surfaceCallbackGeneration
+            availableTexture = surface
+            val current = decoderSurface
+            if (current != null && current.texture === surface &&
+                !current.destroyNotified && current.surface.isValid
+            ) {
+                immediateSurface = current.surface
+                immediateCallback = onAvailable
+            } else {
+                current?.let { previous ->
+                    decoderSurface = null
+                    if (!previous.destroyNotified) {
+                        notifySurfaceDestroyedLocked(previous)
+                        if (onDestroyed == null) releaseImmediately = previous
+                    }
+                }
+                pendingSurfaceReleases[surface]?.let { pending ->
+                    pendingRelease = pending
+                    generation = surfaceCallbackGeneration
+                } ?: DecoderSurface(surface).also { created ->
+                    decoderSurface = created
+                    immediateSurface = created.surface
+                    immediateCallback = onAvailable
+                }
+            }
         }
-        AndroidSurface(surface).also { created ->
-            decoderSurface = created
-            onAvailable?.invoke(created)
+        releaseImmediately?.release()
+        invokeAvailableIfCurrent(immediateSurface, immediateCallback, generation)
+        if (pendingRelease != null) {
+            pendingRelease!!.whenReleased {
+                announceAvailableAfterRelease(surface, generation)
+            }
         }
     }
 
@@ -785,11 +911,122 @@ private class ReadOnlyPreviewTextureView(context: Context) : TextureView(context
     override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
 
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
-        decoderSurface?.let { current ->
-            onDestroyed?.invoke(current)
-            current.release()
+        var releaseImmediately = false
+        val current: DecoderSurface?
+        synchronized(surfaceRecordsLock) {
+            val record = decoderSurface?.takeIf { it.texture === surface }
+                ?: pendingSurfaceReleases[surface]
+            if (decoderSurface === record) decoderSurface = null
+            if (availableTexture === surface) availableTexture = null
+            val wasAlreadyNotified = record?.destroyNotified == true
+            if (record != null) {
+                record.markTextureDestroyed()
+                if (!wasAlreadyNotified) {
+                    notifySurfaceDestroyedLocked(record)
+                    releaseImmediately = onDestroyed == null
+                }
+            }
+            current = record
         }
-        decoderSurface = null
-        return true
+        if (current == null) return true
+        // A pending record was already handed to the asynchronous detach
+        // callback. Clearing callbacks after that handoff must not turn this
+        // later TextureView notification into an early release.
+        if (releaseImmediately) current.release()
+        // Returning false transfers SurfaceTexture ownership to us. The
+        // release callback runs after the decoder has detached from this
+        // surface, which prevents BufferQueue/MediaCodec races.
+        return false
+    }
+
+    private fun announceAvailableAfterRelease(
+        texture: SurfaceTexture,
+        generation: Long,
+    ) {
+        var surface: AndroidSurface? = null
+        var callback: ((AndroidSurface) -> Unit)? = null
+        synchronized(surfaceRecordsLock) {
+            if (generation != surfaceCallbackGeneration ||
+                onAvailable == null ||
+                availableTexture !== texture ||
+                decoderSurface != null ||
+                pendingSurfaceReleases.containsKey(texture)
+            ) {
+                return@synchronized
+            }
+            DecoderSurface(texture).also { created ->
+                decoderSurface = created
+                surface = created.surface
+                callback = onAvailable
+            }
+        }
+        invokeAvailableIfCurrent(surface, callback, generation)
+    }
+
+    private fun invokeAvailableIfCurrent(
+        surface: AndroidSurface?,
+        callback: ((AndroidSurface) -> Unit)?,
+        generation: Long,
+    ) {
+        if (surface == null || callback == null) return
+        val stillCurrent = synchronized(surfaceRecordsLock) {
+            surfaceCallbackGeneration == generation && onAvailable === callback
+        }
+        if (stillCurrent) callback(surface)
+    }
+
+    private fun notifySurfaceDestroyedLocked(record: DecoderSurface) {
+        if (!record.markDestroyed()) return
+        pendingSurfaceReleases[record.texture] = record
+        onDestroyed?.invoke(record.surface, record::release)
+    }
+
+    private inner class DecoderSurface(
+        val texture: SurfaceTexture,
+    ) {
+        val surface = AndroidSurface(texture)
+        private val released = AtomicBoolean(false)
+        private val textureDestroyed = AtomicBoolean(false)
+        private val releaseListeners = mutableListOf<() -> Unit>()
+        private val releaseLease = PreviewSurfaceLease {
+            runCatching { surface.release() }
+            val releaseTexture: Boolean
+            val listeners: List<() -> Unit>
+            synchronized(surfaceRecordsLock) {
+                releaseTexture = textureDestroyed.get()
+                if (pendingSurfaceReleases[texture] === this@DecoderSurface) {
+                    pendingSurfaceReleases.remove(texture)
+                }
+                released.set(true)
+                listeners = releaseListeners.toList()
+                releaseListeners.clear()
+            }
+            if (releaseTexture) runCatching { texture.release() }
+            listeners.forEach { listener -> runCatching { listener() } }
+        }
+        private val destroyed = AtomicBoolean(false)
+
+        val destroyNotified: Boolean
+            get() = destroyed.get()
+
+        fun markDestroyed(): Boolean = destroyed.compareAndSet(false, true)
+
+        fun markTextureDestroyed() {
+            textureDestroyed.set(true)
+        }
+
+        fun whenReleased(listener: () -> Unit) {
+            val invokeImmediately = synchronized(surfaceRecordsLock) {
+                if (released.get()) {
+                    true
+                } else {
+                    releaseListeners += listener
+                    false
+                }
+            }
+            if (invokeImmediately) listener()
+        }
+
+        fun release() = releaseLease.release()
     }
 }

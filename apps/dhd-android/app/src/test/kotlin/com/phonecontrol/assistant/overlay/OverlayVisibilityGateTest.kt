@@ -120,6 +120,31 @@ class OverlayVisibilityGateTest {
     }
 
     @Test
+    fun `overlay preview releases its decoder target while the activity hides the overlay`() {
+        assertTrue(shouldRenderOverlayPreview(previewVisible = true, overlayHidden = false))
+        assertFalse(shouldRenderOverlayPreview(previewVisible = true, overlayHidden = true))
+        assertFalse(shouldRenderOverlayPreview(previewVisible = false, overlayHidden = false))
+    }
+
+    @Test
+    fun `overlay preview remains renderable when its session is detached`() {
+        assertTrue(
+            shouldRenderOverlayPreview(
+                previewVisible = true,
+                overlayHidden = false,
+                hasDisplaySession = true,
+            ),
+        )
+        assertFalse(
+            shouldRenderOverlayPreview(
+                previewVisible = true,
+                overlayHidden = false,
+                hasDisplaySession = false,
+            ),
+        )
+    }
+
+    @Test
     fun `overlay recovery prioritizes attention over connection recovery`() {
         val attention = runningState("Needs your attention").copy(
             attentionReason = "Confirm the prompt.",

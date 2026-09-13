@@ -60,6 +60,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.text.selection.DisableSelection
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
@@ -180,7 +181,7 @@ fun AssistantScreen(
     onOpenCompanion: () -> Unit,
     previewState: LiveDisplayPreviewState? = null,
     onPreviewSurfaceAvailable: (AndroidSurface) -> Unit = {},
-    onPreviewSurfaceDestroyed: (AndroidSurface) -> Unit = {},
+    onPreviewSurfaceDestroyed: PreviewSurfaceDestroyed = { _, release -> release() },
     onOpenPreview: (String) -> Unit = {},
     expandedPreviewSessionKey: String? = null,
 ) {
@@ -724,7 +725,7 @@ private fun ConversationTimeline(
     onAcknowledgeAttention: () -> Boolean,
     previewState: LiveDisplayPreviewState? = null,
     onPreviewSurfaceAvailable: (AndroidSurface) -> Unit = {},
-    onPreviewSurfaceDestroyed: (AndroidSurface) -> Unit = {},
+    onPreviewSurfaceDestroyed: PreviewSurfaceDestroyed = { _, release -> release() },
     onOpenPreview: (String) -> Unit = {},
     expandedPreviewSessionKey: String? = null,
     modifier: Modifier = Modifier,
@@ -782,7 +783,7 @@ private fun ConversationTimeline(
             listState.scrollToItem(groups.lastIndex, scrollOffset = Int.MAX_VALUE)
         }
     }
-    SelectionContainer {
+    Box {
         LazyColumn(
             state = listState,
             modifier = modifier.fillMaxWidth(),
@@ -790,6 +791,7 @@ private fun ConversationTimeline(
             verticalArrangement = Arrangement.spacedBy(18.dp),
         ) {
             items(groups, key = { it.id }) { group ->
+                SelectionContainer {
                 TaskGroupCard(
                     group = group,
                     state = state,
@@ -808,6 +810,7 @@ private fun ConversationTimeline(
                     active = state.isActive() &&
                         state.sessionIdOrNullForUi()?.let(group.runIds::contains) == true,
                 )
+                }
             }
         }
     }
@@ -827,7 +830,7 @@ private fun TaskGroupCard(
     onAcknowledgeAttention: () -> Boolean,
     previewState: LiveDisplayPreviewState? = null,
     onPreviewSurfaceAvailable: (AndroidSurface) -> Unit = {},
-    onPreviewSurfaceDestroyed: (AndroidSurface) -> Unit = {},
+    onPreviewSurfaceDestroyed: PreviewSurfaceDestroyed = { _, release -> release() },
     onOpenPreview: (String) -> Unit = {},
     expandedPreviewSessionKey: String? = null,
     active: Boolean,
@@ -869,12 +872,19 @@ private fun TaskGroupCard(
                 !preview.isExpanded(expandedPreviewSessionKey)
         } == true
         if (active && previewVisibleForGroup) {
-            LiveDisplayPreview(
-                state = taskPreviewState,
-                onSurfaceAvailable = onPreviewSurfaceAvailable,
-                onSurfaceDestroyed = onPreviewSurfaceDestroyed,
-                onExpand = { taskPreviewState.sessionKey?.let(onOpenPreview) },
-            )
+            // The timeline is selectable for message text, but the preview
+            // owns a native TextureView and a Compose expand control. Keep
+            // that interaction island out of SelectionContainer's gesture
+            // registrar so a post-scroll selection pass cannot retain the
+            // pointer stream before the expand control sees it.
+            DisableSelection {
+                LiveDisplayPreview(
+                    state = taskPreviewState,
+                    onSurfaceAvailable = onPreviewSurfaceAvailable,
+                    onSurfaceDestroyed = onPreviewSurfaceDestroyed,
+                    onExpand = { taskPreviewState.sessionKey?.let(onOpenPreview) },
+                )
+            }
         }
 
         // Keep the playful status for healthy work, but replace it with a

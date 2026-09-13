@@ -170,14 +170,14 @@ fun PhoneControlApp(
     onSteerRequest: (String) -> Boolean,
     previewState: LiveDisplayPreviewState? = null,
     onPreviewSurfaceAvailable: (AndroidSurface) -> Unit = {},
-    onPreviewSurfaceDestroyed: (AndroidSurface) -> Unit = {},
+    onPreviewSurfaceDestroyed: PreviewSurfaceDestroyed = { _, release -> release() },
     /** Display records supplied by the lifecycle/backend layer. */
     displayRecords: List<TaskDisplayUiRecord> = emptyList(),
     onTaskDisplaySurfaceAvailable: (TaskDisplayUiRecord, AndroidSurface) -> Unit = { _, surface ->
         onPreviewSurfaceAvailable(surface)
     },
-    onTaskDisplaySurfaceDestroyed: (TaskDisplayUiRecord, AndroidSurface) -> Unit = { _, surface ->
-        onPreviewSurfaceDestroyed(surface)
+    onTaskDisplaySurfaceDestroyed: (TaskDisplayUiRecord, AndroidSurface, () -> Unit) -> Unit = { _, surface, release ->
+        onPreviewSurfaceDestroyed(surface, release)
     },
     onEndTaskDisplay: (TaskDisplayUiRecord) -> Unit = {},
     onRetryTaskDisplayPreview: (TaskDisplayUiRecord) -> Unit = {},
@@ -496,8 +496,8 @@ fun PhoneControlApp(
                         onSurfaceAvailable = { surface ->
                             onTaskDisplaySurfaceAvailable(viewerRecord, surface)
                         },
-                        onSurfaceDestroyed = { surface ->
-                            onTaskDisplaySurfaceDestroyed(viewerRecord, surface)
+                        onSurfaceDestroyed = { surface, release ->
+                            onTaskDisplaySurfaceDestroyed(viewerRecord, surface, release)
                         },
                         onRetry = { onRetryTaskDisplayPreview(viewerRecord) },
                         onAcknowledgeAttention = onAcknowledgeAttention,

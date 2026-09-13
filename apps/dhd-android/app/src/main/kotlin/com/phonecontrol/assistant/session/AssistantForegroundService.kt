@@ -45,11 +45,12 @@ class AssistantForegroundService : Service() {
             developerStatus = application.developerModeController.status,
             companionConnected = application.devBridgeServer.companionConnected,
             taskPreviewState = application.taskDisplayBackend.previewState,
+            taskDisplaySession = application.taskDisplayBackend.activeSession,
             onTaskPreviewSurfaceAvailable = { session, surface ->
                 application.attachTaskPreview(session, surface)
             },
-            onTaskPreviewSurfaceDestroyed = { session, surface ->
-                application.detachTaskPreview(session, surface)
+            onTaskPreviewSurfaceDestroyed = { _, surface, release ->
+                application.detachTaskPreview(surface, release)
             },
         )
         startForegroundCompat(buildNotification(coordinator.state.value))

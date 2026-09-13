@@ -1,7 +1,6 @@
 package com.phonecontrol.assistant.developer
 
 import android.content.Context
-import android.view.Surface
 import com.phonecontrol.assistant.execution.PhoneProcessResult
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
@@ -225,9 +224,7 @@ class DhdVirtualDisplayManager(
 
     suspend fun attachLiveSurface(
         session: DhdVirtualDisplaySession,
-        surface: Surface,
     ): DhdLivePreviewHandle {
-        require(surface.isValid) { "The live preview surface is invalid." }
         require(isCurrentSession(session)) { "The virtual display session is not active." }
         val result = controller.execute(
             listOf(
@@ -239,7 +236,7 @@ class DhdVirtualDisplayManager(
         if (result.exitCode != 0 || result.timedOut) {
             throw IOException(failureMessage(result, "The virtual display stream could not be attached."))
         }
-        return DhdLivePreviewHandle(session, surface)
+        return DhdLivePreviewHandle(session)
     }
 
     suspend fun detachLiveSurface(session: DhdVirtualDisplaySession) {

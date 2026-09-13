@@ -197,14 +197,14 @@ class MainActivity : ComponentActivity() {
                 onPreviewSurfaceAvailable = { surface ->
                     displayForRun?.let { app.attachTaskPreview(it, surface) }
                 },
-                onPreviewSurfaceDestroyed = { surface ->
-                    displayForRun?.let { app.detachTaskPreview(it, surface) }
+                onPreviewSurfaceDestroyed = { surface, release ->
+                    app.detachTaskPreview(surface, release)
                 },
                 onTaskDisplaySurfaceAvailable = { record, surface ->
                     app.attachTaskPreview(record.sessionKey, surface)
                 },
-                onTaskDisplaySurfaceDestroyed = { record, surface ->
-                    app.detachTaskPreview(record.sessionKey, surface)
+                onTaskDisplaySurfaceDestroyed = { _, surface, release ->
+                    app.detachTaskPreview(surface, release)
                 },
                 onEndTaskDisplay = { record ->
                     app.endTaskDisplay(record.displayId, record.displayRef)

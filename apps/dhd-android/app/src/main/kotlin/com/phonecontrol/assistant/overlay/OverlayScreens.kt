@@ -780,10 +780,11 @@ private fun RecoveryActionButton(
 @Composable
 private fun FloatingVirtualDisplayCard(
     previewState: TaskPreviewState,
+    taskDisplaySession: TaskDisplaySession?,
     onHide: () -> Unit,
     onContinue: () -> Unit,
     onSurfaceAvailable: (TaskDisplaySession, AndroidSurface) -> Unit,
-    onSurfaceDestroyed: (TaskDisplaySession, AndroidSurface) -> Unit,
+    onSurfaceDestroyed: (TaskDisplaySession, AndroidSurface, () -> Unit) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalAssistantColors.current
@@ -819,6 +820,7 @@ private fun FloatingVirtualDisplayCard(
             ) {
                 OverlayVirtualDisplayPreview(
                     previewState = previewState,
+                    taskDisplaySession = taskDisplaySession,
                     onHide = onHide,
                     onContinue = onContinue,
                     onSurfaceAvailable = onSurfaceAvailable,
@@ -852,14 +854,18 @@ fun OverlayPanel(
     onDismissResult: () -> Unit = {},
     onHorizontalSwipeDismiss: (OverlaySwipeDirection, Int) -> Unit,
     taskPreviewState: StateFlow<TaskPreviewState>,
+    taskDisplaySession: StateFlow<TaskDisplaySession?>,
+    overlayHidden: StateFlow<Boolean>,
     onTaskPreviewSurfaceAvailable: (TaskDisplaySession, AndroidSurface) -> Unit,
-    onTaskPreviewSurfaceDestroyed: (TaskDisplaySession, AndroidSurface) -> Unit,
+    onTaskPreviewSurfaceDestroyed: (TaskDisplaySession, AndroidSurface, () -> Unit) -> Unit,
 ) {
     val state by sessionState.collectAsState()
     val calls by toolCalls.collectAsState()
     val mode by panelMode.collectAsState()
     val result by resultMessage.collectAsState()
     val previewState by taskPreviewState.collectAsState()
+    val activeDisplaySession by taskDisplaySession.collectAsState()
+    val isOverlayHidden by overlayHidden.collectAsState()
     val currentDeveloperStatus by developerStatus.collectAsState()
     val isCompanionConnected by companionConnected.collectAsState()
     val active = state is SessionState.Running || state is SessionState.Paused
@@ -1110,7 +1116,17 @@ fun OverlayPanel(
             }
         }
 
-        if (previewVisible) {
+        // The overlay window can be GONE while its composition survives an
+        // Activity handoff. Remove the TextureView while hidden so the
+        // session's single decoder target is released; recreating it on
+        // reveal receives a fresh surface and cannot show frozen pixels from
+        // the inline/fullscreen viewer.
+        val displaySession = activeDisplaySession ?: previewState.sessionOrNull()
+        if (shouldRenderOverlayPreview(
+                previewVisible = previewVisible,
+                overlayHidden = isOverlayHidden,
+                hasDisplaySession = displaySession != null,
+            )) {
             Popup(
                 alignment = Alignment.BottomCenter,
                 offset = IntOffset(
@@ -1129,6 +1145,7 @@ fun OverlayPanel(
             ) {
                 FloatingVirtualDisplayCard(
                     previewState = previewState,
+                    taskDisplaySession = displaySession,
                     onHide = { previewVisible = false },
                     onContinue = onContinueInDhd,
                     onSurfaceAvailable = onTaskPreviewSurfaceAvailable,
@@ -1296,6 +1313,21 @@ fun OverlayPanel(
             }
         }
     }
+}
+
+/** Compose the preview only while requested, visible, and backed by a session. */
+internal fun shouldRenderOverlayPreview(
+    previewVisible: Boolean,
+    overlayHidden: Boolean,
+    hasDisplaySession: Boolean = true,
+): Boolean = previewVisible && !overlayHidden && hasDisplaySession
+
+private fun TaskPreviewState.sessionOrNull(): TaskDisplaySession? = when (this) {
+    is TaskPreviewState.Connecting -> session
+    is TaskPreviewState.Attached -> session
+    is TaskPreviewState.Ended -> null
+    is TaskPreviewState.Error -> null
+    TaskPreviewState.Detached -> null
 }
 
 @Composable
@@ -1929,31 +1961,39 @@ private fun TextToolbarItem(
 @Composable
 private fun OverlayVirtualDisplayPreview(
     previewState: TaskPreviewState,
+    taskDisplaySession: TaskDisplaySession?,
     onHide: () -> Unit,
     onContinue: () -> Unit,
     onSurfaceAvailable: (TaskDisplaySession, AndroidSurface) -> Unit,
-    onSurfaceDestroyed: (TaskDisplaySession, AndroidSurface) -> Unit,
+    onSurfaceDestroyed: (TaskDisplaySession, AndroidSurface, () -> Unit) -> Unit,
 ) {
     val colors = LocalAssistantColors.current
-    val live = when (previewState) {
-        is TaskPreviewState.Connecting -> LiveDisplayPreviewState.connecting(
-            appLabel = previewState.session.packageName.takeIf(String::isNotBlank),
-            aspectRatio = previewState.session.geometry.width.toFloat() /
-                previewState.session.geometry.height.toFloat(),
-            sessionKey = previewState.session.sessionKey,
-        )
-        is TaskPreviewState.Attached -> LiveDisplayPreviewState.live(
-            appLabel = previewState.session.packageName.takeIf(String::isNotBlank),
-            aspectRatio = previewState.session.geometry.width.toFloat() /
-                previewState.session.geometry.height.toFloat(),
-            sessionKey = previewState.session.sessionKey,
-        )
-        else -> null
-    }
-    val session = when (previewState) {
-        is TaskPreviewState.Connecting -> previewState.session
-        is TaskPreviewState.Attached -> previewState.session
-        else -> null
+    // The backend keeps the display session alive while its decoder Surface is
+    // detached during an Activity/overlay handoff. Use that session as the
+    // identity for composition; previewState only describes playback. If the
+    // state is Detached, composing a connecting preview is what creates the
+    // replacement TextureView and lets the surface callback reattach it.
+    val session = taskDisplaySession ?: previewState.sessionOrNull()
+    val livePreview = session?.let { displaySession ->
+        when (previewState) {
+            is TaskPreviewState.Error,
+            is TaskPreviewState.Ended,
+            -> null
+            is TaskPreviewState.Attached -> LiveDisplayPreviewState.live(
+                appLabel = displaySession.packageName.takeIf(String::isNotBlank),
+                aspectRatio = displaySession.geometry.width.toFloat() /
+                    displaySession.geometry.height.toFloat(),
+                sessionKey = displaySession.sessionKey,
+            )
+            is TaskPreviewState.Connecting,
+            TaskPreviewState.Detached,
+            -> LiveDisplayPreviewState.connecting(
+                appLabel = displaySession.packageName.takeIf(String::isNotBlank),
+                aspectRatio = displaySession.geometry.width.toFloat() /
+                    displaySession.geometry.height.toFloat(),
+                sessionKey = displaySession.sessionKey,
+            )
+        }?.let { preview -> displaySession to preview }
     }
     val statusMessage = when (previewState) {
         TaskPreviewState.Detached -> "The virtual display will appear when a task opens one."
@@ -1978,14 +2018,17 @@ private fun OverlayVirtualDisplayPreview(
                 fontWeight = FontWeight.Medium,
             )
         }
-        if (live != null && session != null) {
+        if (livePreview != null) {
+            val (displaySession, live) = livePreview
             LiveDisplayPreview(
                 state = live,
                 modifier = Modifier
                     .fillMaxWidth()
                     .heightIn(max = 248.dp),
-                onSurfaceAvailable = { surface -> onSurfaceAvailable(session, surface) },
-                onSurfaceDestroyed = { surface -> onSurfaceDestroyed(session, surface) },
+                onSurfaceAvailable = { surface -> onSurfaceAvailable(displaySession, surface) },
+                onSurfaceDestroyed = { surface, release ->
+                    onSurfaceDestroyed(displaySession, surface, release)
+                },
                 onExpand = onContinue,
                 showCardChrome = false,
             )

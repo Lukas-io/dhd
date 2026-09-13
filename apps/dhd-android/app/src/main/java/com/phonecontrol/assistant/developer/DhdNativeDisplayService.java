@@ -523,14 +523,17 @@ final class DhdNativeDisplayService implements Closeable {
         private final AtomicBoolean closed = new AtomicBoolean(false);
         private volatile boolean streamClientAllowed;
         private volatile Socket streamClient;
-        /** True until the queue contains a decodable IDR boundary. */
+        /** True until the queue contains a fresh, decodable IDR boundary. */
         private boolean awaitingKeyFrame = true;
+        /** A reconnect must not accept a keyframe from before its reset point. */
+        private long keyFrameRequiredAfterPts = Long.MIN_VALUE;
+        private long lastEnqueuedPresentationTimeUs = Long.MIN_VALUE;
         /**
-         * The packet queue is consumed by the current stream client. Keep the
-         * most recent IDR separately so a new decoder can start immediately
-         * when a viewer surface is replaced while the display is static.
+         * The first viewer may consume a keyframe that was encoded while the
+         * display was starting. Keep that startup frame; only later viewers
+         * need a queue reset and a fresh IDR boundary.
          */
-        private EncodedPacket lastKeyFramePacket;
+        private boolean streamHasServedClient;
         private ServerSocket streamServer;
         // Keep the bound port as immutable session metadata. The daemon can
         // snapshot a session for LIST while close() is releasing the server;
@@ -794,9 +797,10 @@ final class DhdNativeDisplayService implements Closeable {
             boolean requestSyncFrame = false;
             boolean accepted = true;
             synchronized (streamLock) {
-                if ((packet.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) {
-                    lastKeyFramePacket = packet;
-                }
+                long previousLastPts = lastEnqueuedPresentationTimeUs;
+                lastEnqueuedPresentationTimeUs = Math.max(
+                        lastEnqueuedPresentationTimeUs,
+                        packet.presentationTimeUs);
                 if (packets.size() >= MAX_STREAM_QUEUE_PACKETS) {
                     // Dropping an arbitrary AVC packet can discard a P-frame
                     // that later frames reference. The decoder then renders a
@@ -804,17 +808,24 @@ final class DhdNativeDisplayService implements Closeable {
                     // GOP boundary and request a fresh sync frame instead.
                     packets.clear();
                     awaitingKeyFrame = true;
+                    keyFrameRequiredAfterPts = Math.max(
+                            keyFrameRequiredAfterPts,
+                            previousLastPts);
                     requestSyncFrame = true;
                 }
                 if (awaitingKeyFrame) {
-                    if ((packet.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) == 0) {
+                    boolean isFreshKeyFrame =
+                            (packet.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 &&
+                                    packet.presentationTimeUs > keyFrameRequiredAfterPts;
+                    if (!isFreshKeyFrame) {
                         // Keep the queue empty until the encoder supplies the
-                        // requested IDR. Do not return before the sync-frame
-                        // request below; otherwise an overflow would leave
-                        // the decoder waiting forever on the old GOP.
+                        // requested fresh IDR. Do not return before the sync-
+                        // frame request below; otherwise an overflow would
+                        // leave the decoder waiting forever on an old GOP.
                         accepted = false;
                     } else {
                         awaitingKeyFrame = false;
+                        keyFrameRequiredAfterPts = Long.MIN_VALUE;
                     }
                 }
                 if (accepted) {
@@ -885,24 +896,34 @@ final class DhdNativeDisplayService implements Closeable {
 
         private void writeStream(Socket client) throws Exception {
             DataOutputStream output = new DataOutputStream(client.getOutputStream());
+            boolean requestInitialSync = false;
             synchronized (streamLock) {
-                // A reconnecting decoder cannot safely start in the middle of
-                // an old GOP. Preserve the latest IDR as a safe first frame,
-                // then allow the requested fresh IDR to follow it. Without
-                // this cache, a static display can leave the new decoder
-                // blank until the next app interaction produces a buffer.
-                packets.clear();
-                if (lastKeyFramePacket != null) {
-                    packets.addLast(lastKeyFramePacket);
-                    awaitingKeyFrame = false;
-                } else {
+                // The first client can use the keyframe already buffered
+                // while the target activity was launching. Clearing it makes
+                // a static display depend on a second sync frame, which some
+                // hardware encoders do not emit until the pixels change.
+                // Once a client has been served, a replacement decoder must
+                // start at a fresh IDR so it cannot show an old display.
+                if (shouldResetStreamQueue(streamHasServedClient)) {
+                    packets.clear();
                     awaitingKeyFrame = true;
+                    keyFrameRequiredAfterPts = lastEnqueuedPresentationTimeUs;
+                    requestInitialSync = true;
+                } else if (packets.isEmpty()) {
+                    // No startup frame is available yet. Preserve the queue
+                    // semantics and request one without discarding anything.
+                    awaitingKeyFrame = true;
+                    keyFrameRequiredAfterPts = Long.MIN_VALUE;
+                    requestInitialSync = true;
                 }
+                streamHasServedClient = true;
             }
-            // The cached IDR makes the handoff render immediately. Request a
-            // newer IDR as well so the cache cannot leave a changed display
-            // stuck on an older frame.
-            requestSyncFrame();
+            if (requestInitialSync) {
+                // Request a fresh IDR so a static display does not wait for
+                // the encoder's next periodic sync interval. The first
+                // request never invalidates a frame already in the queue.
+                requestSyncFrame();
+            }
             MediaFormat format;
             synchronized (streamLock) {
                 while (!closed.get() && outputFormat == null) streamLock.wait(100L);
@@ -1000,6 +1021,11 @@ final class DhdNativeDisplayService implements Closeable {
                 this.bytes = bytes;
             }
         }
+    }
+
+    /** Queue reset is safe only after the stream has served its first client. */
+    static boolean shouldResetStreamQueue(boolean streamHasServedClient) {
+        return streamHasServedClient;
     }
 
     /** Compatibility constants kept out of the public SDK surface. */

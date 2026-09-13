@@ -488,22 +488,13 @@ class DhdTaskDisplayBackend(
                         ?.takeIf { it.taskSession == session }
                         ?: throw TaskDisplayException("The task display session is no longer active.")
                 }
-                val previousHandle = stateLock.withLock {
-                    previewStateJobs.remove(session.sessionKey)?.cancel()
-                    liveHandles.remove(session.sessionKey)
+                val existingHandle = stateLock.withLock {
+                    liveHandles[session.sessionKey]?.handle
                 }
-                // Closing the app-side decoder only closes its socket. The
-                // daemon must also clear its registered stream client before
-                // the replacement decoder can be accepted.
-                try {
-                    nativeManager.detachLiveSurface(bound.nativeSession)
-                } finally {
-                    previousHandle?.handle?.close()
-                }
-                val handle = nativeManager.attachLiveSurface(bound.nativeSession, surface)
+                val handle = existingHandle ?: nativeManager.attachLiveSurface(bound.nativeSession)
                 stateLock.withLock {
                     if (sessions[session.sessionKey]?.taskSession != session) {
-                        handle.close()
+                        if (existingHandle == null) handle.close()
                         throw TaskDisplayException("The task display session ended during preview attach.")
                     }
                     liveHandles[session.sessionKey] = LiveHandle(surface, handle)
@@ -511,11 +502,17 @@ class DhdTaskDisplayBackend(
                         session.sessionKey,
                         TaskPreviewState.Connecting(session),
                     )
-                    previewStateJobs[session.sessionKey] = observePreviewState(
-                        session = session,
-                        handle = handle,
-                    )
+                    if (previewStateJobs[session.sessionKey]?.isActive != true) {
+                        previewStateJobs[session.sessionKey] = observePreviewState(
+                            session = session,
+                            handle = handle,
+                        )
+                    }
                 }
+                // The controller owns the authenticated stream. Replacing a
+                // viewer only swaps this decoder's Surface and replays the
+                // cached GOP; it never tears down the native stream.
+                handle.attachSurface(surface)
             }
         } catch (error: Throwable) {
             if (error is CancellationException) throw error
@@ -551,27 +548,18 @@ class DhdTaskDisplayBackend(
                     liveHandles[session.sessionKey]
                         ?.takeIf { it.surface === surface }
                         ?.also {
-                            liveHandles.remove(session.sessionKey)
+                            liveHandles[session.sessionKey] = it.copy(surface = null)
                             previewStateJobs.remove(session.sessionKey)?.cancel()
                         }
                 }
-                // A newer Surface may have won the lease while this stale
-                // destroy callback was waiting. It owns the native stream;
-                // never detach it or publish Detached for the replacement.
                 if (handle == null) return@withDisplayLease
-                try {
-                    nativeManager.detachLiveSurface(session.nativeOrThrow())
-                } finally {
-                    handle?.handle?.close()
-                }
+                // A newer Surface may have won the lease while this stale
+                // destroy callback was waiting. It owns the decoder. Keep
+                // the stream controller alive so the next surface can reuse
+                // its authenticated connection and cached GOP.
+                handle.handle.detachSurface(surface)
                 stateLock.withLock {
-                    if (_previewState.value.sessionKeyOrNull() == session.sessionKey
-                    ) {
-                        publishPreviewStateLocked(
-                            session.sessionKey,
-                            TaskPreviewState.Detached,
-                        )
-                    }
+                    publishPreviewStateLocked(session.sessionKey, TaskPreviewState.Detached)
                 }
             }
         } catch (error: CancellationException) {
@@ -589,8 +577,7 @@ class DhdTaskDisplayBackend(
             liveHandles[sessionKey]?.surface
         } ?: return
         // attachLiveSurface serializes the replacement with any in-flight
-        // detach and closes the failed decoder before opening a fresh AVC
-        // connection on the same TextureView surface.
+        // detach and reuses the persistent stream controller.
         attachLiveSurface(session, surface)
     }
 
@@ -1262,7 +1249,8 @@ class DhdTaskDisplayBackend(
     ): Job = scope.launch {
         handle.state.collectLatest { state ->
             stateLock.withLock {
-                if (liveHandles[session.sessionKey]?.handle !== handle) return@withLock
+                val liveHandle = liveHandles[session.sessionKey]
+                if (liveHandle?.handle !== handle || liveHandle.surface == null) return@withLock
                 publishPreviewStateLocked(session.sessionKey, when (state.phase) {
                     DhdLivePreviewPhase.CONNECTING -> TaskPreviewState.Connecting(session)
                     DhdLivePreviewPhase.LIVE -> {
@@ -1360,7 +1348,7 @@ class DhdTaskDisplayBackend(
     )
 
     private data class LiveHandle(
-        val surface: Surface,
+        val surface: Surface?,
         val handle: DhdLivePreviewHandle,
     )
 
