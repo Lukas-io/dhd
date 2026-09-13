@@ -49,6 +49,9 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -244,12 +247,19 @@ fun LiveDisplayPreview(
     onSurfaceAvailable: (AndroidSurface) -> Unit,
     onSurfaceDestroyed: PreviewSurfaceDestroyed,
     onExpand: () -> Unit = {},
+    onExpandBoundsChanged: (Rect?) -> Unit = {},
     showCardChrome: Boolean = true,
 ) {
     val latestOnSurfaceAvailable = rememberUpdatedState(onSurfaceAvailable)
     val latestOnSurfaceDestroyed = rememberUpdatedState(onSurfaceDestroyed)
+    val latestOnExpandBoundsChanged = rememberUpdatedState(onExpandBoundsChanged)
     var textureView by remember { mutableStateOf<ReadOnlyPreviewTextureView?>(null) }
     val colors = LocalAssistantColors.current
+    val density = androidx.compose.ui.platform.LocalDensity.current
+
+    DisposableEffect(state.sessionKey) {
+        onDispose { latestOnExpandBoundsChanged.value(null) }
+    }
 
     val previewLifecycle = LocalLifecycleOwner.current.lifecycle
     DisposableEffect(textureView, state.sessionKey, previewLifecycle) {
@@ -290,7 +300,20 @@ fun LiveDisplayPreview(
             .fillMaxWidth()
             .heightIn(min = 160.dp, max = 360.dp)
             .then(previewContainerModifier)
-            .semantics { contentDescription = "Live app preview" },
+            .semantics { contentDescription = "Live app preview" }
+            .onGloballyPositioned { coordinates ->
+                val bounds = coordinates.boundsInRoot()
+                val insetPx = with(density) { 6.dp.toPx() }
+                val buttonSizePx = with(density) { 48.dp.toPx() }
+                latestOnExpandBoundsChanged.value(
+                    Rect(
+                        left = bounds.right - insetPx - buttonSizePx,
+                        top = bounds.top + insetPx,
+                        right = bounds.right - insetPx,
+                        bottom = bounds.top + insetPx + buttonSizePx,
+                    ),
+                )
+            },
         contentAlignment = Alignment.Center,
     ) {
         val boundedMaxHeight = maxHeight.takeIf { it.value.isFinite() }
@@ -352,18 +375,69 @@ fun LiveDisplayPreview(
                 .padding(6.dp)
                 .size(48.dp)
                 .zIndex(2f)
-                .clip(RoundedCornerShape(999.dp)),
+                .clip(RoundedCornerShape(999.dp))
+                .semantics {
+                    contentDescription = "Open full-screen viewer"
+                },
             shape = RoundedCornerShape(999.dp),
             color = colors.composerBackground.copy(alpha = 0.92f),
         ) {
             Box(contentAlignment = Alignment.Center) {
                 Icon(
                     painter = painterResource(R.drawable.ic_fullscreen),
-                    contentDescription = "Open full-screen viewer",
+                    contentDescription = null,
                     tint = colors.textPrimary,
                     modifier = Modifier.size(21.dp),
                 )
             }
+        }
+    }
+}
+
+/**
+ * Reserves the inline preview's measured space while its surface is owned by
+ * [FullScreenLiveDisplayViewer]. The placeholder deliberately has no
+ * AndroidView, so the same decoder surface is never attached twice.
+ */
+@Composable
+internal fun LiveDisplayPreviewPlaceholder(
+    state: LiveDisplayPreviewState,
+    modifier: Modifier = Modifier,
+    showCardChrome: Boolean = true,
+) {
+    val colors = LocalAssistantColors.current
+    val previewAspectRatio = state.aspectRatio.takeIf { it.isFinite() && it > 0f }
+        ?: DEFAULT_LIVE_DISPLAY_PREVIEW_ASPECT_RATIO
+    val shape = RoundedCornerShape(FULLSCREEN_DISPLAY_CORNER_RADIUS_DP.dp)
+    val previewContainerModifier = if (showCardChrome) {
+        Modifier
+            .background(colors.surfaceCard, shape)
+            .clip(shape)
+    } else {
+        Modifier
+    }
+
+    BoxWithConstraints(
+        modifier = modifier
+            .fillMaxWidth()
+            .heightIn(min = 160.dp, max = 360.dp)
+            .then(previewContainerModifier),
+        contentAlignment = Alignment.Center,
+    ) {
+        val boundedMaxHeight = maxHeight.takeIf { it.value.isFinite() }
+            ?: (maxWidth / previewAspectRatio)
+        val previewWidth = minOf(maxWidth, boundedMaxHeight * previewAspectRatio)
+        val previewHeight = previewWidth / previewAspectRatio
+
+        MaterialSurface(
+            modifier = Modifier
+                .width(previewWidth)
+                .height(previewHeight),
+            shape = shape,
+            color = if (showCardChrome) colors.surfaceCard else Color.Transparent,
+            shadowElevation = if (showCardChrome) 2.dp else 0.dp,
+        ) {
+            Box(modifier = Modifier.fillMaxSize())
         }
     }
 }

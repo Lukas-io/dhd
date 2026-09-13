@@ -48,6 +48,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -60,7 +61,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.foundation.text.selection.DisableSelection
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
@@ -103,6 +103,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -112,6 +113,8 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
@@ -127,7 +130,9 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import com.phonecontrol.assistant.R
 import com.phonecontrol.assistant.apps.AppPermissionRepository
 import com.phonecontrol.assistant.apps.InstalledUserApp
@@ -732,6 +737,8 @@ private fun ConversationTimeline(
     contentPadding: PaddingValues = PaddingValues(vertical = 12.dp),
 ) {
     val listState = rememberLazyListState()
+    var timelineBounds by remember { mutableStateOf<Rect?>(null) }
+    var expandButtonBounds by remember { mutableStateOf<Rect?>(null) }
     val continuationRunId = state.continuationSessionIdOrNullForUi()
     val groups = remember(timeline, continuationRunId) {
         groupTimeline(timeline, continuationRunId)
@@ -757,41 +764,52 @@ private fun ConversationTimeline(
     // The inline preview is a live child of the task group. Its decoder and
     // tool rows can change height while the user is reading older messages;
     // do not reposition the list around that child as it updates.
-    val inlinePreviewVisible = state.isActive() &&
+    val previewBelongsToCurrentTimeline = state.isActive() &&
         previewState?.let { preview ->
             preview.belongsToRun(state.sessionIdOrNullForUi()) &&
-                !preview.isExpanded(expandedPreviewSessionKey) &&
                 groups.any { group ->
                     group.runIds.any { runId -> preview.belongsToGroup(runId) }
                 }
         } == true
+    val previewExpandedInViewer = previewBelongsToCurrentTimeline &&
+        previewState?.isExpanded(expandedPreviewSessionKey) == true
+    val inlinePreviewVisible = previewBelongsToCurrentTimeline && !previewExpandedInViewer
     LaunchedEffect(
         groups.lastOrNull()?.id,
         groups.lastOrNull()?.activities?.size,
         groups.lastOrNull()?.steerMessages?.size,
         groups.lastOrNull()?.assistantMessages?.lastOrNull()?.text?.length,
         inlinePreviewVisible,
+        previewExpandedInViewer,
     ) {
         if (
             groups.isNotEmpty() &&
             followLatest &&
             !listState.isScrollInProgress &&
-            !inlinePreviewVisible
+            !inlinePreviewVisible &&
+            !previewExpandedInViewer
         ) {
             // A very large offset positions the last item at the bottom of
             // the viewport instead of repeatedly snapping to its start.
             listState.scrollToItem(groups.lastIndex, scrollOffset = Int.MAX_VALUE)
         }
     }
-    Box {
+    val expandSessionKey = previewState?.sessionKey ?: state.sessionIdOrNullForUi()
+    Box(
+        modifier = Modifier.onGloballyPositioned { coordinates ->
+            timelineBounds = coordinates.boundsInRoot()
+        },
+    ) {
         LazyColumn(
             state = listState,
             modifier = modifier.fillMaxWidth(),
             contentPadding = contentPadding,
             verticalArrangement = Arrangement.spacedBy(18.dp),
+            // The preview has interactive Compose children. Do not keep an
+            // edge overscroll gesture active over them at the list boundary.
+            overscrollEffect = null,
         ) {
             items(groups, key = { it.id }) { group ->
-                SelectionContainer {
                 TaskGroupCard(
                     group = group,
                     state = state,
@@ -806,12 +824,48 @@ private fun ConversationTimeline(
                     onPreviewSurfaceAvailable = onPreviewSurfaceAvailable,
                     onPreviewSurfaceDestroyed = onPreviewSurfaceDestroyed,
                     onOpenPreview = onOpenPreview,
+                    onPreviewExpandBoundsChanged = { bounds ->
+                        expandButtonBounds = bounds
+                    },
                     expandedPreviewSessionKey = expandedPreviewSessionKey,
                     active = state.isActive() &&
                         state.sessionIdOrNullForUi()?.let(group.runIds::contains) == true,
                 )
-                }
             }
+        }
+
+        // Keep the visible affordance in the item for stable semantics and
+        // rendering, but route physical taps through a sibling of LazyColumn.
+        // LazyColumn's drag/selection/edge gesture chain can otherwise retain
+        // the pointer stream after the list reaches its final offset.
+        val rootBounds = timelineBounds
+        val buttonBounds = expandButtonBounds
+        if (
+            rootBounds != null &&
+            buttonBounds != null &&
+            buttonBounds.left >= rootBounds.left &&
+            buttonBounds.top >= rootBounds.top &&
+            buttonBounds.right <= rootBounds.right &&
+            buttonBounds.bottom <= rootBounds.bottom &&
+            expandSessionKey != null
+        ) {
+            Box(
+                modifier = Modifier
+                    .offset {
+                        IntOffset(
+                            x = (buttonBounds.left - rootBounds.left).roundToInt(),
+                            y = (buttonBounds.top - rootBounds.top).roundToInt(),
+                        )
+                    }
+                    .size(48.dp)
+                    .zIndex(3f)
+                    .pointerInput(expandSessionKey) {
+                        detectTapGestures {
+                            android.util.Log.d("DhdPreview", "Expand requested")
+                            onOpenPreview(expandSessionKey)
+                        }
+                    },
+            )
         }
     }
 }
@@ -832,6 +886,7 @@ private fun TaskGroupCard(
     onPreviewSurfaceAvailable: (AndroidSurface) -> Unit = {},
     onPreviewSurfaceDestroyed: PreviewSurfaceDestroyed = { _, release -> release() },
     onOpenPreview: (String) -> Unit = {},
+    onPreviewExpandBoundsChanged: (Rect?) -> Unit = {},
     expandedPreviewSessionKey: String? = null,
     active: Boolean,
 ) {
@@ -854,11 +909,19 @@ private fun TaskGroupCard(
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         // User message bubble (ChatGPT navy bubble in dark, soft gray bubble in light)
-        group.userMessage?.let { MessageBubble(it) }
+        group.userMessage?.let { message ->
+            SelectionContainer {
+                MessageBubble(message)
+            }
+        }
 
         // Steering instructions stay attached to the current run instead of
         // appearing as a new task.
-        group.steerMessages.forEach { SteerMessageBubble(it) }
+        group.steerMessages.forEach { message ->
+            SelectionContainer {
+                SteerMessageBubble(message)
+            }
+        }
 
         val taskPreviewState = previewState?.let { preview ->
             if (preview.sessionKey == null) {
@@ -871,20 +934,26 @@ private fun TaskGroupCard(
             group.runIds.any { runId -> preview.belongsToGroup(runId) } &&
                 !preview.isExpanded(expandedPreviewSessionKey)
         } == true
+        val previewExpandedForGroup = taskPreviewState?.let { preview ->
+            group.runIds.any { runId -> preview.belongsToGroup(runId) } &&
+                preview.isExpanded(expandedPreviewSessionKey)
+        } == true
         if (active && previewVisibleForGroup) {
-            // The timeline is selectable for message text, but the preview
-            // owns a native TextureView and a Compose expand control. Keep
-            // that interaction island out of SelectionContainer's gesture
-            // registrar so a post-scroll selection pass cannot retain the
-            // pointer stream before the expand control sees it.
-            DisableSelection {
-                LiveDisplayPreview(
-                    state = taskPreviewState,
-                    onSurfaceAvailable = onPreviewSurfaceAvailable,
-                    onSurfaceDestroyed = onPreviewSurfaceDestroyed,
-                    onExpand = { taskPreviewState.sessionKey?.let(onOpenPreview) },
-                )
-            }
+            // Keep the preview outside any SelectionContainer. Its native
+            // TextureView and expand control must not share a selection
+            // gesture surface with the surrounding timeline text.
+            LiveDisplayPreview(
+                state = taskPreviewState,
+                onSurfaceAvailable = onPreviewSurfaceAvailable,
+                onSurfaceDestroyed = onPreviewSurfaceDestroyed,
+                onExpand = { taskPreviewState.sessionKey?.let(onOpenPreview) },
+                onExpandBoundsChanged = onPreviewExpandBoundsChanged,
+            )
+        } else if (active && previewExpandedForGroup) {
+            // Fullscreen owns the decoder surface. Keep this equal-sized slot
+            // in the timeline so opening/closing the viewer cannot change the
+            // LazyColumn's measured content or clamp its scroll offset.
+            LiveDisplayPreviewPlaceholder(state = taskPreviewState)
         }
 
         // Keep the playful status for healthy work, but replace it with a
@@ -945,7 +1014,11 @@ private fun TaskGroupCard(
         }
 
         // Assistant response message(s)
-        group.assistantMessages.forEach { MessageBubble(it) }
+        group.assistantMessages.forEach { message ->
+            SelectionContainer {
+                MessageBubble(message)
+            }
+        }
     }
 }
 
