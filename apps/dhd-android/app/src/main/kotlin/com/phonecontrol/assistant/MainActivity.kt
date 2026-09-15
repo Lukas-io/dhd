@@ -207,7 +207,7 @@ class MainActivity : ComponentActivity() {
                     app.detachTaskPreview(surface, release)
                 },
                 onEndTaskDisplay = { record ->
-                    app.endTaskDisplay(record.displayId, record.displayRef)
+                    app.endTaskDisplay(record.displayId, record.displayRef, record.sessionKey)
                 },
                 onRetryTaskDisplayPreview = { record ->
                     app.retryTaskPreview(record.sessionKey)
@@ -298,7 +298,7 @@ class MainActivity : ComponentActivity() {
     private fun stopSession() {
         startService(
             Intent(this, AssistantForegroundService::class.java)
-                .setAction(AssistantForegroundService.ACTION_STOP),
+                .setAction(AssistantForegroundService.ACTION_STOP_USER),
         )
     }
 

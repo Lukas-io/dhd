@@ -668,7 +668,7 @@ class OverlayWindowController(
     private fun stopSession() {
         appContext.startService(
             android.content.Intent(appContext, AssistantForegroundService::class.java)
-                .setAction(AssistantForegroundService.ACTION_STOP),
+                .setAction(AssistantForegroundService.ACTION_STOP_USER),
         )
     }
 

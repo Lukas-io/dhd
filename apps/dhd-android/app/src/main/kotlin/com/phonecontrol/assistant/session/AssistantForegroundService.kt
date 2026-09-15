@@ -113,16 +113,8 @@ class AssistantForegroundService : Service() {
                     stopSelfResult(startId)
                 }
             }
-            ACTION_STOP -> {
-                coordinator.stop("Stopped from the notification.")
-                removeAttentionNotification(this)
-                if (!overlayEnabledAndPermitted()) {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelfResult(startId)
-                } else {
-                    updateNotification(coordinator.state.value)
-                }
-            }
+            ACTION_STOP -> stopSession("Stopped from the notification.", startId)
+            ACTION_STOP_USER -> stopSession("Stopped by the user.", startId)
 
             ACTION_START, null -> {
                 if (overlayEnabledAndPermitted()) {
@@ -154,6 +146,17 @@ class AssistantForegroundService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun stopSession(reason: String, startId: Int) {
+        coordinator.stop(reason)
+        removeAttentionNotification(this)
+        if (!overlayEnabledAndPermitted()) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelfResult(startId)
+        } else {
+            updateNotification(coordinator.state.value)
+        }
+    }
 
     private fun updateNotification(state: SessionState) {
         val notificationManager = getSystemService(NotificationManager::class.java)
@@ -250,6 +253,7 @@ class AssistantForegroundService : Service() {
         const val ACTION_TOGGLE_PAUSE = "com.phonecontrol.assistant.action.TOGGLE_PAUSE"
         const val ACTION_CONTINUE = "com.phonecontrol.assistant.action.CONTINUE"
         const val ACTION_STOP = "com.phonecontrol.assistant.action.STOP"
+        const val ACTION_STOP_USER = "com.phonecontrol.assistant.action.STOP_USER"
         const val EXTRA_REQUEST = "com.phonecontrol.assistant.extra.REQUEST"
         const val EXTRA_CONVERSATION_ID = "com.phonecontrol.assistant.extra.CONVERSATION_ID"
         const val EXTRA_REASONING_EFFORT = "com.phonecontrol.assistant.extra.REASONING_EFFORT"

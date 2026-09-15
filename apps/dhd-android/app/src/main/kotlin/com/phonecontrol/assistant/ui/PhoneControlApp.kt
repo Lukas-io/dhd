@@ -39,6 +39,7 @@ import com.phonecontrol.assistant.PhoneControlApplication
 import com.phonecontrol.assistant.apps.InstalledAppsRepository
 import com.phonecontrol.assistant.data.DHD_CONVERSATION_ID
 import com.phonecontrol.assistant.domain.ReasoningEffort
+import com.phonecontrol.assistant.execution.TaskDisplayLayoutPreferences
 
 data class AssistantColorScheme(
     val isDark: Boolean,
@@ -266,6 +267,14 @@ fun PhoneControlApp(
     val developerStatus by developerModeController.status.collectAsState()
     val companionConnected by application.devBridgeServer.companionConnected.collectAsState()
     val apps = remember { InstalledAppsRepository(context).listLaunchableUserApps() }
+    val taskDisplayLayoutPreferences = remember { TaskDisplayLayoutPreferences(context) }
+    var fullSizeLayoutPackages by remember {
+        mutableStateOf(taskDisplayLayoutPreferences.fullSizeLayoutPackages())
+    }
+    val setFullSizeLayout: (String, Boolean) -> Unit = { packageName, enabled ->
+        taskDisplayLayoutPreferences.setFullSizeLayoutEnabled(packageName, enabled)
+        fullSizeLayoutPackages = taskDisplayLayoutPreferences.fullSizeLayoutPackages()
+    }
 
     val navController = rememberNavController()
     val initialNavigationRoute = when (initialRoute) {
@@ -439,6 +448,10 @@ fun PhoneControlApp(
                                 navController.popBackStack()
                             },
                             onEnd = onEndTaskDisplay,
+                            fullSizeLayoutForPackage = { packageName ->
+                                packageName in fullSizeLayoutPackages
+                            },
+                            onSetFullSizeLayout = setFullSizeLayout,
                             onBack = { navController.popBackStack() },
                         )
                     }
@@ -484,6 +497,10 @@ fun PhoneControlApp(
                             viewerSessionKey = record.sessionKey
                         },
                         onEnd = onEndTaskDisplay,
+                        fullSizeLayoutForPackage = { packageName ->
+                            packageName in fullSizeLayoutPackages
+                        },
+                        onSetFullSizeLayout = setFullSizeLayout,
                         onBack = { taskDisplaysSheetVisible = false },
                     )
                 }

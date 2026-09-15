@@ -73,14 +73,21 @@ class PhoneControlApplication : Application() {
     }
 
     /** End one display, stopping its owning agent run before releasing native resources. */
-    fun endTaskDisplay(displayId: Int?, displayRef: String?) {
-        val selectedDisplayId = displayId ?: return
+    fun endTaskDisplay(displayId: Int?, displayRef: String?, sessionKey: String? = null) {
         previewScope.launch {
             val activeRunKey = sessionCoordinator.activeSessionId()
-            if (activeRunKey != null && taskDisplayBackend.isDisplayClaimedByRun(selectedDisplayId, activeRunKey)) {
-                sessionCoordinator.stop("Display ended by the user.")
+            val selectedDisplayId = displayId
+            if (selectedDisplayId != null) {
+                if (activeRunKey != null && taskDisplayBackend.isDisplayClaimedByRun(selectedDisplayId, activeRunKey)) {
+                    sessionCoordinator.stop("Display ended by the user.")
+                }
+                taskDisplayBackend.closeTaskDisplay(selectedDisplayId, displayRef)
+            } else if (!sessionKey.isNullOrBlank()) {
+                // A fallback UI record can outlive its Android display ID.
+                // Close by the opaque owner key so an unavailable/stale record
+                // can still be removed from Task Displays.
+                taskDisplayBackend.close(sessionKey)
             }
-            taskDisplayBackend.closeTaskDisplay(selectedDisplayId, displayRef)
         }
     }
 

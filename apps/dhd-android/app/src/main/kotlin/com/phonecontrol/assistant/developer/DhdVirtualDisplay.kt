@@ -21,15 +21,26 @@ data class DhdVirtualDisplaySpec(
     val frameRate: Int = 30,
     val bitRate: Int = 2_000_000,
     // Apps on the task display receive this density through a per-display
-    // window-manager override, giving them a wider dp viewport while
-    // preserving the base 720x1560 pixel buffer.
+    // window-manager override. The optional logical canvas is independent of
+    // the encoded 720x1560 pixel buffer.
     val appDensityDpi: Int = 320,
+    val appDisplayWidth: Int? = null,
+    val appDisplayHeight: Int? = null,
 ) {
     init {
         require(width in 320..2_160) { "Virtual display width is outside the supported range." }
         require(height in 320..3_840) { "Virtual display height is outside the supported range." }
         require(densityDpi in 120..640) { "Virtual display density is outside the supported range." }
         require(appDensityDpi in 120..640) { "App density is outside the supported range." }
+        require((appDisplayWidth == null) == (appDisplayHeight == null)) {
+            "App display width and height must be provided together."
+        }
+        require(appDisplayWidth == null || appDisplayWidth > 0) {
+            "App display width must be positive."
+        }
+        require(appDisplayHeight == null || appDisplayHeight > 0) {
+            "App display height must be positive."
+        }
         require(frameRate in 1..60) { "Virtual display frame rate is outside the supported range." }
         require(bitRate in 128_000..20_000_000) { "Virtual display bit rate is outside the supported range." }
     }
@@ -49,6 +60,8 @@ data class DhdVirtualDisplaySession(
     val streamToken: String,
     val codecMime: String = DhdVirtualDisplayProtocol.CODEC_AVC,
     val appDensityDpi: Int = densityDpi,
+    val appDisplayWidth: Int? = null,
+    val appDisplayHeight: Int? = null,
 ) {
     init {
         require(sessionKey.isNotBlank()) { "Virtual display session key must not be blank." }
@@ -65,7 +78,16 @@ data class DhdVirtualDisplaySession(
     }
 
     val spec: DhdVirtualDisplaySpec
-        get() = DhdVirtualDisplaySpec(width, height, densityDpi, frameRate, bitRate, appDensityDpi)
+        get() = DhdVirtualDisplaySpec(
+            width = width,
+            height = height,
+            densityDpi = densityDpi,
+            frameRate = frameRate,
+            bitRate = bitRate,
+            appDensityDpi = appDensityDpi,
+            appDisplayWidth = appDisplayWidth,
+            appDisplayHeight = appDisplayHeight,
+        )
 }
 
 data class DhdVirtualDisplayCapture(
@@ -157,18 +179,22 @@ class DhdVirtualDisplayManager(
 
             val result = try {
                 controller.execute(
-                    command = listOf(
-                        DhdVirtualDisplayProtocol.COMMAND,
-                        DhdVirtualDisplayProtocol.CREATE,
-                        sessionKey,
-                        packageName,
-                        spec.width.toString(),
-                        spec.height.toString(),
-                        spec.densityDpi.toString(),
-                        spec.frameRate.toString(),
-                        spec.bitRate.toString(),
-                        spec.appDensityDpi.toString(),
-                    ),
+                    command = buildList {
+                        add(DhdVirtualDisplayProtocol.COMMAND)
+                        add(DhdVirtualDisplayProtocol.CREATE)
+                        add(sessionKey)
+                        add(packageName)
+                        add(spec.width.toString())
+                        add(spec.height.toString())
+                        add(spec.densityDpi.toString())
+                        add(spec.frameRate.toString())
+                        add(spec.bitRate.toString())
+                        add(spec.appDensityDpi.toString())
+                        if (spec.appDisplayWidth != null && spec.appDisplayHeight != null) {
+                            add(spec.appDisplayWidth.toString())
+                            add(spec.appDisplayHeight.toString())
+                        }
+                    },
                 )
             } catch (cancelledError: CancellationException) {
                 if (cancelled.contains(sessionKey)) {
@@ -449,6 +475,8 @@ class DhdVirtualDisplayManager(
         streamToken = json.getString("streamToken"),
         codecMime = json.optString("codecMime", DhdVirtualDisplayProtocol.CODEC_AVC),
         appDensityDpi = json.optInt("appDensityDpi", json.getInt("densityDpi")),
+        appDisplayWidth = json.optInt("appDisplayWidth", 0).takeIf { it > 0 },
+        appDisplayHeight = json.optInt("appDisplayHeight", 0).takeIf { it > 0 },
     )
 
     private fun failureCode(result: PhoneProcessResult): DhdVirtualDisplayResult.Code = when {

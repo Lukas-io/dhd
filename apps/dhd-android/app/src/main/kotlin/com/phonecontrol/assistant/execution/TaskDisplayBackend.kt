@@ -18,6 +18,9 @@ data class TaskDisplaySpec(
      * created; the pixel geometry used for coordinates and streaming is fixed.
      */
     val appDensityDpi: Int = DEFAULT_APP_DENSITY_DPI,
+    /** Optional logical canvas used by apps that need a wider dp viewport. */
+    val appDisplayWidth: Int? = null,
+    val appDisplayHeight: Int? = null,
 ) {
     init {
         require(width > 0) { "Task display width must be positive." }
@@ -25,6 +28,15 @@ data class TaskDisplaySpec(
         require(densityDpi > 0) { "Task display density must be positive." }
         require(appDensityDpi in 120..640) {
             "Task app density must be between 120 and 640 dpi."
+        }
+        require((appDisplayWidth == null) == (appDisplayHeight == null)) {
+            "Task app display width and height must be provided together."
+        }
+        require(appDisplayWidth == null || appDisplayWidth > 0) {
+            "Task app display width must be positive."
+        }
+        require(appDisplayHeight == null || appDisplayHeight > 0) {
+            "Task app display height must be positive."
         }
     }
 
@@ -53,11 +65,17 @@ data class TaskDisplaySession(
     val geometry: TaskDisplayGeometry,
     /** The package launched on this display, when known. */
     val packageName: String = "",
+    /** Logical app canvas; input coordinates are scaled into this space. */
+    val appDisplayWidth: Int = geometry.width,
+    val appDisplayHeight: Int = geometry.height,
 ) {
     init {
         require(sessionKey.isNotBlank()) { "Task display session key must not be blank." }
         require(taskId.isNotBlank()) { "Task display task ID must not be blank." }
         require(displayId > 0) { "Task display ID must be greater than the default display." }
+        require(appDisplayWidth > 0 && appDisplayHeight > 0) {
+            "Task app display geometry must be positive."
+        }
     }
 }
 

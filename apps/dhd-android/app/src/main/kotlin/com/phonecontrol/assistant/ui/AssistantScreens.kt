@@ -3096,6 +3096,8 @@ fun TaskDisplaysScreen(
     records: List<TaskDisplayUiRecord>,
     onView: (TaskDisplayUiRecord) -> Unit,
     onEnd: (TaskDisplayUiRecord) -> Unit,
+    fullSizeLayoutForPackage: (String) -> Boolean = { false },
+    onSetFullSizeLayout: (String, Boolean) -> Unit = { _, _ -> },
     onBack: () -> Unit,
 ) {
     val colors = LocalAssistantColors.current
@@ -3209,6 +3211,11 @@ fun TaskDisplaysScreen(
                         nowEpochMs = nowEpochMs,
                         onView = { onView(record) },
                         onEnd = { endCandidate = record },
+                        fullSizeLayoutEnabled = record.packageName
+                            ?.takeIf(String::isNotBlank)
+                            ?.let(fullSizeLayoutForPackage)
+                            ?: false,
+                        onSetFullSizeLayout = onSetFullSizeLayout,
                     )
                 }
             }
@@ -3257,8 +3264,16 @@ private fun TaskDisplayManagerCard(
     nowEpochMs: Long,
     onView: () -> Unit,
     onEnd: () -> Unit,
+    fullSizeLayoutEnabled: Boolean,
+    onSetFullSizeLayout: (String, Boolean) -> Unit,
 ) {
     val colors = LocalAssistantColors.current
+    val packageName = record.packageName?.takeIf(String::isNotBlank)
+    val appLabel = record.appLabel ?: packageName ?: "this app"
+    var layoutDialogVisible by rememberSaveable(record.sessionKey) { mutableStateOf(false) }
+    var pendingFullSizeLayout by remember(record.sessionKey, fullSizeLayoutEnabled) {
+        mutableStateOf(fullSizeLayoutEnabled)
+    }
     val statusColor = when (record.lifecycle) {
         TaskDisplayLifecycle.RUNNING -> colors.accentGreen
         TaskDisplayLifecycle.PAUSED -> colors.accentBlue
@@ -3278,9 +3293,7 @@ private fun TaskDisplayManagerCard(
         shape = RoundedCornerShape(20.dp),
         color = colors.settingsCard,
         border = BorderStroke(1.dp, colors.borderColor),
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(enabled = canView, onClick = onView),
+        modifier = Modifier.fillMaxWidth(),
     ) {
         Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 15.dp)) {
             Row(verticalAlignment = Alignment.Top) {
@@ -3345,6 +3358,32 @@ private fun TaskDisplayManagerCard(
                 )
             }
 
+            if (packageName != null) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                    horizontalArrangement = Arrangement.End,
+                ) {
+                    TextButton(
+                        onClick = {
+                            pendingFullSizeLayout = fullSizeLayoutEnabled
+                            layoutDialogVisible = true
+                        },
+                        enabled = canView,
+                    ) {
+                        Text(
+                            text = if (fullSizeLayoutEnabled) {
+                                "Full-size layout on"
+                            } else {
+                                "Display looks wrong?"
+                            },
+                            color = if (canView) colors.accentBlue else colors.textSecondary,
+                        )
+                    }
+                }
+            }
+
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -3358,11 +3397,83 @@ private fun TaskDisplayManagerCard(
                     fontSize = 11.sp,
                     modifier = Modifier.weight(1f),
                 )
+                TextButton(onClick = onView, enabled = canView) {
+                    Text("View", color = if (canView) colors.accentBlue else colors.textSecondary)
+                }
                 TextButton(onClick = onEnd, enabled = canEnd) {
                     Text("End", color = if (canEnd) colors.errorRed else colors.textSecondary)
                 }
             }
         }
+    }
+
+    if (layoutDialogVisible && packageName != null) {
+        AlertDialog(
+            onDismissRequest = { layoutDialogVisible = false },
+            containerColor = colors.surfaceCard,
+            titleContentColor = colors.textPrimary,
+            textContentColor = colors.textSecondary,
+            shape = RoundedCornerShape(20.dp),
+            title = { Text("App display looks wrong?", fontWeight = FontWeight.SemiBold) },
+            text = {
+                Column {
+                    Text(
+                        "If $appLabel looks squished, cut off, or leaves a large empty area, " +
+                            "try the full-size app layout. This only affects $appLabel and " +
+                            "applies the next time it is opened.",
+                        fontSize = 14.sp,
+                        lineHeight = 20.sp,
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 18.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Use full-size app layout",
+                                color = colors.textPrimary,
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                "Helpful when the app does not fit the display correctly.",
+                                color = colors.textSecondary,
+                                fontSize = 12.sp,
+                                lineHeight = 17.sp,
+                                modifier = Modifier.padding(top = 3.dp),
+                            )
+                        }
+                        Switch(
+                            checked = pendingFullSizeLayout,
+                            onCheckedChange = { pendingFullSizeLayout = it },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = colors.textPrimary,
+                                checkedTrackColor = colors.accentBlue,
+                                uncheckedThumbColor = colors.textSecondary,
+                                uncheckedTrackColor = colors.borderColor,
+                            ),
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onSetFullSizeLayout(packageName, pendingFullSizeLayout)
+                        layoutDialogVisible = false
+                    },
+                ) {
+                    Text("Save", color = colors.accentBlue, fontWeight = FontWeight.SemiBold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { layoutDialogVisible = false }) {
+                    Text("Cancel", color = colors.textSecondary)
+                }
+            },
+        )
     }
 }
 
