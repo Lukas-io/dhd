@@ -16,6 +16,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -35,6 +37,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -856,6 +861,9 @@ fun OverlayPanel(
     taskPreviewState: StateFlow<TaskPreviewState>,
     taskDisplaySession: StateFlow<TaskDisplaySession?>,
     overlayHidden: StateFlow<Boolean>,
+    onKeyboardVisibilityChanged: (Boolean) -> Unit,
+    onTextFieldFocusChanged: (Boolean) -> Unit,
+    onComposerTapped: () -> Unit,
     onTaskPreviewSurfaceAvailable: (TaskDisplaySession, AndroidSurface) -> Unit,
     onTaskPreviewSurfaceDestroyed: (TaskDisplaySession, AndroidSurface, () -> Unit) -> Unit,
 ) {
@@ -947,6 +955,10 @@ fun OverlayPanel(
     val density = LocalDensity.current
     val imeBottom = WindowInsets.ime.getBottom(density)
     val keyboardVisible = imeBottom > with(density) { 96.dp.toPx() }
+
+    LaunchedEffect(keyboardVisible) {
+        onKeyboardVisibilityChanged(keyboardVisible)
+    }
 
     val resultText = result?.takeIf { it.isNotBlank() } ?: terminalMessage(state)
     val hasFloatingResult = effectiveMode == OverlayPanelMode.RESULT && resultText.isNotBlank()
@@ -1297,6 +1309,8 @@ fun OverlayPanel(
                             reasoningEffort = reasoningEffort,
                             visibleReasoningEfforts = visibleReasoningEfforts,
                             onSelectReasoningEffort = setReasoningEffort,
+                            onTextFieldFocusChanged = onTextFieldFocusChanged,
+                            onComposerTapped = onComposerTapped,
                         )
                         OverlayPanelMode.WORKING,
                         OverlayPanelMode.ATTENTION -> WorkingRow(
@@ -1531,6 +1545,8 @@ private fun Composer(
     onContinueInDhd: () -> Unit,
     onCollapse: () -> Unit,
     onShowPreview: () -> Unit,
+    onTextFieldFocusChanged: (Boolean) -> Unit,
+    onComposerTapped: () -> Unit,
     fastMode: Boolean,
     onSetFastMode: (Boolean) -> Unit,
     reasoningEffort: ReasoningEffort,
@@ -1541,7 +1557,9 @@ private fun Composer(
     val colors = LocalAssistantColors.current
     var draft by rememberSaveable { mutableStateOf("") }
     var reasoningSelectorOpen by rememberSaveable { mutableStateOf(false) }
+    var focusRequestToken by remember { mutableStateOf(0) }
     val focus = LocalFocusManager.current
+    val focusRequester = remember { FocusRequester() }
     val density = LocalDensity.current
     val clipboardManager = LocalClipboardManager.current
     val textToolbar = remember(clipboardManager) {
@@ -1559,6 +1577,17 @@ private fun Composer(
         if (!keyboardVisible) {
             reasoningSelectorOpen = false
             textToolbar.hide()
+        }
+    }
+
+    LaunchedEffect(focusRequestToken) {
+        if (focusRequestToken == 0) return@LaunchedEffect
+        // The overlay window becomes focusable in response to the same touch
+        // that reached this field. Retry across a few frames so the request is
+        // made after WindowManager has granted the overlay window focus.
+        repeat(6) {
+            withFrameNanos { }
+            focusRequester.requestFocus()
         }
     }
 
@@ -1618,6 +1647,15 @@ private fun Composer(
                 onValueChange = { draft = it.take(MAX_DRAFT_LENGTH) },
                 modifier = Modifier
                     .weight(1f)
+                    .focusRequester(focusRequester)
+                    .pointerInput(onComposerTapped) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false)
+                            onComposerTapped()
+                            focusRequestToken += 1
+                        }
+                    }
+                    .onFocusChanged { onTextFieldFocusChanged(it.isFocused) }
                     .then(
                         if (keyboardVisible) {
                             Modifier.heightIn(min = 38.dp, max = 126.dp)

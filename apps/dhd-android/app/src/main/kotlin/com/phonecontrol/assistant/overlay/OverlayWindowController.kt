@@ -8,8 +8,10 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.Surface
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
@@ -73,6 +75,9 @@ class OverlayWindowController(
     private var viewTreeOwner: OverlayViewTreeOwner? = null
     private var lastState: SessionState = coordinator.state.value
     private var hidden = visibilityGate.hidden.value
+    private var keyboardWasVisible = false
+    private var textFieldFocused = false
+    private var panelFocusEnabled = false
 
     val panelMode: StateFlow<OverlayPanelMode> = _panelMode.asStateFlow()
     val resultMessage: StateFlow<String?> = _resultMessage.asStateFlow()
@@ -112,7 +117,10 @@ class OverlayWindowController(
 
     fun setHidden(value: Boolean) {
         hidden = value
-        if (value) hideKeyboard()
+        if (value) {
+            hideKeyboard()
+            releasePanelFocus()
+        }
         panelView?.visibility = if (value) View.GONE else View.VISIBLE
         updateGlowVisibility()
     }
@@ -149,9 +157,26 @@ class OverlayWindowController(
         }
         _glowTrigger.value = System.currentTimeMillis()
         _resultMessage.value = null
-        panelView?.clearFocus()
-        hideKeyboard()
+        val existingInputFocus = hasExistingInputFocus()
+        if (existingInputFocus) {
+            prepareForComposerFocus()
+        } else {
+            releasePanelFocus()
+        }
         setPanelMode(OverlayPanelMode.COMPOSER)
+        if (existingInputFocus) {
+            panelView?.post {
+                val panel = panelView ?: return@post
+                if (_panelMode.value == OverlayPanelMode.COMPOSER && !hidden && !textFieldFocused) {
+                    // Wait until the overlay window has had a chance to take
+                    // window focus, then dismiss the old app's IME. Do not
+                    // focus a Compose child; the user must tap the composer.
+                    panel.requestFocus()
+                    hideKeyboard()
+                    panel.clearFocus()
+                }
+            }
+        }
     }
 
     fun showBubble() {
@@ -295,10 +320,19 @@ class OverlayWindowController(
         updateGlowVisibility()
         updatePanelLayout(mode != OverlayPanelMode.BUBBLE)
         if (changed) {
+            // Composer focus is opt-in: the panel stays non-focusable until
+            // the text field receives a touch. Non-input modes always release
+            // any focus held by the panel.
+            if (!canAcceptTextInput()) {
+                releasePanelFocus()
+            }
             // WindowManager may measure the old Compose content before the state
             // flow recomposition lands. Reconcile once more on the next UI turn.
             panelView?.post {
                 if (_panelMode.value == mode) {
+                    if (!canAcceptTextInput()) {
+                        releasePanelFocus()
+                    }
                     updatePanelLayout(mode != OverlayPanelMode.BUBBLE)
                 }
             }
@@ -320,6 +354,20 @@ class OverlayWindowController(
         val lifecycleOwner = OverlayViewTreeOwner()
         val initialVisibility = if (hidden) View.GONE else View.VISIBLE
         val panel = ComposeView(appContext).apply {
+            isFocusable = false
+            isFocusableInTouchMode = false
+            descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+            setOnTouchListener { _, event ->
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        if (canAcceptTextInput()) {
+                            allowPanelFocus()
+                        }
+                    }
+                    MotionEvent.ACTION_OUTSIDE -> releasePanelFocus()
+                }
+                false
+            }
             visibility = initialVisibility
             setViewTreeLifecycleOwner(lifecycleOwner)
             setViewTreeSavedStateRegistryOwner(lifecycleOwner)
@@ -333,6 +381,9 @@ class OverlayWindowController(
                         developerStatus = developerStatus,
                         companionConnected = companionConnected,
                         taskDisplaySession = taskDisplaySession,
+                        onKeyboardVisibilityChanged = ::onKeyboardVisibilityChanged,
+                        onTextFieldFocusChanged = ::onTextFieldFocusChanged,
+                        onComposerTapped = ::onComposerTapped,
                         onExpand = ::openComposer,
                         onNewRequest = ::openComposer,
                         onSubmit = ::submitRequest,
@@ -444,16 +495,25 @@ class OverlayWindowController(
         val panel = panelView ?: return
         val params = panelParams ?: return
         if (expanded) {
+            val focusable = panelFocusEnabled && canAcceptTextInput()
+            panel.isFocusable = focusable
+            panel.isFocusableInTouchMode = focusable
             params.width = WindowManager.LayoutParams.MATCH_PARENT
             params.height = WindowManager.LayoutParams.WRAP_CONTENT
             params.gravity = Gravity.BOTTOM or Gravity.START
             params.x = 0
             params.y = 0
             params.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+            if (!focusable) {
+                params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            }
             params.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN or
                 WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
         } else {
+            panel.isFocusable = false
+            panel.isFocusableInTouchMode = false
             val savedPosition = OverlayPreferences.bubblePosition(appContext)
             val insets = bubbleInsets()
             val bubblePosition = bubblePositionOnNearestEdge(
@@ -476,6 +536,103 @@ class OverlayWindowController(
             params.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN or
                 WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
         }
+        runCatching { windowManager.updateViewLayout(panel, params) }
+    }
+
+    private fun onKeyboardVisibilityChanged(visible: Boolean) {
+        if (visible) {
+            keyboardWasVisible = true
+            if (textFieldFocused) {
+                allowPanelFocus()
+            }
+        } else if (keyboardWasVisible && textFieldFocused) {
+            keyboardWasVisible = false
+            releasePanelFocus()
+        } else {
+            keyboardWasVisible = false
+        }
+    }
+
+    private fun allowPanelFocus() {
+        if (hidden || !canAcceptTextInput()) return
+        setPanelFocusable(true)
+    }
+
+    private fun prepareForComposerFocus() {
+        val panel = panelView ?: return
+        // The bubble is normally not focusable, so the text field in the
+        // underlying app keeps focus while the user taps it. Claim the overlay
+        // window only for the handoff; the composer field itself remains
+        // unfocused until the user taps it.
+        setPanelFocusable(true)
+        panel.isFocusableInTouchMode = true
+        panel.isFocusable = true
+        panel.requestFocus()
+    }
+
+    private fun hasExistingInputFocus(): Boolean {
+        val panel = panelView ?: return false
+        val imeVisible = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            panel.rootWindowInsets?.isVisible(WindowInsets.Type.ime()) == true
+        } else {
+            false
+        }
+        // A stale served view is not enough to trigger the handoff. Only a
+        // currently visible IME means the previous app needs to relinquish
+        // its text-entry session before the composer opens.
+        return imeVisible
+    }
+
+    private fun onTextFieldFocusChanged(focused: Boolean) {
+        textFieldFocused = focused
+        if (!focused || !canAcceptTextInput()) return
+        allowPanelFocus()
+        panelView?.post {
+            val panel = panelView ?: return@post
+            if (canAcceptTextInput()) {
+                appContext.getSystemService(InputMethodManager::class.java)
+                    ?.showSoftInput(panel, InputMethodManager.SHOW_IMPLICIT)
+            }
+        }
+    }
+
+    private fun onComposerTapped() {
+        if (!canAcceptTextInput()) return
+        // The tap started while the overlay window was not focusable. Enable
+        // the window first, then let Compose request the actual text-field
+        // focus on the next frame.
+        allowPanelFocus()
+        panelView?.post {
+            val panel = panelView ?: return@post
+            if (canAcceptTextInput()) {
+                panel.requestFocus()
+            }
+        }
+    }
+
+    private fun releasePanelFocus() {
+        textFieldFocused = false
+        panelView?.clearFocus()
+        setPanelFocusable(false)
+    }
+
+    private fun canAcceptTextInput(): Boolean =
+        !coordinator.state.value.isActiveForOverlay() &&
+            _panelMode.value in setOf(OverlayPanelMode.COMPOSER, OverlayPanelMode.RESULT)
+
+    private fun setPanelFocusable(focusable: Boolean) {
+        val panel = panelView ?: return
+        val params = panelParams ?: return
+        panelFocusEnabled = focusable
+        panel.isFocusable = focusable
+        panel.isFocusableInTouchMode = focusable
+        val nextFlags = if (focusable) {
+            params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+        } else {
+            params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        }
+        if (nextFlags == params.flags) return
+        params.flags = nextFlags
         runCatching { windowManager.updateViewLayout(panel, params) }
     }
 
@@ -569,6 +726,8 @@ class OverlayWindowController(
     }
 
     private fun hideKeyboard() {
+        keyboardWasVisible = false
+        textFieldFocused = false
         panelView?.let { view ->
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 view.windowInsetsController?.hide(android.view.WindowInsets.Type.ime())
