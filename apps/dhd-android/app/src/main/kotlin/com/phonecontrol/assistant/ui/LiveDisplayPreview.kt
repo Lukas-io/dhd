@@ -459,6 +459,7 @@ fun FullScreenLiveDisplayViewer(
     onRetry: () -> Unit = {},
     onAcknowledgeAttention: () -> Boolean = { false },
     onStopSession: () -> Unit = {},
+    onEndTaskDisplay: (TaskDisplayUiRecord) -> Unit = {},
 ) {
     val colors = LocalAssistantColors.current
     val title = record.appLabel
@@ -635,16 +636,36 @@ fun FullScreenLiveDisplayViewer(
                                 }
                             }
                         }
-                        if (state.status == LiveDisplayPreviewStatus.ERROR) {
-                            Button(
-                                onClick = onRetry,
-                                modifier = Modifier.padding(top = 10.dp),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = colors.accentBlue,
-                                    contentColor = Color.White,
+                        if (state.status == LiveDisplayPreviewStatus.ERROR ||
+                            record.lifecycle == TaskDisplayLifecycle.UNAVAILABLE
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 10.dp),
+                                horizontalArrangement = Arrangement.spacedBy(
+                                    10.dp,
+                                    Alignment.CenterHorizontally,
                                 ),
+                                verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                Text("Retry preview")
+                                if (state.status == LiveDisplayPreviewStatus.ERROR) {
+                                    Button(
+                                        onClick = onRetry,
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = colors.accentBlue,
+                                            contentColor = Color.White,
+                                        ),
+                                    ) {
+                                        Text("Retry preview")
+                                    }
+                                }
+                                OutlinedButton(
+                                    onClick = { onEndTaskDisplay(record) },
+                                    border = BorderStroke(1.dp, colors.errorRed),
+                                ) {
+                                    Text("End display", color = colors.errorRed)
+                                }
                             }
                         }
                     }

@@ -488,6 +488,7 @@ class DhdTaskDisplayBackend(
                     throw TaskDisplayException("The task display session is no longer active.")
                 }
             }
+            refreshRetainedExpiry(session.sessionKey)
             block()
         }
     }
@@ -591,6 +592,13 @@ class DhdTaskDisplayBackend(
         // attachLiveSurface serializes the replacement with any in-flight
         // detach and reuses the persistent stream controller.
         attachLiveSurface(session, surface)
+    }
+
+    override suspend fun touch(sessionKey: String) {
+        val operationLock = operationLocks.getOrPut(sessionKey) { Mutex() }
+        operationLock.withLock {
+            refreshRetainedExpiry(sessionKey)
+        }
     }
 
     override fun cancel(sessionKey: String) {
@@ -894,6 +902,7 @@ class DhdTaskDisplayBackend(
                     throw TaskDisplayException("The task display session is no longer active.")
                 }
             }
+            refreshRetainedExpiry(session.sessionKey)
             block()
         }
     }
@@ -957,10 +966,19 @@ class DhdTaskDisplayBackend(
                         status = TaskDisplayStatus.EXPIRED,
                         error = record.error ?: "The retained display expired.",
                     )
-                    else -> record.copy(
-                        status = TaskDisplayStatus.UNAVAILABLE,
-                        error = record.error
-                            ?: "The DHD display session is no longer active. The display service may have restarted.",
+                    record.status.isTerminal -> record.copy(
+                        expiresAtEpochMs = record.expiresAtEpochMs
+                            ?: now + terminalRetentionMs.coerceAtLeast(0L),
+                    )
+                    record.status == TaskDisplayStatus.UNAVAILABLE &&
+                        record.expiresAtEpochMs != null && record.expiresAtEpochMs <= now -> record.copy(
+                        status = TaskDisplayStatus.EXPIRED,
+                        error = record.error ?: "The retained display expired.",
+                    )
+                    else -> unavailableRecord(
+                        record,
+                        "The DHD display session is no longer active. The display service may have restarted.",
+                        now,
                     )
                 }
                 if (next != record) publishRecord(next)
@@ -990,9 +1008,10 @@ class DhdTaskDisplayBackend(
                         error = record.error ?: "The retained display expired.",
                     )
                     ended -> record
-                    else -> record.copy(
-                        status = TaskDisplayStatus.UNAVAILABLE,
-                        error = record.error ?: "The native display did not match the persisted task identity.",
+                    else -> unavailableRecord(
+                        record,
+                        "The native display did not match the persisted task identity.",
+                        now,
                     )
                 }
                 publishRecord(next)
@@ -1085,9 +1104,19 @@ class DhdTaskDisplayBackend(
                     status = TaskDisplayStatus.EXPIRED,
                     error = record.error ?: "The retained display expired.",
                 )
-                else -> record.copy(
-                    status = TaskDisplayStatus.UNAVAILABLE,
-                    error = record.error ?: message,
+                record.status.isTerminal -> record.copy(
+                    expiresAtEpochMs = record.expiresAtEpochMs
+                        ?: now + terminalRetentionMs.coerceAtLeast(0L),
+                )
+                record.status == TaskDisplayStatus.UNAVAILABLE &&
+                    record.expiresAtEpochMs != null && record.expiresAtEpochMs <= now -> record.copy(
+                    status = TaskDisplayStatus.EXPIRED,
+                    error = record.error ?: "The retained display expired.",
+                )
+                else -> unavailableRecord(
+                    record,
+                    message,
+                    now,
                 )
             }
             if (next != record) publishRecord(next)
@@ -1095,6 +1124,44 @@ class DhdTaskDisplayBackend(
                 scheduleExpiry(next)
             }
         }
+    }
+
+    private fun unavailableRecord(
+        record: TaskDisplayRecord,
+        message: String,
+        nowEpochMs: Long,
+    ): TaskDisplayRecord {
+        val unavailableAt = (record.terminalAtEpochMs ?: nowEpochMs)
+            .coerceAtLeast(record.createdAtEpochMs)
+        return record.copy(
+            status = TaskDisplayStatus.UNAVAILABLE,
+            terminalAtEpochMs = unavailableAt,
+            expiresAtEpochMs = record.expiresAtEpochMs
+                ?: unavailableAt + terminalRetentionMs.coerceAtLeast(0L),
+            error = record.error ?: message,
+        )
+    }
+
+    /**
+     * Retained and unavailable displays are useful only while they are being
+     * used. Active RUNNING/PAUSED displays deliberately have no idle deadline
+     * so a long-running task cannot disappear underneath its agent.
+     */
+    private fun refreshRetainedExpiry(sessionKey: String) {
+        val record = findRecord(sessionKey) ?: return
+        if (record.status == TaskDisplayStatus.ENDED ||
+            record.status == TaskDisplayStatus.EXPIRED ||
+            (!record.status.isTerminal && record.status != TaskDisplayStatus.UNAVAILABLE)
+        ) {
+            return
+        }
+        val now = nowEpochMs()
+        val refreshed = record.copy(
+            terminalAtEpochMs = record.terminalAtEpochMs ?: now,
+            expiresAtEpochMs = now + terminalRetentionMs.coerceAtLeast(0L),
+        )
+        publishRecord(refreshed)
+        scheduleExpiry(refreshed)
     }
 
     private fun scheduleExpiry(record: TaskDisplayRecord) {
@@ -1109,7 +1176,9 @@ class DhdTaskDisplayBackend(
 
     private suspend fun expire(sessionKey: String, expectedExpiry: Long) {
         val record = findRecord(sessionKey) ?: return
-        if ((record.terminalAtEpochMs == null && !record.status.isTerminal) ||
+        if ((record.terminalAtEpochMs == null &&
+                !record.status.isTerminal &&
+                record.status != TaskDisplayStatus.UNAVAILABLE) ||
             record.expiresAtEpochMs != expectedExpiry ||
             expectedExpiry > nowEpochMs()
         ) return
@@ -1133,7 +1202,7 @@ class DhdTaskDisplayBackend(
                 val current = findRecord(sessionKey)
                 if (current == null ||
                     current.expiresAtEpochMs != expectedExpiry ||
-                    !current.status.isTerminal ||
+                    (!current.status.isTerminal && current.status != TaskDisplayStatus.UNAVAILABLE) ||
                     current.status == TaskDisplayStatus.ENDED ||
                     current.status == TaskDisplayStatus.EXPIRED ||
                     expectedExpiry > nowEpochMs()

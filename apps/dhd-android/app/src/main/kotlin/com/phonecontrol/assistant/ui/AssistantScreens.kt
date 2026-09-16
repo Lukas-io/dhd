@@ -2,6 +2,7 @@
 
 package com.phonecontrol.assistant.ui
 
+import android.widget.ImageView
 import android.view.Surface as AndroidSurface
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
@@ -25,7 +26,9 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -54,6 +57,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.selection.toggleable
@@ -117,9 +121,11 @@ import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
@@ -133,6 +139,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
+import androidx.compose.ui.viewinterop.AndroidView
 import com.phonecontrol.assistant.R
 import com.phonecontrol.assistant.apps.AppPermissionRepository
 import com.phonecontrol.assistant.apps.InstalledUserApp
@@ -3102,6 +3109,7 @@ fun TaskDisplaysScreen(
 ) {
     val colors = LocalAssistantColors.current
     var endCandidate by remember { mutableStateOf<TaskDisplayUiRecord?>(null) }
+    var actionCandidate by remember { mutableStateOf<TaskDisplayUiRecord?>(null) }
     var nowEpochMs by remember { mutableStateOf(System.currentTimeMillis()) }
 
     LaunchedEffect(Unit) {
@@ -3139,8 +3147,8 @@ fun TaskDisplaysScreen(
                 .fillMaxWidth()
                 // The empty state should size to its content so the sheet's
                 // partially-expanded anchor never cuts the message off. A
-                // populated manager still gets a tall, scrollable surface.
-                .then(if (sortedRecords.isEmpty()) Modifier else Modifier.fillMaxHeight(0.9f))
+                // populated manager only needs a compact icon strip.
+                .then(if (sortedRecords.isEmpty()) Modifier else Modifier.fillMaxHeight(0.52f))
                 .navigationBarsPadding(),
         ) {
             Row(
@@ -3188,39 +3196,58 @@ fun TaskDisplaysScreen(
                 }
             }
         } else {
-            LazyColumn(
+            Column(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
                     .padding(horizontal = 18.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-                contentPadding = PaddingValues(top = 14.dp, bottom = 24.dp),
             ) {
-                item {
-                    Text(
-                        text = "Phone displays stay available while a task runs and briefly after it ends.",
-                        color = colors.textSecondary,
-                        fontSize = 13.sp,
-                        lineHeight = 19.sp,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                    )
-                }
-                items(sortedRecords, key = { it.sessionKey }) { record ->
-                    TaskDisplayManagerCard(
-                        record = record,
-                        nowEpochMs = nowEpochMs,
-                        onView = { onView(record) },
-                        onEnd = { endCandidate = record },
-                        fullSizeLayoutEnabled = record.packageName
-                            ?.takeIf(String::isNotBlank)
-                            ?.let(fullSizeLayoutForPackage)
-                            ?: false,
-                        onSetFullSizeLayout = onSetFullSizeLayout,
-                    )
+                Text(
+                    text = "Tap an app to view it. Long-press an icon for actions.",
+                    color = colors.textSecondary,
+                    fontSize = 13.sp,
+                    lineHeight = 19.sp,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                )
+                LazyRow(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                ) {
+                    items(sortedRecords, key = { it.sessionKey }) { record ->
+                        TaskDisplayIconTile(
+                            record = record,
+                            onView = { onView(record) },
+                            onLongPress = { actionCandidate = record },
+                        )
+                    }
                 }
             }
         }
         }
+    }
+
+    actionCandidate?.let { record ->
+        TaskDisplayActionsDialog(
+            record = record,
+            nowEpochMs = nowEpochMs,
+            fullSizeLayoutEnabled = record.packageName
+                ?.takeIf(String::isNotBlank)
+                ?.let(fullSizeLayoutForPackage)
+                ?: false,
+            onSetFullSizeLayout = onSetFullSizeLayout,
+            onView = {
+                actionCandidate = null
+                onView(record)
+            },
+            onEnd = {
+                actionCandidate = null
+                endCandidate = record
+            },
+            onDismiss = { actionCandidate = null },
+        )
     }
 
     endCandidate?.let { record ->
@@ -3256,6 +3283,242 @@ fun TaskDisplaysScreen(
             },
         )
     }
+}
+
+@Composable
+private fun TaskDisplayIconTile(
+    record: TaskDisplayUiRecord,
+    onView: () -> Unit,
+    onLongPress: () -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    val appLabel = record.appLabel ?: record.packageName ?: "Task display"
+    val canView = record.lifecycle != TaskDisplayLifecycle.ENDED &&
+        record.lifecycle != TaskDisplayLifecycle.EXPIRED
+    val statusColor = when (record.lifecycle) {
+        TaskDisplayLifecycle.RUNNING -> colors.accentGreen
+        TaskDisplayLifecycle.PAUSED -> colors.accentBlue
+        TaskDisplayLifecycle.COMPLETED,
+        TaskDisplayLifecycle.STOPPED -> colors.textSecondary
+        TaskDisplayLifecycle.FAILED,
+        TaskDisplayLifecycle.UNAVAILABLE -> colors.warningAmber
+        TaskDisplayLifecycle.ENDED,
+        TaskDisplayLifecycle.EXPIRED -> colors.textSecondary.copy(alpha = 0.7f)
+    }
+    val description = "$appLabel task display, ${record.lifecycle.displayLabel()}. " +
+        "Tap to view. Long press for actions."
+
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = colors.settingsCard,
+        border = BorderStroke(1.dp, colors.borderColor),
+        modifier = Modifier
+            .size(78.dp)
+            .combinedClickable(
+                enabled = canView,
+                onClick = onView,
+                onLongClick = onLongPress,
+            )
+            .semantics {
+                contentDescription = description
+                role = Role.Button
+            },
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center,
+        ) {
+            TaskDisplayAppIcon(
+                packageName = record.packageName,
+                contentDescription = null,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(9.dp),
+            )
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(7.dp)
+                    .size(12.dp)
+                    .background(statusColor, CircleShape)
+                    .border(2.dp, colors.settingsCard, CircleShape),
+            )
+        }
+    }
+}
+
+@Composable
+private fun TaskDisplayAppIcon(
+    packageName: String?,
+    contentDescription: String?,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val icon = remember(packageName) {
+        packageName
+            ?.takeIf(String::isNotBlank)
+            ?.let { name -> runCatching { context.packageManager.getApplicationIcon(name) }.getOrNull() }
+    }
+    if (icon == null) {
+        Icon(
+            painter = painterResource(R.drawable.ic_apps),
+            contentDescription = contentDescription,
+            tint = LocalAssistantColors.current.textSecondary,
+            modifier = modifier,
+        )
+    } else {
+        AndroidView(
+            modifier = modifier,
+            factory = { viewContext ->
+                ImageView(viewContext).apply {
+                    scaleType = ImageView.ScaleType.CENTER_INSIDE
+                    this.contentDescription = contentDescription
+                }
+            },
+            update = { imageView ->
+                imageView.setImageDrawable(icon)
+                imageView.contentDescription = contentDescription
+            },
+        )
+    }
+}
+
+@Composable
+private fun TaskDisplayActionsDialog(
+    record: TaskDisplayUiRecord,
+    nowEpochMs: Long,
+    fullSizeLayoutEnabled: Boolean,
+    onSetFullSizeLayout: (String, Boolean) -> Unit,
+    onView: () -> Unit,
+    onEnd: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    val packageName = record.packageName?.takeIf(String::isNotBlank)
+    val appLabel = record.appLabel ?: packageName ?: "this app"
+    val canView = record.lifecycle != TaskDisplayLifecycle.ENDED &&
+        record.lifecycle != TaskDisplayLifecycle.EXPIRED
+    val canEnd = canView
+    val statusColor = when (record.lifecycle) {
+        TaskDisplayLifecycle.RUNNING -> colors.accentGreen
+        TaskDisplayLifecycle.PAUSED -> colors.accentBlue
+        TaskDisplayLifecycle.COMPLETED,
+        TaskDisplayLifecycle.STOPPED -> colors.textSecondary
+        TaskDisplayLifecycle.FAILED,
+        TaskDisplayLifecycle.UNAVAILABLE -> colors.warningAmber
+        TaskDisplayLifecycle.ENDED,
+        TaskDisplayLifecycle.EXPIRED -> colors.textSecondary.copy(alpha = 0.7f)
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = colors.surfaceCard,
+        titleContentColor = colors.textPrimary,
+        textContentColor = colors.textSecondary,
+        shape = RoundedCornerShape(20.dp),
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TaskDisplayAppIcon(
+                    packageName = packageName,
+                    contentDescription = null,
+                    modifier = Modifier.size(38.dp),
+                )
+                Text(
+                    text = appLabel,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(start = 12.dp),
+                )
+            }
+        },
+        text = {
+            Column {
+                Text(
+                    text = record.lifecycle.displayLabel(),
+                    color = statusColor,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+                record.expiresAtEpochMs?.let { expiry ->
+                    Text(
+                        text = "Auto-removes ${taskDisplayRemainingLabel(expiry, nowEpochMs)}",
+                        color = colors.textSecondary,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+                record.error?.takeIf(String::isNotBlank)?.let { error ->
+                    Text(
+                        text = error,
+                        color = colors.warningAmber,
+                        fontSize = 12.sp,
+                        lineHeight = 17.sp,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+                if (packageName != null) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Display looks wrong?",
+                                color = colors.textPrimary,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                text = "Use the full-size app layout next time it opens.",
+                                color = colors.textSecondary,
+                                fontSize = 12.sp,
+                                lineHeight = 16.sp,
+                                modifier = Modifier.padding(top = 3.dp),
+                            )
+                        }
+                        Switch(
+                            checked = fullSizeLayoutEnabled,
+                            onCheckedChange = { enabled ->
+                                onSetFullSizeLayout(packageName, enabled)
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = colors.textPrimary,
+                                checkedTrackColor = colors.accentBlue,
+                                uncheckedThumbColor = colors.textSecondary,
+                                uncheckedTrackColor = colors.borderColor,
+                            ),
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onView, enabled = canView) {
+                Text(
+                    text = "View",
+                    color = if (canView) colors.accentBlue else colors.textSecondary,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        },
+        dismissButton = {
+            Row {
+                TextButton(onClick = onDismiss) {
+                    Text("Cancel", color = colors.textSecondary)
+                }
+                TextButton(onClick = onEnd, enabled = canEnd) {
+                    Text(
+                        text = "End",
+                        color = if (canEnd) colors.errorRed else colors.textSecondary,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+        },
+    )
 }
 
 @Composable

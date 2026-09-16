@@ -519,6 +519,10 @@ fun PhoneControlApp(
                         onRetry = { onRetryTaskDisplayPreview(viewerRecord) },
                         onAcknowledgeAttention = onAcknowledgeAttention,
                         onStopSession = onStopSession,
+                        onEndTaskDisplay = { record ->
+                            viewerSessionKey = null
+                            onEndTaskDisplay(record)
+                        },
                     )
                 }
             }

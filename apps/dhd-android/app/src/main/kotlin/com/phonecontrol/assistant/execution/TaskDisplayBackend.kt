@@ -304,6 +304,9 @@ interface TaskDisplayBackend {
     /** Restart decoding on the currently attached preview surface after an error. */
     suspend fun retryLiveSurface(sessionKey: String) = Unit
 
+    /** Refresh retained-display expiry after a user or agent actually uses it. */
+    suspend fun touch(sessionKey: String) = Unit
+
     /** Invalidate agent work immediately while leaving the display viewable. */
     fun cancel(sessionKey: String)
 
