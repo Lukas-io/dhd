@@ -36,7 +36,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -489,7 +488,6 @@ private fun ClosePillButton(
             0.8.dp,
             colors.borderColor.copy(alpha = if (colors.isDark) 0.85f else 0.9f),
         ),
-        shadowElevation = 8.dp,
         modifier = modifier.semantics { contentDescription = "$label assistant card" },
     ) {
         Row(
@@ -549,9 +547,7 @@ private fun FloatingResultCard(
         )
 
         Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .shadow(20.dp, cardShape, clip = false),
+            modifier = Modifier.fillMaxWidth(),
             shape = cardShape,
             color = colors.composerBackground.copy(
                 alpha = if (colors.isDark) 0.98f else 0.97f,
@@ -697,9 +693,7 @@ private fun FloatingRecoveryCard(
     }
 
     Surface(
-        modifier = modifier
-            .fillMaxWidth()
-            .shadow(20.dp, cardShape, clip = false),
+        modifier = modifier.fillMaxWidth(),
         shape = cardShape,
         color = colors.composerBackground.copy(
             alpha = if (colors.isDark) 0.98f else 0.97f,
@@ -806,9 +800,7 @@ private fun FloatingVirtualDisplayCard(
         )
 
         Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .shadow(20.dp, cardShape, clip = false),
+            modifier = Modifier.fillMaxWidth(),
             shape = cardShape,
             color = colors.composerBackground.copy(
                 alpha = if (colors.isDark) 0.98f else 0.97f,
@@ -1295,7 +1287,6 @@ fun OverlayPanel(
                         width = 0.8.dp,
                         color = colors.borderColor.copy(alpha = if (colors.isDark) 0.9f else 0.95f),
                     ),
-                    shadowElevation = 24.dp,
                 ) {
                     when (effectiveMode) {
                         OverlayPanelMode.COMPOSER,
@@ -1763,9 +1754,7 @@ private fun Composer(
                     ),
                 ) {
                     Surface(
-                        modifier = Modifier
-                            .width(286.dp)
-                            .shadow(18.dp, RoundedCornerShape(22.dp)),
+                        modifier = Modifier.width(286.dp),
                         shape = RoundedCornerShape(22.dp),
                         color = colors.composerBackground,
                         border = androidx.compose.foundation.BorderStroke(
@@ -1917,7 +1906,6 @@ private fun TextToolbarPopup(
             shape = RoundedCornerShape(20.dp),
             color = colors.composerBackground,
             border = androidx.compose.foundation.BorderStroke(0.8.dp, colors.borderColor),
-            shadowElevation = 12.dp,
         ) {
             Row(
                 modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),

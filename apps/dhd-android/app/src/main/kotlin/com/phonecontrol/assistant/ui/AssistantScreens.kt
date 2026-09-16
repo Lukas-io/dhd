@@ -3314,12 +3314,14 @@ private fun TaskDisplayIconTile(
     val description = "$appLabel task display, ${record.lifecycle.displayLabel()}. " +
         "Tap to view. Long press for actions."
 
+    val tileShape = RoundedCornerShape(18.dp)
     Surface(
-        shape = RoundedCornerShape(18.dp),
+        shape = tileShape,
         color = colors.settingsCard,
         border = BorderStroke(1.dp, colors.borderColor),
         modifier = Modifier
             .size(78.dp)
+            .clip(tileShape)
             .combinedClickable(
                 enabled = canView,
                 onClick = onView,
