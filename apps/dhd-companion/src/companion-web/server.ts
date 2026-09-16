@@ -19,29 +19,33 @@ import {
   DEFAULT_BRIDGE_HOST,
   DEFAULT_BRIDGE_PORT,
   parsePort,
-  requestBridge
+  requestBridge,
+  type BridgeMessage
 } from "../phone-assistant-bridge.js";
-import { discoverPhone } from "../pairing.js";
-import { normalizePairingCode } from "./pairing-code.js";
+import {
+  DEFAULT_PHONE_DISCOVERY_TIMEOUT_MS,
+  discoverPhones,
+  requestPairingApproval,
+  type DiscoveredPhone,
+} from "../pairing.js";
 import type {
   BridgeCheckResult,
   BridgeStatus,
   CompanionLogEntry,
-  CompanionSettingsInput,
   CompanionSettingsSnapshot,
   CompanionState,
   CompanionProcessStatus,
   PhoneSnapshot,
   CompanionToolCall,
   CompanionToolCallResponse,
-  CompanionTokenUsageSnapshot
+  CompanionTokenUsageSnapshot,
+  DiscoveredPhoneSnapshot,
 } from "./api.js";
 
 interface ConnectionConfig {
   host: string;
   port: number;
   token: string;
-  pairingCode?: string;
   deviceId?: string;
 }
 
@@ -49,7 +53,6 @@ interface StoredConnectionSettings {
   host?: string;
   port?: number;
   token?: string;
-  pairingCode?: string;
   deviceId?: string;
 }
 
@@ -61,6 +64,17 @@ const MAX_LOG_ENTRIES = 250;
 const MAX_TOOL_CALLS = 50;
 const DEFAULT_WEB_PORT = 8766;
 const DEFAULT_WEB_HOST = "127.0.0.1";
+const BRIDGE_CHECK_TIMEOUT_MS = 5_000;
+const BRIDGE_CHECK_TOTAL_TIMEOUT_MS = 15_000;
+const PAIRED_DIRECT_CHECK_TIMEOUT_MS = 2_000;
+const BRIDGE_CHECK_ATTEMPTS = 3;
+const BRIDGE_CHECK_RETRY_DELAYS_MS = [150, 400] as const;
+const COMPANION_DISCONNECT_TIMEOUT_MS = 1_500;
+const AUTOMATIC_REDISCOVERY_COOLDOWN_MS = 15_000;
+const BRIDGE_HEARTBEAT_INTERVAL_MS = 4_000;
+const BRIDGE_OFFLINE_RETRY_DELAYS_MS = [15_000, 30_000, 60_000] as const;
+const PHONE_DISCOVERY_TIMEOUT_MS = DEFAULT_PHONE_DISCOVERY_TIMEOUT_MS;
+const WORKER_RESTART_DELAY_MS = 1_000;
 
 let connection: ConnectionConfig = initialConnection();
 let worker: ChildProcess | null = null;
@@ -71,6 +85,14 @@ let lastError: string | undefined;
 let logEntries: CompanionLogEntry[] = [];
 let toolCalls: CompanionToolCall[] = [];
 let tokenUsage: CompanionTokenUsageSnapshot | undefined;
+let bridgeCheckInFlight: Promise<BridgeCheckResult> | undefined;
+let lastAutomaticRediscoveryAt = 0;
+let heartbeatRetryAt = 0;
+let heartbeatFailureCount = 0;
+let dashboardActive = false;
+let workerRestartTimer: NodeJS.Timeout | undefined;
+let discoveredPhoneList: DiscoveredPhone[] = [];
+let phoneDiscoveryInFlight: Promise<DiscoveredPhone[]> | undefined;
 const toolImages = new Map<string, { bytes: Buffer; mimeType: string }>();
 const sseClients = new Set<http.ServerResponse>();
 
@@ -107,11 +129,24 @@ async function loadConnection(): Promise<ConnectionConfig> {
     ? stored.port
     : defaults.port;
   const port = storedPort >= 1 && storedPort <= 65_535 ? storedPort : defaults.port;
+  const hasStoredPairing = Boolean(
+    typeof stored.deviceId === "string" && stored.deviceId.trim(),
+  );
   return {
-    host: process.env.PHONE_ASSISTANT_BRIDGE_HOST?.trim() || stored.host?.trim() || defaults.host,
-    port: process.env.PHONE_ASSISTANT_BRIDGE_PORT ? defaults.port : port,
-    token: process.env.PHONE_ASSISTANT_BRIDGE_TOKEN?.trim() || stored.token?.trim() || "",
-    ...(stored.pairingCode ? { pairingCode: stored.pairingCode.trim().toUpperCase() } : {}),
+    // A saved pairing owns the discovered address and token. Environment
+    // values are commonly inherited from an older worker/MCP session; letting
+    // them override a paired record makes the dashboard probe a stale phone
+    // forever after the phone changes networks. Keep env overrides for manual
+    // or unpaired configurations.
+    host: hasStoredPairing
+      ? stored.host?.trim() || DEFAULT_BRIDGE_HOST
+      : process.env.PHONE_ASSISTANT_BRIDGE_HOST?.trim() || stored.host?.trim() || defaults.host,
+    port: hasStoredPairing
+      ? port
+      : process.env.PHONE_ASSISTANT_BRIDGE_PORT ? defaults.port : port,
+    token: hasStoredPairing
+      ? stored.token?.trim() || ""
+      : process.env.PHONE_ASSISTANT_BRIDGE_TOKEN?.trim() || stored.token?.trim() || "",
     ...(stored.deviceId ? { deviceId: stored.deviceId.trim() } : {})
   };
 }
@@ -121,7 +156,6 @@ async function saveConnection(): Promise<void> {
     host: connection.host,
     port: connection.port,
     token: connection.token,
-    ...(connection.pairingCode ? { pairingCode: connection.pairingCode } : {}),
     ...(connection.deviceId ? { deviceId: connection.deviceId } : {})
   };
   await mkdir(dirname(settingsPath()), { recursive: true });
@@ -136,7 +170,8 @@ function settingsSnapshot(): CompanionSettingsSnapshot {
     host: connection.host,
     port: connection.port,
     tokenConfigured: connection.token.length > 0,
-    pairingConfigured: Boolean(connection.pairingCode)
+    pairingConfigured: Boolean(connection.deviceId),
+    ...(connection.deviceId ? { pairedDeviceId: connection.deviceId } : {})
   };
 }
 
@@ -397,7 +432,6 @@ function workerEnvironment(): NodeJS.ProcessEnv {
     PHONE_ASSISTANT_BRIDGE_HOST: connection.host,
     PHONE_ASSISTANT_BRIDGE_PORT: String(connection.port),
     PHONE_ASSISTANT_BRIDGE_TOKEN: connection.token,
-    ...(connection.pairingCode ? { PHONE_ASSISTANT_PAIRING_CODE: connection.pairingCode } : {}),
     ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {})
   };
 }
@@ -416,8 +450,33 @@ function getWorkerScript(): { command: string; args: string[] } | null {
   return null;
 }
 
+function scheduleWorkerRestart(): void {
+  if (!dashboardActive || processStatus === "stopping" || worker || workerRestartTimer) return;
+  appendLog("Companion worker exited unexpectedly; restarting it.", {
+    level: "error",
+    source: "system",
+  });
+  workerRestartTimer = setTimeout(() => {
+    workerRestartTimer = undefined;
+    if (!dashboardActive || worker) return;
+    startWorker();
+  }, WORKER_RESTART_DELAY_MS);
+}
+
+function ensureWorkerRunning(): void {
+  if (!dashboardActive || processStatus === "stopping") return;
+  if (worker && !worker.killed) return;
+  if (workerRestartTimer) return;
+  startWorker();
+}
+
 function startWorker(): CompanionState {
   if (worker && !worker.killed) return snapshot();
+
+  if (workerRestartTimer) {
+    clearTimeout(workerRestartTimer);
+    workerRestartTimer = undefined;
+  }
 
   const scriptConfig = getWorkerScript();
   if (!scriptConfig) {
@@ -430,6 +489,7 @@ function startWorker(): CompanionState {
   processStatus = "starting";
   bridgeStatus = "unknown";
   lastError = undefined;
+  resetHeartbeatRetry();
   appendLog(`Starting companion worker for ${connection.host}:${connection.port}.`, { level: "system", source: "system" });
 
   const child = spawn(scriptConfig.command, scriptConfig.args, {
@@ -451,9 +511,15 @@ function startWorker(): CompanionState {
     processStatus = "error";
     lastError = error.message;
     appendLog(`Companion worker failed: ${error.message}`, { level: "error", source: "system" });
+    publishState();
+    scheduleWorkerRestart();
   });
   child.once("exit", (code, signal) => {
-    if (worker === child) worker = null;
+    // A forced stop can finish before the old child emits its exit event. If
+    // a replacement worker has already been installed, this callback is
+    // stale and must not overwrite the replacement's state.
+    if (worker !== child) return;
+    worker = null;
     const expected = processStatus === "stopping";
     processStatus = expected || code === 0 ? "stopped" : "error";
     if (!expected && code !== 0) {
@@ -463,25 +529,48 @@ function startWorker(): CompanionState {
       `Companion worker ${expected ? "stopped" : "exited"}${code === null ? ` (${signal ?? "unknown"})` : ` (code ${code})`}.`,
       { level: expected || code === 0 ? "system" : "error", source: "system" }
     );
+    if (!expected) {
+      bridgeStatus = "offline";
+      resetHeartbeatRetry();
+      publishState();
+      void releaseCompanionPresence()
+        .finally(() => scheduleWorkerRestart())
+        .catch(() => {});
+    }
   });
   processStatus = "running";
   appendLog("Companion worker is running.", { level: "system", source: "system" });
-  if (connection.token || connection.pairingCode) {
+  if (connection.token) {
     void checkConnection({ silent: true }).catch(() => {});
   }
   return snapshot();
 }
 
-async function stopWorker(): Promise<CompanionState> {
+async function stopWorker(
+  reason = "requested",
+  checkToIgnore?: Promise<BridgeCheckResult>,
+): Promise<CompanionState> {
+  if (workerRestartTimer) {
+    clearTimeout(workerRestartTimer);
+    workerRestartTimer = undefined;
+  }
   const child = worker;
   if (!child || child.killed) {
     worker = null;
     processStatus = "stopped";
-    publishState();
+    const target = connection;
+    await releaseCompanionPresence(target, checkToIgnore);
+    if (connection === target) {
+      bridgeStatus = "offline";
+      resetHeartbeatRetry();
+      publishState();
+    }
     return snapshot();
   }
+  const target = connection;
   processStatus = "stopping";
-  appendLog("Stopping companion worker.", { level: "system", source: "system" });
+  publishState();
+  appendLog(`Stopping companion worker (${reason}).`, { level: "system", source: "system" });
   await new Promise<void>((resolveStop) => {
     let settled = false;
     const finish = () => {
@@ -498,6 +587,12 @@ async function stopWorker(): Promise<CompanionState> {
       }
     }, 3_000);
   });
+  await releaseCompanionPresence(target, checkToIgnore);
+  if (connection === target) {
+    bridgeStatus = "offline";
+    resetHeartbeatRetry();
+    publishState();
+  }
   return snapshot();
 }
 
@@ -523,6 +618,137 @@ function bridgeOptions(timeoutMs: number, target: ConnectionConfig = connection)
   };
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function statusCheckError(result: BridgeMessage): Error {
+  return new Error(
+    typeof result.message === "string"
+      ? result.message
+      : "The phone bridge rejected the status check."
+  );
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolveWait) => setTimeout(resolveWait, milliseconds));
+}
+
+const BRIDGE_CHECK_DEADLINE_MESSAGE = "Timed out checking the phone assistant bridge.";
+
+function remainingCheckTime(deadlineAt: number | undefined, maximumMs: number): number {
+  if (deadlineAt === undefined) return maximumMs;
+  const remainingMs = deadlineAt - Date.now();
+  if (remainingMs <= 0) throw new Error(BRIDGE_CHECK_DEADLINE_MESSAGE);
+  return Math.min(maximumMs, remainingMs);
+}
+
+async function waitForCheckRetry(milliseconds: number, deadlineAt: number | undefined): Promise<void> {
+  await wait(remainingCheckTime(deadlineAt, milliseconds));
+}
+
+function awaitBeforeCheckDeadline<T>(operation: Promise<T>, deadlineAt: number | undefined): Promise<T> {
+  if (deadlineAt === undefined) return operation;
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(BRIDGE_CHECK_DEADLINE_MESSAGE));
+    }, remainingCheckTime(deadlineAt, Number.MAX_SAFE_INTEGER));
+    operation.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function resetHeartbeatRetry(): void {
+  heartbeatRetryAt = 0;
+  heartbeatFailureCount = 0;
+}
+
+function scheduleHeartbeatRetry(): void {
+  const delayIndex = Math.min(heartbeatFailureCount, BRIDGE_OFFLINE_RETRY_DELAYS_MS.length - 1);
+  heartbeatRetryAt = Date.now() + BRIDGE_OFFLINE_RETRY_DELAYS_MS[delayIndex];
+  heartbeatFailureCount += 1;
+}
+
+/**
+ * A status request is intentionally small, but the first packet after a
+ * phone/network transition can still be lost. Retry the request on a fresh
+ * socket so one stale TCP attempt cannot make a healthy phone look offline.
+ */
+async function requestStatusWithRetry(
+  target: ConnectionConfig,
+  options: { deadlineAt?: number; attempts?: number; timeoutMs?: number } = {},
+): Promise<BridgeMessage> {
+  let lastError: unknown;
+  const attempts = Math.max(1, options.attempts ?? BRIDGE_CHECK_ATTEMPTS);
+  const timeoutMs = options.timeoutMs ?? BRIDGE_CHECK_TIMEOUT_MS;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const result = await requestBridge(
+        { type: "status", requestId: randomUUID() },
+        bridgeOptions(remainingCheckTime(options.deadlineAt, timeoutMs), target)
+      );
+      if (result.ok !== true) throw statusCheckError(result);
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts - 1) {
+        await waitForCheckRetry(
+          BRIDGE_CHECK_RETRY_DELAYS_MS[attempt] ?? BRIDGE_CHECK_RETRY_DELAYS_MS.at(-1)!,
+          options.deadlineAt,
+        );
+      }
+    }
+  }
+  throw (lastError instanceof Error ? lastError : new Error(String(lastError)));
+}
+
+/** Tell the phone that the worker owning the liveness lease has stopped. */
+async function releaseCompanionPresence(
+  target: ConnectionConfig = connection,
+  checkToIgnore?: Promise<BridgeCheckResult>,
+): Promise<void> {
+  // An unpaired target has no worker lease to release. Non-loopback targets
+  // also require a token, which is guaranteed after pairing.
+  if (!target.token) return;
+
+  // A dashboard health check may already be in flight when worker shutdown
+  // begins. Let it finish before sending the release so its authenticated
+  // request cannot arrive after the release and immediately make the phone
+  // connected.
+  const inFlightCheck = bridgeCheckInFlight;
+  if (inFlightCheck && inFlightCheck !== checkToIgnore) await inFlightCheck.catch(() => {});
+
+  try {
+    const result = await requestBridge(
+      { type: "companion_disconnected", requestId: randomUUID() },
+      bridgeOptions(COMPANION_DISCONNECT_TIMEOUT_MS, target),
+    );
+    if (result.ok !== true) throw statusCheckError(result);
+  } catch (error) {
+    // The lease timeout remains the fallback when the phone is already
+    // unreachable. Stopping the local worker should still complete promptly.
+    appendLog(`Could not release phone companion presence: ${errorMessage(error)}`, {
+      level: "info",
+      source: "bridge",
+    });
+  }
+}
+
 function phoneSnapshot(value: Record<string, unknown>): PhoneSnapshot {
   return {
     state: typeof value.state === "string" ? value.state : "unknown",
@@ -534,43 +760,144 @@ function phoneSnapshot(value: Record<string, unknown>): PhoneSnapshot {
   };
 }
 
-async function checkConnection(options: { silent?: boolean } = {}): Promise<BridgeCheckResult> {
+function discoveredPhoneSnapshot(value: DiscoveredPhone): DiscoveredPhoneSnapshot {
+  return {
+    deviceId: value.deviceId,
+    deviceName: value.deviceName,
+    ...(value.model ? { model: value.model } : {})
+  };
+}
+
+function sameConnection(left: ConnectionConfig, right: ConnectionConfig): boolean {
+  return left.host === right.host &&
+    left.port === right.port &&
+    left.token === right.token &&
+    left.deviceId === right.deviceId;
+}
+
+async function discoverPhonesOnNetwork(timeoutMs = PHONE_DISCOVERY_TIMEOUT_MS): Promise<DiscoveredPhone[]> {
+  if (phoneDiscoveryInFlight) return phoneDiscoveryInFlight;
+  const operation = discoverPhones({ timeoutMs });
+  phoneDiscoveryInFlight = operation;
+  try {
+    discoveredPhoneList = await operation;
+    return discoveredPhoneList;
+  } finally {
+    if (phoneDiscoveryInFlight === operation) phoneDiscoveryInFlight = undefined;
+  }
+}
+
+async function rediscoverPairedDevice(
+  target: ConnectionConfig,
+  deadlineAt?: number,
+): Promise<CompanionState> {
+  if (!target.deviceId || !target.token) {
+    throw new Error("The saved phone pairing is incomplete.");
+  }
+  const phones = await awaitBeforeCheckDeadline(
+    discoverPhonesOnNetwork(remainingCheckTime(deadlineAt, PHONE_DISCOVERY_TIMEOUT_MS)),
+    deadlineAt,
+  );
+  const discovered = phones.find((candidate) => candidate.deviceId === target.deviceId);
+  if (!discovered) {
+    throw new Error("No paired DHD phone answered on the local network. Make sure the phone and computer are on the same network.");
+  }
+
+  let lastStatusError: unknown;
+  const addresses = [...new Set([discovered.host, ...discovered.addresses])];
+  for (const host of addresses) {
+    const candidate: ConnectionConfig = {
+      host,
+      port: discovered.port,
+      token: target.token,
+      deviceId: target.deviceId
+    };
+    try {
+      const result = await requestStatusWithRetry(candidate, { deadlineAt });
+      return applyPairedConnection(candidate, result, "reconnected", target);
+    } catch (error) {
+      lastStatusError = error;
+    }
+  }
+  throw (lastStatusError instanceof Error
+    ? lastStatusError
+    : new Error("The paired DHD phone was discovered but did not accept the saved token."));
+}
+
+function checkConnection(options: { silent?: boolean } = {}): Promise<BridgeCheckResult> {
+  // Startup, the heartbeat, the initial page load, and the manual button can
+  // all ask for the same probe. Share one operation so an older failure cannot
+  // overwrite a newer success or produce a misleading red toast.
+  if (bridgeCheckInFlight) return bridgeCheckInFlight;
+
+  const operation = performConnectionCheck(options);
+  bridgeCheckInFlight = operation;
+  void operation.then(
+    () => {
+      if (bridgeCheckInFlight === operation) bridgeCheckInFlight = undefined;
+    },
+    () => {
+      if (bridgeCheckInFlight === operation) bridgeCheckInFlight = undefined;
+    }
+  );
+  return operation;
+}
+
+async function performConnectionCheck(options: { silent?: boolean } = {}): Promise<BridgeCheckResult> {
+  const target = connection;
   const previousBridgeStatus = bridgeStatus;
-  const previousPhoneState = phone?.state;
+  const previousPhone = phone;
+  const deadlineAt = Date.now() + BRIDGE_CHECK_TOTAL_TIMEOUT_MS;
+  // Heartbeats are recovery probes, not user actions. Keep their in-flight
+  // state internal so the dashboard does not flash CHECKING every few
+  // seconds while the worker remains healthy.
   if (!options.silent) {
     bridgeStatus = "checking";
     lastError = undefined;
     publishState();
   }
   try {
-    const result = await requestBridge(
-      { type: "status", requestId: randomUUID() },
-      bridgeOptions(4_000)
+    const result = await requestStatusWithRetry(
+      target,
+      target.deviceId && target.token
+        ? { deadlineAt, attempts: 1, timeoutMs: PAIRED_DIRECT_CHECK_TIMEOUT_MS }
+        : { deadlineAt },
     );
-    if (result.ok !== true) throw new Error(typeof result.message === "string" ? result.message : "The phone bridge rejected the status check.");
+    if (connection !== target) {
+      return { ok: false, message: "Connection settings changed while checking; check the new link." };
+    }
     const nextPhone = phoneSnapshot(result);
-    const phoneChanged = JSON.stringify(nextPhone) !== JSON.stringify(phone);
+    const phoneChanged = JSON.stringify(nextPhone) !== JSON.stringify(previousPhone);
     phone = nextPhone;
     bridgeStatus = "connected";
     lastError = undefined;
-    if (!options.silent || previousBridgeStatus !== "connected") {
-      appendLog(`Phone bridge connected; state: ${nextPhone.state}.`, { level: "system", source: "bridge" });
-    } else if (phoneChanged) {
+    lastAutomaticRediscoveryAt = 0;
+    resetHeartbeatRetry();
+    if (!options.silent || previousBridgeStatus !== "connected" || phoneChanged) {
+      appendLog(`Phone bridge check passed; phone session state: ${nextPhone.state}.`, { level: "system", source: "bridge" });
+    } else {
       publishState();
     }
     return { ok: true, message: "Phone bridge connected.", phone: nextPhone };
   } catch (error) {
-    const directMessage = error instanceof Error ? error.message : String(error);
-    if (connection.pairingCode && !options.silent) {
+    if (connection !== target) {
+      return { ok: false, message: "Connection settings changed while checking; check the new link." };
+    }
+    const directMessage = errorMessage(error);
+    const canRediscover = Date.now() < deadlineAt &&
+      Boolean(target.deviceId && target.token) &&
+      (!options.silent || Date.now() - lastAutomaticRediscoveryAt >= AUTOMATIC_REDISCOVERY_COOLDOWN_MS);
+    if (canRediscover) {
+      if (options.silent) lastAutomaticRediscoveryAt = Date.now();
       try {
-        const nextState = await pairWithCode(connection.pairingCode, "reconnected");
+        const nextState = await rediscoverPairedDevice(target, deadlineAt);
         return {
           ok: nextState.bridgeStatus === "connected",
-          message: "Phone bridge rediscovered from the saved pairing code.",
+          message: "Phone bridge rediscovered on the local network.",
           phone: nextState.phone
         };
       } catch (rediscoveryError) {
-        const rediscoveryMessage = rediscoveryError instanceof Error ? rediscoveryError.message : String(rediscoveryError);
+        const rediscoveryMessage = errorMessage(rediscoveryError);
         lastError = `${directMessage} Pairing rediscovery failed: ${rediscoveryMessage}`;
       }
     } else {
@@ -586,70 +913,69 @@ async function checkConnection(options: { silent?: boolean } = {}): Promise<Brid
   }
 }
 
-function parseSettingsInput(value: unknown): CompanionSettingsInput {
-  if (!value || typeof value !== "object") throw new Error("Connection settings are required.");
-  const input = value as Partial<CompanionSettingsInput>;
-  const host = typeof input.host === "string" ? input.host.trim() : "";
-  if (!host) throw new Error("Bridge host is required.");
-  const port = parsePort(String(input.port ?? ""));
-  const token = typeof input.token === "string" ? input.token.trim() : undefined;
-  return { host, port, ...(token ? { token } : {}) };
-}
+async function applyPairedConnection(
+  candidate: ConnectionConfig,
+  result: BridgeMessage,
+  logVerb: string,
+  expectedConnection?: ConnectionConfig,
+): Promise<CompanionState> {
+  if (expectedConnection && connection !== expectedConnection) {
+    throw new Error("Connection settings changed while rediscovering the phone; keeping the newer settings.");
+  }
 
-async function saveSettings(value: unknown): Promise<CompanionState> {
-  const input = parseSettingsInput(value);
-  const wasRunning = Boolean(worker && !worker.killed);
-  const changed = input.host !== connection.host || input.port !== connection.port || Boolean(input.token);
-  if (wasRunning && changed) await stopWorker();
-  connection = {
-    host: input.host,
-    port: input.port,
-    token: input.token || connection.token
-  };
-  await saveConnection();
-  bridgeStatus = "unknown";
-  phone = undefined;
-  lastError = undefined;
-  appendLog(`Saved connection settings for ${connection.host}:${connection.port}.`, { level: "system", source: "system" });
-  if (wasRunning && changed) startWorker();
-  return snapshot();
-}
-
-async function pairWithCode(value: unknown, logVerb = "paired"): Promise<CompanionState> {
-  const rawCode = typeof value === "string"
-    ? value
-    : value && typeof value === "object" && typeof (value as { code?: unknown }).code === "string"
-      ? (value as { code: string }).code
-      : null;
-  if (!rawCode) throw new Error("A DHD pairing code is required.");
-  const pairingCode = normalizePairingCode(rawCode);
-  const offer = await discoverPhone(pairingCode);
-  const candidate: ConnectionConfig = {
-    host: offer.host,
-    port: offer.port,
-    token: offer.token,
-    pairingCode,
-    deviceId: offer.deviceId
-  };
-
-  const result = await requestBridge(
-    { type: "status", requestId: randomUUID() },
-    bridgeOptions(5_000, candidate)
-  );
-  if (result.ok !== true) {
-    throw new Error(typeof result.message === "string" ? result.message : "The discovered phone rejected the connection check.");
+  if (sameConnection(connection, candidate)) {
+    phone = phoneSnapshot(result);
+    bridgeStatus = "connected";
+    lastError = undefined;
+    lastAutomaticRediscoveryAt = 0;
+    resetHeartbeatRetry();
+    appendLog(`Phone bridge reconnected; state: ${phone.state}.`, { level: "system", source: "bridge" });
+    return snapshot();
   }
 
   const wasRunning = Boolean(worker && !worker.killed);
-  if (wasRunning) await stopWorker();
+  if (wasRunning) await stopWorker("phone pairing changed", bridgeCheckInFlight);
+  if (expectedConnection && connection !== expectedConnection) {
+    if (wasRunning) startWorker();
+    throw new Error("Connection settings changed while rediscovering the phone; keeping the newer settings.");
+  }
   connection = candidate;
   await saveConnection();
   phone = phoneSnapshot(result);
   bridgeStatus = "connected";
   lastError = undefined;
+  lastAutomaticRediscoveryAt = 0;
+  resetHeartbeatRetry();
   appendLog(`Phone pairing ${logVerb}; the companion discovered the phone automatically.`, { level: "system", source: "bridge" });
   if (wasRunning) startWorker();
   return snapshot();
+}
+
+async function pairWithDiscoveredDevice(value: unknown): Promise<CompanionState> {
+  if (!value || typeof value !== "object" || typeof (value as { deviceId?: unknown }).deviceId !== "string") {
+    throw new Error("A discovered phone must be selected.");
+  }
+  const deviceId = (value as { deviceId: string }).deviceId.trim();
+  if (!deviceId) throw new Error("A discovered phone must be selected.");
+  const expectedConnection = connection;
+
+  // Refresh before pairing so the nonce and address belong to a recent LAN
+  // response rather than a stale browser list.
+  const phones = await discoverPhonesOnNetwork();
+  const selected = phones.find((candidate) => candidate.deviceId === deviceId);
+  if (!selected) {
+    throw new Error("That phone is no longer visible on the local network. Refresh the phone list and try again.");
+  }
+
+  const offer = await requestPairingApproval(selected);
+  const candidate: ConnectionConfig = {
+    host: offer.host,
+    port: offer.port,
+    token: offer.token,
+    deviceId: offer.deviceId
+  };
+  const result = await requestStatusWithRetry(candidate);
+  return applyPairedConnection(candidate, result, "paired", expectedConnection);
 }
 
 async function readRequestBody(req: http.IncomingMessage): Promise<unknown> {
@@ -812,23 +1138,25 @@ export function createCompanionWebServer(): http.Server {
       return;
     }
 
-    if (pathname === "/api/settings" && req.method === "POST") {
+    if (pathname === "/api/discover" && req.method === "POST") {
       try {
-        const body = await readRequestBody(req);
-        const nextState = await saveSettings(body);
+        const phones = await discoverPhonesOnNetwork();
+        const response: { phones: DiscoveredPhoneSnapshot[] } = {
+          phones: phones.map(discoveredPhoneSnapshot)
+        };
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(nextState));
+        res.end(JSON.stringify(response));
       } catch (err) {
-        res.writeHead(400, { "Content-Type": "application/json" });
+        res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ message: err instanceof Error ? err.message : String(err) }));
       }
       return;
     }
 
-    if (pathname === "/api/pair" && req.method === "POST") {
+    if (pathname === "/api/pair-device" && req.method === "POST") {
       try {
         const body = await readRequestBody(req);
-        const nextState = await pairWithCode(body);
+        const nextState = await pairWithDiscoveredDevice(body);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(nextState));
       } catch (err) {
@@ -840,36 +1168,15 @@ export function createCompanionWebServer(): http.Server {
 
     if (pathname === "/api/check" && req.method === "POST") {
       try {
+        // The dashboard is the worker's owner. A manual health check should
+        // also recover a worker that exited while the dashboard stayed open.
+        ensureWorkerRunning();
         const result = await checkConnection();
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(result));
       } catch (err) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: false, message: err instanceof Error ? err.message : String(err) }));
-      }
-      return;
-    }
-
-    if (pathname === "/api/start" && req.method === "POST") {
-      try {
-        const nextState = startWorker();
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(nextState));
-      } catch (err) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ message: err instanceof Error ? err.message : String(err) }));
-      }
-      return;
-    }
-
-    if (pathname === "/api/stop" && req.method === "POST") {
-      try {
-        const nextState = await stopWorker();
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(nextState));
-      } catch (err) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ message: err instanceof Error ? err.message : String(err) }));
       }
       return;
     }
@@ -913,10 +1220,6 @@ export function createCompanionWebServer(): http.Server {
     if (pathname === "/api.js" || pathname === "/api.ts") {
       return serveStaticFile(res, "api.js");
     }
-    if (pathname === "/pairing-code.js" || pathname === "/pairing-code.ts") {
-      return serveStaticFile(res, "pairing-code.js");
-    }
-
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("Not Found");
   });
@@ -976,30 +1279,39 @@ function startFileWatcher(): void {
 function startHeartbeat(): void {
   if (heartbeatTimer) return;
   heartbeatTimer = setInterval(async () => {
-    // Only poll when web UI clients are connected or worker is running
-    if (sseClients.size === 0 && processStatus !== "running") return;
-    if (bridgeStatus === "checking") return;
-    if (!connection.token && !connection.pairingCode) return;
-    try {
-      await checkConnection({ silent: true });
-    } catch {
-      // Ignored in periodic heartbeat
+    if (!dashboardActive) return;
+    if (!worker || worker.killed || processStatus === "stopped" || processStatus === "error") {
+      ensureWorkerRunning();
+      return;
     }
-  }, 4_000);
+    if (processStatus !== "running") return;
+    if (bridgeStatus === "checking") return;
+    if (!connection.token) return;
+    if (Date.now() < heartbeatRetryAt) return;
+    try {
+      const result = await checkConnection({ silent: true });
+      if (result.ok) resetHeartbeatRetry();
+      else scheduleHeartbeatRetry();
+    } catch {
+      scheduleHeartbeatRetry();
+    }
+  }, BRIDGE_HEARTBEAT_INTERVAL_MS);
 }
 
 export async function startCompanionWebServer(port = DEFAULT_WEB_PORT, host = DEFAULT_WEB_HOST): Promise<http.Server> {
   connection = await loadConnection();
   startHeartbeat();
   startFileWatcher();
-  if (connection.token || connection.pairingCode) {
-    void checkConnection({ silent: true }).catch(() => {});
-  }
   const server = createCompanionWebServer();
 
   return new Promise((resolveReady, rejectReady) => {
     server.once("error", rejectReady);
     server.listen(port, host, () => {
+      // The dashboard owns the worker lifecycle. Users only need to launch
+      // the dashboard; worker start/stop is intentionally not a dashboard
+      // action.
+      dashboardActive = true;
+      startWorker();
       console.log(`\n  ======================================================`);
       console.log(`  DHD Companion Web App running at:`);
       console.log(`  http://${host}:${port}`);
@@ -1009,9 +1321,29 @@ export async function startCompanionWebServer(port = DEFAULT_WEB_PORT, host = DE
   });
 }
 
+let dashboardShutdownPromise: Promise<void> | undefined;
+
+function shutdownDashboard(exitCode: number): void {
+  if (dashboardShutdownPromise) return;
+  dashboardActive = false;
+  dashboardShutdownPromise = stopWorker("dashboard shutdown")
+    .catch((error: unknown) => {
+      console.error(
+        "Failed to stop the companion worker during dashboard shutdown:",
+        error instanceof Error ? error.message : String(error),
+      );
+    })
+    .then(() => {
+      process.exitCode = exitCode;
+      process.exit();
+    });
+}
+
 if (process.argv[1] && (process.argv[1].endsWith("server.ts") || process.argv[1].endsWith("server.js"))) {
   const port = Number(process.env.COMPANION_PORT || DEFAULT_WEB_PORT);
   const host = process.env.COMPANION_HOST || DEFAULT_WEB_HOST;
+  process.once("SIGINT", () => shutdownDashboard(0));
+  process.once("SIGTERM", () => shutdownDashboard(0));
   startCompanionWebServer(port, host).catch((err) => {
     console.error("Failed to start companion web server:", err);
     process.exit(1);

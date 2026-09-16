@@ -266,6 +266,7 @@ fun PhoneControlApp(
     val developerModeController = application.developerModeController
     val developerStatus by developerModeController.status.collectAsState()
     val companionConnected by application.devBridgeServer.companionConnected.collectAsState()
+    val pendingCompanionPairing by application.devBridgeServer.pendingCompanionPairing.collectAsState()
     val apps = remember { InstalledAppsRepository(context).listLaunchableUserApps() }
     val taskDisplayLayoutPreferences = remember { TaskDisplayLayoutPreferences(context) }
     var fullSizeLayoutPackages by remember {
@@ -421,7 +422,7 @@ fun PhoneControlApp(
                             apps = apps,
                             permissions = permissions,
                             developerStatus = developerStatus,
-                            bridgeServer = application.devBridgeServer,
+                            companionConnected = companionConnected,
                             themeMode = themeMode,
                             onSelectThemeMode = setThemeMode,
                             visibleReasoningEfforts = visibleReasoningEfforts,
@@ -466,10 +467,15 @@ fun PhoneControlApp(
                     }
 
                     composable(AppRoutes.COMPANION) {
-                        CompanionScreen(
-                            bridgeServer = application.devBridgeServer,
-                            onBack = { navController.popBackStack() },
-                        )
+                        if (companionConnected) {
+                            LaunchedEffect(companionConnected) {
+                                navController.popBackStack()
+                            }
+                        } else {
+                            CompanionInstructionsScreen(
+                                onBack = { navController.popBackStack() },
+                            )
+                        }
                     }
 
                     composable(AppRoutes.APPROVED_APPS) {
@@ -480,6 +486,11 @@ fun PhoneControlApp(
                         )
                     }
                 }
+
+                CompanionPairingApprovalDialog(
+                    pending = pendingCompanionPairing,
+                    bridgeServer = application.devBridgeServer,
+                )
 
                 LaunchedEffect(initialNavigationRoute) {
                     initialNavigationRoute?.let { route ->

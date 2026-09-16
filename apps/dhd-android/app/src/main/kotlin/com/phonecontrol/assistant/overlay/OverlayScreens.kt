@@ -670,9 +670,9 @@ private fun FloatingRecoveryCard(
 
         OverlayRecoveryKind.COMPANION -> {
             title = "Desktop companion not connected"
-            detail = "DHD has not sent any phone action yet. Check the Codex companion and try again."
+            detail = "DHD is waiting for the desktop companion. Connect this phone on your local network."
             icon = com.phonecontrol.assistant.R.drawable.ic_laptop
-            primaryLabel = "Open desktop companion"
+            primaryLabel = "View connection instructions"
             primaryAction = onOpenCompanion
             secondaryLabel = null
             secondaryAction = null
@@ -2617,8 +2617,10 @@ internal fun overlayRecoveryKind(
     )
     if (developerConnectionNeedsAction) return OverlayRecoveryKind.DEVELOPER
 
-    val currentPurpose = state.currentPurposeOrNull().orEmpty()
-    if (!companionConnected || currentPurpose.equals("Waiting for desktop Codex bridge", ignoreCase = true)) {
+    // A Codex retry/release can leave the companion connected. Only show the
+    // disconnected recovery overlay when the phone-side heartbeat lease is
+    // actually absent.
+    if (!companionConnected) {
         return OverlayRecoveryKind.COMPANION
     }
     return null

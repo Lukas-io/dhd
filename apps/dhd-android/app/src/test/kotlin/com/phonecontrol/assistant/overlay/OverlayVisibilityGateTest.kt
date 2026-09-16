@@ -178,6 +178,14 @@ class OverlayVisibilityGateTest {
                 companionConnected = false,
             ),
         )
+        assertEquals(
+            null,
+            overlayRecoveryKind(
+                state = runningState("Waiting for desktop Codex bridge"),
+                developerStatus = DeveloperModeStatus(DeveloperConnectionState.READY),
+                companionConnected = true,
+            ),
+        )
     }
 
     @Test

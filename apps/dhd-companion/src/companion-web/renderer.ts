@@ -1,16 +1,12 @@
 import type {
   CompanionClientApi,
+  DiscoveredPhoneSnapshot,
   CompanionLogEntry,
   CompanionState,
   CompanionToolCall,
   CompanionToolCallDebugImage,
   CompanionToolCallImageContent
 } from "./api.js";
-import {
-  displayPairingCode,
-  formatPairingCodeDraft,
-  normalizePairingCode
-} from "./pairing-code.js";
 
 function createWebApi(): CompanionClientApi {
   return {
@@ -19,20 +15,17 @@ function createWebApi(): CompanionClientApi {
       if (!res.ok) throw new Error(`Server returned ${res.status}: ${res.statusText}`);
       return res.json();
     },
-    async saveSettings(input): Promise<CompanionState> {
-      const res = await fetch("/api/settings", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(input)
-      });
+    async discoverPhones(): Promise<DiscoveredPhoneSnapshot[]> {
+      const res = await fetch("/api/discover", { method: "POST" });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.message || `Server returned ${res.status}`);
       }
-      return res.json();
+      const data = await res.json() as { phones?: DiscoveredPhoneSnapshot[] };
+      return Array.isArray(data.phones) ? data.phones : [];
     },
-    async pairWithPhone(input): Promise<CompanionState> {
-      const res = await fetch("/api/pair", {
+    async pairWithDiscoveredPhone(input): Promise<CompanionState> {
+      const res = await fetch("/api/pair-device", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(input)
@@ -44,28 +37,23 @@ function createWebApi(): CompanionClientApi {
       return res.json();
     },
     async checkConnection() {
-      const res = await fetch("/api/check", { method: "POST" });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.message || `Server returned ${res.status}`);
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), CHECK_REQUEST_TIMEOUT_MS);
+      try {
+        const res = await fetch("/api/check", { method: "POST", signal: controller.signal });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.message || `Server returned ${res.status}`);
+        }
+        return res.json();
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw new Error("Timed out checking the phone assistant bridge.");
+        }
+        throw error;
+      } finally {
+        window.clearTimeout(timeoutId);
       }
-      return res.json();
-    },
-    async startCompanion(): Promise<CompanionState> {
-      const res = await fetch("/api/start", { method: "POST" });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.message || `Server returned ${res.status}`);
-      }
-      return res.json();
-    },
-    async stopCompanion(): Promise<CompanionState> {
-      const res = await fetch("/api/stop", { method: "POST" });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.message || `Server returned ${res.status}`);
-      }
-      return res.json();
     },
     async clearLogs(): Promise<CompanionState> {
       const res = await fetch("/api/clear-logs", { method: "POST" });
@@ -160,24 +148,17 @@ const elements = {
   toolImageDialogImage: byId<HTMLImageElement>("tool-image-dialog-image"),
   toolImageDialogLabel: byId<HTMLSpanElement>("tool-image-dialog-label"),
   closeToolImageDialog: byId<HTMLButtonElement>("close-tool-image-dialog"),
-  host: byId<HTMLInputElement>("host-input"),
-  port: byId<HTMLInputElement>("port-input"),
-  token: byId<HTMLInputElement>("token-input"),
-  pairingCode: byId<HTMLInputElement>("pairing-code-input"),
-  pair: byId<HTMLButtonElement>("pair-phone"),
-  toggleTokenVisibility: byId<HTMLButtonElement>("toggle-token-visibility"),
-  save: byId<HTMLButtonElement>("save-settings"),
+  discoverPhones: byId<HTMLButtonElement>("discover-phones"),
+  discoveryStatus: byId<HTMLSpanElement>("discovery-status"),
+  discoveredPhones: byId<HTMLDivElement>("discovered-phones"),
   check: byId<HTMLButtonElement>("check-connection"),
-  start: byId<HTMLButtonElement>("start-companion"),
-  stop: byId<HTMLButtonElement>("stop-companion"),
   logList: byId<HTMLDivElement>("log-list"),
   logScrollContainer: byId<HTMLDivElement>("log-scroll-container"),
   toast: byId<HTMLDivElement>("toast"),
   toastIcon: document.getElementById("toast-icon") as HTMLDivElement | null,
   toastMessage: document.getElementById("toast-message") as HTMLSpanElement | null,
   toastClose: document.getElementById("toast-close") as HTMLButtonElement | null,
-  connectionStatusPill: document.getElementById("connection-status-pill") as HTMLSpanElement | null,
-  pairingStatusHint: document.getElementById("pairing-status-hint") as HTMLSpanElement | null
+  connectionStatusPill: document.getElementById("connection-status-pill") as HTMLSpanElement | null
 };
 
 let toastTimer: number | undefined;
@@ -262,6 +243,18 @@ const TOAST_ICONS = {
 };
 
 const SPINNER_SVG = `<svg class="btn-svg spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10" stroke-opacity="0.25" stroke="currentColor" fill="none"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-linecap="round"/></svg>`;
+const CHECK_CONNECTION_BUTTON_HTML = elements.check.innerHTML;
+const CHECK_REQUEST_TIMEOUT_MS = 18_000;
+
+function setCheckButtonLoading(loading: boolean): void {
+  const alreadyLoading = elements.check.querySelector(".spinner") !== null;
+  if (loading && !alreadyLoading) {
+    elements.check.innerHTML = `${SPINNER_SVG}<span>Checking...</span>`;
+  } else if (!loading && alreadyLoading) {
+    elements.check.innerHTML = CHECK_CONNECTION_BUTTON_HTML;
+  }
+  elements.check.disabled = loading;
+}
 
 async function withButtonLoading<T>(
   button: HTMLButtonElement,
@@ -322,7 +315,7 @@ function renderLogs(entries: CompanionLogEntry[]): void {
   if (entries.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty-console font-mono";
-    empty.textContent = "No events recorded. Start the companion worker or test the phone link.";
+    empty.textContent = "No events recorded. Phone activity and link checks will appear here.";
     elements.logList.append(empty);
     return;
   }
@@ -704,7 +697,7 @@ function renderToolCalls(calls: CompanionToolCall[]): void {
   if (calls.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty-console font-mono";
-    empty.textContent = "No tool calls recorded. Start the companion worker and send a phone request.";
+    empty.textContent = "No tool calls recorded. Send a phone request from DHD to see activity here.";
     elements.toolList.append(empty);
     elements.toolScrollContainer.scrollTop = previousOuterScrollTop;
     elements.toolScrollContainer.scrollLeft = previousOuterScrollLeft;
@@ -839,24 +832,15 @@ function render(next: CompanionState): void {
   const targetStr = `${next.settings.host}:${next.settings.port}`;
   if (elements.headerTarget) elements.headerTarget.textContent = targetStr;
 
-  const isWorkerRunning = next.processStatus === "running";
-  const isWorkerStarting = next.processStatus === "starting";
-  const isWorkerBusy = isWorkerRunning || isWorkerStarting;
-
-  elements.appStatusDetail.textContent = isWorkerRunning
+  elements.appStatusDetail.textContent = next.processStatus === "running"
     ? "worker active // listening"
-    : "ready";
-
-  // Toggle Start / Stop action buttons
-  if (isWorkerBusy) {
-    elements.start.style.display = "none";
-    elements.stop.style.display = "inline-flex";
-    elements.stop.disabled = next.processStatus === "stopping";
-  } else {
-    elements.start.style.display = "inline-flex";
-    elements.stop.style.display = "none";
-    elements.start.disabled = false;
-  }
+    : next.processStatus === "starting"
+      ? "worker starting"
+      : next.processStatus === "stopping"
+        ? "worker stopping"
+        : next.processStatus === "error"
+          ? "worker error"
+          : "worker offline";
 
   setText(elements.bridgeState, next.bridgeStatus.toUpperCase());
   elements.bridgeState.className = `state-badge font-mono ${next.bridgeStatus}`;
@@ -867,6 +851,7 @@ function render(next: CompanionState): void {
 
   const isPaired = next.settings.pairingConfigured;
   const isManual = next.settings.tokenConfigured;
+  pairedDeviceId = next.settings.pairedDeviceId;
 
   setText(elements.tokenState, isPaired ? "PAIRED" : isManual ? "MANUAL" : "NOT_CONFIGURED");
 
@@ -883,10 +868,6 @@ function render(next: CompanionState): void {
     }
   }
 
-  if (elements.pairingStatusHint) {
-    elements.pairingStatusHint.textContent = isPaired ? "✓ Saved (enter code to re-pair)" : "";
-  }
-
   const phoneState = next.phone;
   const isPhoneActive = phoneState?.active === true;
   setText(elements.phoneState, (phoneState?.state ?? "NOT_CHECKED").toUpperCase());
@@ -898,12 +879,9 @@ function render(next: CompanionState): void {
 
   elements.lastError.textContent = next.lastError || "";
   elements.lastError.hidden = !next.lastError;
-  elements.check.disabled = next.bridgeStatus === "checking";
+  setCheckButtonLoading(next.bridgeStatus === "checking");
+  renderDiscoveredPhones();
 
-  if (document.activeElement !== elements.host) elements.host.value = next.settings.host;
-  if (document.activeElement !== elements.port) elements.port.value = String(next.settings.port);
-  elements.token.placeholder = isManual ? "Token configured (enter new token to replace)" : "Paste manual bridge token";
-  elements.pairingCode.placeholder = "ABCD-2345";
   renderLogs(next.logs);
   renderToolCalls(next.toolCalls);
   renderTokenUsage(next.tokenUsage, isPhoneActive);
@@ -938,12 +916,126 @@ if (elements.toastClose) {
   elements.toastClose.addEventListener("click", hideToast);
 }
 
-async function refreshState(): Promise<void> {
+type BridgeCheckPromise = ReturnType<CompanionClientApi["checkConnection"]>;
+let connectionCheckInFlight: BridgeCheckPromise | undefined;
+
+function runConnectionCheck(): BridgeCheckPromise {
+  if (connectionCheckInFlight) return connectionCheckInFlight;
+  const request = api.checkConnection();
+  connectionCheckInFlight = request;
+  void request.then(
+    () => {
+      if (connectionCheckInFlight === request) connectionCheckInFlight = undefined;
+    },
+    () => {
+      if (connectionCheckInFlight === request) connectionCheckInFlight = undefined;
+    }
+  );
+  return request;
+}
+
+async function refreshState(options: { verifyConnection?: boolean } = {}): Promise<void> {
   const state = await api.getState();
   render(state);
-  // If state is unknown and token/pairing is configured, verify bridge link
-  if (state.bridgeStatus === "unknown" && (state.settings.tokenConfigured || state.settings.pairingConfigured)) {
-    void api.checkConnection().then(() => api.getState().then(render)).catch(() => {});
+  // Verify once on every page load so a previous offline result cannot remain
+  // visible forever after the phone comes back. Calls made after an explicit
+  // action keep the existing behavior and only probe an unknown connection.
+  const shouldVerify = options.verifyConnection === true || state.bridgeStatus === "unknown";
+  if (shouldVerify && (state.settings.tokenConfigured || state.settings.pairingConfigured)) {
+    const checkingState = { ...state, bridgeStatus: "checking" as const, lastError: undefined };
+    render(checkingState);
+    void runConnectionCheck()
+      .then(async (result) => {
+        try {
+          render(await api.getState());
+        } catch {
+          render({
+            ...checkingState,
+            bridgeStatus: result.ok ? "connected" : "offline",
+            ...(result.ok ? {} : { lastError: result.message }),
+          });
+        }
+      })
+      .catch((error: unknown) => {
+        render({
+          ...checkingState,
+          bridgeStatus: "offline",
+          lastError: error instanceof Error ? error.message : String(error),
+        });
+      });
+  }
+}
+
+let discoveredPhoneList: DiscoveredPhoneSnapshot[] = [];
+let pairingDeviceId: string | undefined;
+let pairedDeviceId: string | undefined;
+let discoveryInFlight: Promise<void> | undefined;
+
+function renderDiscoveredPhones(): void {
+  elements.discoveredPhones.replaceChildren();
+  if (discoveredPhoneList.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "discovery-empty font-mono";
+    empty.textContent = "No DHD phones found yet. Make sure the phone and computer are on the same local network.";
+    elements.discoveredPhones.append(empty);
+    return;
+  }
+
+  for (const phone of discoveredPhoneList) {
+    const card = document.createElement("div");
+    card.className = "discovered-phone-card";
+
+    const details = document.createElement("div");
+    details.className = "discovered-phone-details";
+    const name = document.createElement("div");
+    name.className = "discovered-phone-name";
+    name.textContent = phone.deviceName;
+    const model = document.createElement("div");
+    model.className = "discovered-phone-model font-mono";
+    model.textContent = phone.model || "DHD phone on local network";
+    details.append(name, model);
+
+    const pairButton = document.createElement("button");
+    pairButton.type = "button";
+    pairButton.className = "action-btn secondary small discovered-phone-pair";
+    const isPairedPhone = phone.deviceId === pairedDeviceId;
+    pairButton.disabled = pairingDeviceId !== undefined || isPairedPhone;
+    pairButton.textContent = isPairedPhone
+      ? "Paired"
+      : pairingDeviceId === phone.deviceId
+        ? "Approve on phone"
+        : "Pair";
+    if (!isPairedPhone) {
+      pairButton.addEventListener("click", () => {
+        void pairDiscoveredPhone(phone);
+      });
+    }
+
+    card.append(details, pairButton);
+    elements.discoveredPhones.append(card);
+  }
+}
+
+async function discoverPhonesOnNetwork(): Promise<void> {
+  if (discoveryInFlight) return discoveryInFlight;
+  const operation = (async () => {
+    elements.discoveryStatus.textContent = "Searching the local network...";
+    try {
+      discoveredPhoneList = await api.discoverPhones();
+      renderDiscoveredPhones();
+      elements.discoveryStatus.textContent = discoveredPhoneList.length === 0
+        ? "No phones answered."
+        : `${discoveredPhoneList.length} phone${discoveredPhoneList.length === 1 ? "" : "s"} found.`;
+    } catch (error) {
+      elements.discoveryStatus.textContent = "Discovery failed.";
+      throw error;
+    }
+  })();
+  discoveryInFlight = operation;
+  try {
+    await withButtonLoading(elements.discoverPhones, "Searching...", async () => operation);
+  } finally {
+    if (discoveryInFlight === operation) discoveryInFlight = undefined;
   }
 }
 
@@ -1008,14 +1100,6 @@ document.querySelectorAll<HTMLButtonElement>(".tab-btn").forEach((btn) => {
     if (panel) panel.classList.add("active");
   });
 });
-
-// Password visibility toggle
-if (elements.toggleTokenVisibility) {
-  elements.toggleTokenVisibility.addEventListener("click", () => {
-    const isPassword = elements.token.type === "password";
-    elements.token.type = isPassword ? "text" : "password";
-  });
-}
 
 // Clear Logs
 if (elements.clearLogs) {
@@ -1082,71 +1166,28 @@ if (themeToggle) {
   });
 }
 
-// Pairing Code Auto-Hyphenation & Formatting
-elements.pairingCode.addEventListener("keydown", (event) => {
-  if (event.key === "Backspace") {
-    const input = elements.pairingCode;
-    const start = input.selectionStart ?? 0;
-    const end = input.selectionEnd ?? 0;
-    // When deleting right after the auto-inserted hyphen (e.g. "ABCD-"), remove both hyphen and preceding char
-    if (start === end && start === 5 && input.value.charAt(4) === "-") {
-      event.preventDefault();
-      input.value = input.value.slice(0, 3);
-      input.setSelectionRange(3, 3);
-      return;
-    }
-  }
-
-  if (event.key === "Enter") {
-    event.preventDefault();
-    elements.pair.click();
-  }
-});
-
-elements.pairingCode.addEventListener("input", () => {
-  const input = elements.pairingCode;
-  const currentVal = input.value;
-  const formatted = formatPairingCodeDraft(currentVal);
-  if (formatted !== currentVal) {
-    input.value = formatted;
-  }
-});
-
-// Actions
-elements.save.addEventListener("click", async () => {
+async function pairDiscoveredPhone(phone: DiscoveredPhoneSnapshot): Promise<void> {
+  if (pairingDeviceId) return;
+  pairingDeviceId = phone.deviceId;
+  elements.discoveryStatus.textContent = "Approve the connection request on your phone.";
+  renderDiscoveredPhones();
   try {
-    await withButtonLoading(elements.save, "Saving...", async () => {
-      const token = elements.token.value.trim();
-      render(await api.saveSettings({
-        host: elements.host.value,
-        port: Number(elements.port.value),
-        ...(token ? { token } : {})
-      }));
-      elements.token.value = "";
-    });
-    showToast("Connection settings saved.", "success");
+    render(await api.pairWithDiscoveredPhone({ deviceId: phone.deviceId }));
+    discoveredPhoneList = [];
+    renderDiscoveredPhones();
+    elements.discoveryStatus.textContent = `Paired with ${phone.deviceName}.`;
+    showToast(`Paired with ${phone.deviceName}.`, "success");
   } catch (error) {
     showToast(error instanceof Error ? error.message : String(error), "error");
-  }
-});
-
-async function pairWithPhone(value: string): Promise<void> {
-  const code = normalizePairingCode(value);
-  elements.pairingCode.disabled = true;
-  try {
-    await withButtonLoading(elements.pair, "Pairing...", async () => {
-      render(await api.pairWithPhone({ code }));
-      elements.pairingCode.value = "";
-    });
-    showToast(`Paired with DHD using ${displayPairingCode(code)}.`, "success");
   } finally {
-    elements.pairingCode.disabled = false;
+    pairingDeviceId = undefined;
+    renderDiscoveredPhones();
   }
 }
 
-elements.pair.addEventListener("click", async () => {
+elements.discoverPhones.addEventListener("click", async () => {
   try {
-    await pairWithPhone(elements.pairingCode.value);
+    await discoverPhonesOnNetwork();
   } catch (error) {
     showToast(error instanceof Error ? error.message : String(error), "error");
   }
@@ -1156,8 +1197,12 @@ elements.check.addEventListener("click", async () => {
   try {
     let checkResult: { ok: boolean; message: string } | undefined;
     await withButtonLoading(elements.check, "Checking...", async () => {
-      checkResult = await api.checkConnection();
-      await refreshState();
+      checkResult = await runConnectionCheck();
+      // The bridge result is authoritative for the toast. A separate UI
+      // refresh must not turn a successful phone probe into a red error.
+      await refreshState().catch((error: unknown) => {
+        console.warn("Could not refresh companion state after checking the phone link:", error);
+      });
     });
     if (checkResult) {
       showToast(checkResult.message, checkResult.ok ? "success" : "error");
@@ -1167,29 +1212,11 @@ elements.check.addEventListener("click", async () => {
   }
 });
 
-elements.start.addEventListener("click", async () => {
-  try {
-    await withButtonLoading(elements.start, "Starting...", async () => {
-      render(await api.startCompanion());
-    });
-    showToast("Companion worker started.", "success");
-  } catch (error) {
-    showToast(error instanceof Error ? error.message : String(error), "error");
-  }
-});
-
-elements.stop.addEventListener("click", async () => {
-  try {
-    await withButtonLoading(elements.stop, "Stopping...", async () => {
-      render(await api.stopCompanion());
-    });
-    showToast("Companion worker stopped.", "info");
-  } catch (error) {
-    showToast(error instanceof Error ? error.message : String(error), "error");
-  }
-});
-
 api.onState(render);
-void refreshState().catch((error: unknown) => {
+renderDiscoveredPhones();
+void discoverPhonesOnNetwork().catch((error: unknown) => {
+  showToast(error instanceof Error ? error.message : String(error), "error");
+});
+void refreshState({ verifyConnection: true }).catch((error: unknown) => {
   showToast(error instanceof Error ? error.message : String(error), "error");
 });

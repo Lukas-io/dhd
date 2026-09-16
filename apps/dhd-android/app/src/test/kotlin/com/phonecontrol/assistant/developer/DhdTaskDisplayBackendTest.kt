@@ -1,5 +1,6 @@
 package com.phonecontrol.assistant.developer
 
+import com.phonecontrol.assistant.execution.TaskDisplayStatus
 import java.io.IOException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -24,6 +25,32 @@ class DhdTaskDisplayBackendTest {
     @Test
     fun `does not classify unrelated preview failures as missing sessions`() {
         assertFalse(isNativeDisplaySessionMissing(IOException("The AVC stream timed out.")))
+    }
+
+    @Test
+    fun `a stopped owner can be reclaimed before terminal retention is published`() {
+        assertFalse(
+            isTaskDisplayOwnedByAnotherRun(
+                status = TaskDisplayStatus.RUNNING,
+                alreadyBoundToRun = false,
+                ownerKey = "stopped-owner",
+                runSessionKey = "continuation-run",
+                ownerCancelled = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `an active uncancelled display remains protected from another run`() {
+        assertTrue(
+            isTaskDisplayOwnedByAnotherRun(
+                status = TaskDisplayStatus.RUNNING,
+                alreadyBoundToRun = false,
+                ownerKey = "active-owner",
+                runSessionKey = "other-run",
+                ownerCancelled = false,
+            ),
+        )
     }
 
     @Test

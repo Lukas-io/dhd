@@ -167,6 +167,26 @@ describe("Codex App Server agent-message extraction", () => {
     })).resolves.toBeUndefined();
   });
 
+  it("does not let a stale App Server close reject a replacement child", () => {
+    const client = new CodexAppServerClient() as any;
+    const replacementChild = {};
+    let rejected = false;
+    client.child = replacementChild;
+    client.turnCompletion = {
+      resolve: () => undefined,
+      reject: () => { rejected = true; },
+      agentMessages: new Map(),
+      nextAgentMessageOrder: 0,
+      phoneToolFailures: [],
+    };
+
+    client.handleChildClose({}, null, "SIGTERM");
+
+    expect(rejected).toBe(false);
+    expect(client.child).toBe(replacementChild);
+    expect(client.turnCompletion).not.toBeNull();
+  });
+
   it("does not interpret a pending attention request as a phone stop", () => {
     expect(shouldInterruptForPhoneStop({ active: false, attentionPending: true })).toBe(false);
     expect(shouldInterruptForPhoneStop({ active: false })).toBe(true);

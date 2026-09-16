@@ -96,6 +96,13 @@ class MainActivity : ComponentActivity() {
             }
             val displayForRun = resolvedDisplayForRun
                 ?: display?.takeIf { it.sessionKey == coordinatorSessionKey }
+                // Continue creates a fresh coordinator run before the first
+                // tool has a chance to claim the retained display. Keep the
+                // previous backend session rendered during that handoff;
+                // this callback only attaches the read-only preview surface.
+                ?: display?.takeIf {
+                    (sessionState as? SessionState.Running)?.isContinuation == true
+                }
             val activeDisplayOwnerKey = displayForRun?.sessionKey
             val currentToolName = coordinatorSessionKey?.let { sessionKey ->
                 events.asReversed()

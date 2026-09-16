@@ -15,6 +15,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -249,6 +250,8 @@ fun LiveDisplayPreview(
     onExpand: () -> Unit = {},
     onExpandBoundsChanged: (Rect?) -> Unit = {},
     showCardChrome: Boolean = true,
+    /** Agent lifecycle shown separately from the decoder's stream status. */
+    agentLifecycle: TaskDisplayLifecycle? = null,
 ) {
     val latestOnSurfaceAvailable = rememberUpdatedState(onSurfaceAvailable)
     val latestOnSurfaceDestroyed = rememberUpdatedState(onSurfaceDestroyed)
@@ -357,7 +360,16 @@ fun LiveDisplayPreview(
                     PreviewStatusOverlay(state = state)
                 }
 
-                if (state.status == LiveDisplayPreviewStatus.LIVE) {
+                if (state.status == LiveDisplayPreviewStatus.LIVE &&
+                    agentLifecycle != null &&
+                    agentLifecycle != TaskDisplayLifecycle.RUNNING
+                ) {
+                    RetainedPreviewStatusBadge(lifecycle = agentLifecycle)
+                }
+
+                if (state.status == LiveDisplayPreviewStatus.LIVE &&
+                    (agentLifecycle == null || agentLifecycle == TaskDisplayLifecycle.RUNNING)
+                ) {
                     TaskPointerOverlay(event = state.pointerEvent)
                 }
             }
@@ -391,6 +403,34 @@ fun LiveDisplayPreview(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun BoxScope.RetainedPreviewStatusBadge(lifecycle: TaskDisplayLifecycle) {
+    val colors = LocalAssistantColors.current
+    val statusColor = when (lifecycle) {
+        TaskDisplayLifecycle.PAUSED -> colors.warningAmber
+        TaskDisplayLifecycle.FAILED -> colors.errorRed
+        TaskDisplayLifecycle.COMPLETED -> colors.accentGreen
+        TaskDisplayLifecycle.STOPPED -> colors.textSecondary
+        else -> colors.accentBlue
+    }
+    MaterialSurface(
+        modifier = Modifier
+            .align(Alignment.TopStart)
+            .padding(8.dp),
+        shape = RoundedCornerShape(999.dp),
+        color = colors.composerBackground.copy(alpha = 0.92f),
+        border = BorderStroke(1.dp, statusColor.copy(alpha = 0.8f)),
+    ) {
+        Text(
+            text = lifecycle.displayLabel(),
+            color = statusColor,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+        )
     }
 }
 

@@ -107,7 +107,7 @@ describe("DHD App Server thread contract", () => {
     expect(readyThreadIds).toEqual(["fresh-thread"]);
   });
 
-  it("starts a continuation turn without adding a synthetic user message", async () => {
+  it("starts a continuation turn with hidden continue input", async () => {
     const client = new CodexAppServerClient();
     const internals = client as any;
     const requests: Array<{ method: string; params?: Record<string, unknown> }> = [];
@@ -148,6 +148,8 @@ describe("DHD App Server thread contract", () => {
       threadId: "stopped-thread",
     });
 
-    expect(requests.find(({ method }) => method === "turn/start")?.params?.input).toEqual([]);
+    expect(requests.find(({ method }) => method === "turn/start")?.params?.input).toEqual([
+      { type: "text", text: "continue" },
+    ]);
   });
 });

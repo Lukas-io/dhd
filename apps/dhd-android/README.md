@@ -108,20 +108,19 @@ Samsung S23/One UI smoke test before it is considered device-validated.
 ## Dummy desktop bridge (open -> observe -> tap)
 
 The Android app starts an authenticated NDJSON listener on TCP port `8765` and
-a short-code discovery listener on UDP port `8766` while its process is alive.
-For the wireless path, keep the phone and development machine on the same
-reachable Wi-Fi, open DHD Settings → Companion connection, and copy the short
-pairing code into the companion dashboard:
+a phone-discovery listener on UDP port `8766` while its process is alive. For
+the wireless path, keep the phone and development machine on the same
+reachable Wi-Fi, then use the companion dashboard to discover and select the
+phone:
 
 ```powershell
 pnpm companion:dashboard
 ```
 
-Open `http://127.0.0.1:8766`, enter the code, and choose **Pair phone**. The
-companion broadcasts the code locally; this phone bridge answers with its
-current address, port, and credential. The dashboard stores those details so
-you do not have to copy them individually. The code remains valid until you
-refresh it in DHD Settings.
+Open `http://127.0.0.1:8766`, choose **Refresh phones**, select the intended
+phone, and approve the one-time request in DHD Settings → Companion connection.
+The phone bridge then releases its current address, port, and credential. The
+dashboard stores those details so you do not have to copy them individually.
 
 `adb forward` remains a loopback fallback for local development:
 

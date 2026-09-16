@@ -38,6 +38,8 @@ const TERMINAL_MESSAGE_TYPES = new Set([
   "status",
   "pending_request",
   "pending_steer",
+  "heartbeat",
+  "companion_disconnected",
   "request_claimed",
   "request_released",
   "steer_claimed",
@@ -108,10 +110,12 @@ export function requestBridge(
     let buffer = "";
     let responseBytes = 0;
     let settled = false;
+    let timeoutTimer: NodeJS.Timeout | undefined;
 
     const finish = (error?: Error, message?: BridgeMessage) => {
       if (settled) return;
       settled = true;
+      if (timeoutTimer) clearTimeout(timeoutTimer);
       socket.destroy();
       if (error) reject(error);
       else resolve(message!);
@@ -119,6 +123,12 @@ export function requestBridge(
 
     const timeoutMs = options.timeoutMs ?? DEFAULT_BRIDGE_TIMEOUT_MS;
     if (timeoutMs > 0) {
+      // Socket inactivity timeouts do not consistently cover a TCP connect
+      // that is stuck in SYN-SENT. Keep a wall-clock deadline as well so a
+      // filtered or unreachable phone cannot leave callers in CHECKING forever.
+      timeoutTimer = setTimeout(() => {
+        finish(new Error("Timed out waiting for the phone assistant bridge."));
+      }, timeoutMs);
       socket.setTimeout(timeoutMs, () => {
         finish(new Error("Timed out waiting for the phone assistant bridge."));
       });
