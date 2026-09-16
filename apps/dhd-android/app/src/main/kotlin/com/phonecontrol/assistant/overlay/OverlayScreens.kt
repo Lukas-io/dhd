@@ -1450,6 +1450,7 @@ private fun BubbleButton(
         Box(
             modifier = Modifier
                 .fillMaxSize()
+                .clip(bubbleShape)
                 .clickable(
                     role = Role.Button,
                     onClickLabel = "Open assistant",
