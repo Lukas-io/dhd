@@ -10,6 +10,7 @@ import com.phonecontrol.assistant.execution.PhoneProcessRunner
 import com.phonecontrol.assistant.execution.TaskDisplayBackend
 import com.phonecontrol.assistant.execution.TaskDisplayCapture
 import com.phonecontrol.assistant.execution.TaskDisplayGeometry
+import com.phonecontrol.assistant.execution.TaskDisplayLayoutPreferences
 import com.phonecontrol.assistant.execution.TaskDisplaySession
 import com.phonecontrol.assistant.execution.TaskDisplaySpec
 import com.phonecontrol.assistant.execution.TaskDisplayRecord
@@ -19,6 +20,7 @@ import com.phonecontrol.assistant.execution.TaskDisplayStatus
 import com.phonecontrol.assistant.execution.TaskDisplayTarget
 import com.phonecontrol.assistant.execution.isTerminal
 import com.phonecontrol.assistant.execution.terminalized
+import com.phonecontrol.assistant.execution.withFullSizeAppLayout
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
@@ -99,6 +101,7 @@ class DhdTaskDisplayBackend(
     private val terminalRetentionMs: Long = TERMINAL_RETENTION_MS,
 ) : TaskDisplayBackend {
     private val appContext = context.applicationContext
+    private val layoutPreferences = TaskDisplayLayoutPreferences(appContext)
     private val stateLock = Mutex()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val sessions = LinkedHashMap<String, BoundSession>()
@@ -154,11 +157,16 @@ class DhdTaskDisplayBackend(
                     throw TaskDisplayException("The task display session is already active.")
                 }
             }
+            val effectiveSpec = spec.withFullSizeAppLayout(
+                layoutPreferences.isFullSizeLayoutEnabled(packageName),
+            )
             val nativeSpec = DhdVirtualDisplaySpec(
-                width = spec.width,
-                height = spec.height,
-                densityDpi = spec.densityDpi,
-                appDensityDpi = spec.appDensityDpi,
+                width = effectiveSpec.width,
+                height = effectiveSpec.height,
+                densityDpi = effectiveSpec.densityDpi,
+                appDensityDpi = effectiveSpec.appDensityDpi,
+                appDisplayWidth = effectiveSpec.appDisplayWidth,
+                appDisplayHeight = effectiveSpec.appDisplayHeight,
             )
             val result = nativeManager.create(sessionKey, packageName, nativeSpec)
             val nativeSession = when (result) {
@@ -777,11 +785,6 @@ class DhdTaskDisplayBackend(
                     true
                 }
             }
-            if (shouldClose || expected == null) {
-                // Native close is by owner key so it also cancels a create that
-                // has not returned yet. It is safe after a stopped create too.
-                runCatching { nativeManager.close(sessionKey) }
-            }
             if (!shouldClose && expected != null) return@withLock
             unbindOwner(sessionKey)
             expiryJobs.remove(sessionKey)?.cancel()
@@ -796,6 +799,13 @@ class DhdTaskDisplayBackend(
                     ),
                 )
             }
+            // Publish the local terminal state before talking to the daemon.
+            // A restarted/unavailable maintenance service must not make the
+            // Task Displays End action appear unresponsive. Native close is
+            // still attempted by exact owner key as best effort cleanup.
+            if (shouldClose || expected == null) {
+                runCatching { nativeManager.close(sessionKey) }
+            }
         }
     }
 
@@ -809,7 +819,6 @@ class DhdTaskDisplayBackend(
                 message = "The selected task display reference is invalid; the physical display is never controlled by DHD.",
             )
         }
-        reconciliationJob.join()
         val record = findRecordByDisplayId(displayId)
             ?: return TaskDisplayCloseResult.Rejected(
                 code = "DISPLAY_NOT_FOUND",
@@ -948,7 +957,8 @@ class DhdTaskDisplayBackend(
                 taskSession.packageName == record.packageName &&
                 taskSession.geometry.width == record.width &&
                 taskSession.geometry.height == record.height &&
-                taskSession.geometry.densityDpi == record.densityDpi
+                taskSession.geometry.densityDpi == record.densityDpi &&
+                matchesCurrentAppLayout(nativeSession)
             val expired = record.status == TaskDisplayStatus.EXPIRED ||
                 (record.expiresAtEpochMs != null && record.expiresAtEpochMs <= now)
             val ended = record.status == TaskDisplayStatus.ENDED
@@ -1002,6 +1012,22 @@ class DhdTaskDisplayBackend(
                 .mapNotNull { sessions[it.sessionKey]?.taskSession }
                 .maxByOrNull { session -> candidateRecords.first { it.sessionKey == session.sessionKey }.createdAtEpochMs }
         }
+    }
+
+    /**
+     * A retained record predates the logical-canvas profile, so its durable
+     * metadata cannot describe the app-visible size. Compare the native
+     * session against the current per-package profile before re-adopting it;
+     * otherwise a stale 720x1560 app canvas can survive an APK update and be
+     * rendered as a letterboxed preview forever.
+     */
+    private fun matchesCurrentAppLayout(session: DhdVirtualDisplaySession): Boolean {
+        val expected = TaskDisplaySpec().withFullSizeAppLayout(
+            layoutPreferences.isFullSizeLayoutEnabled(session.packageName),
+        )
+        return session.appDensityDpi == expected.appDensityDpi &&
+            session.appDisplayWidth == (expected.appDisplayWidth ?: expected.width) &&
+            session.appDisplayHeight == (expected.appDisplayHeight ?: expected.height)
     }
 
     private suspend fun removeLocalSession(sessionKey: String, expectedTaskId: String? = null) {
@@ -1308,6 +1334,8 @@ class DhdTaskDisplayBackend(
             displayId = displayId,
             streamEndpoint = "127.0.0.1:$streamPort",
             geometry = TaskDisplayGeometry(width, height, densityDpi, rotation),
+            appDisplayWidth = appDisplayWidth ?: width,
+            appDisplayHeight = appDisplayHeight ?: height,
         )
     }
 

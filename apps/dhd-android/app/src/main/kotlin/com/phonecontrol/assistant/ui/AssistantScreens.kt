@@ -137,6 +137,7 @@ import com.phonecontrol.assistant.R
 import com.phonecontrol.assistant.apps.AppPermissionRepository
 import com.phonecontrol.assistant.apps.InstalledUserApp
 import com.phonecontrol.assistant.bridge.DevBridgeServer
+import com.phonecontrol.assistant.bridge.PendingCompanionPairing
 import com.phonecontrol.assistant.data.ConversationStore
 import com.phonecontrol.assistant.data.DHD_BROWSE_APP_TOOL
 import com.phonecontrol.assistant.data.DHD_CONVERSATION_ID
@@ -764,7 +765,10 @@ private fun ConversationTimeline(
     // The inline preview is a live child of the task group. Its decoder and
     // tool rows can change height while the user is reading older messages;
     // do not reposition the list around that child as it updates.
-    val previewBelongsToCurrentTimeline = state.isActive() &&
+    // A stopped/completed run can still own a retained display. Keep the
+    // preview attached to its historical task group while the display is
+    // retained; stopping the run only removes action authority.
+    val previewBelongsToCurrentTimeline = state.sessionIdOrNullForUi() != null &&
         previewState?.let { preview ->
             preview.belongsToRun(state.sessionIdOrNullForUi()) &&
                 groups.any { group ->
@@ -938,7 +942,7 @@ private fun TaskGroupCard(
             group.runIds.any { runId -> preview.belongsToGroup(runId) } &&
                 preview.isExpanded(expandedPreviewSessionKey)
         } == true
-        if (active && previewVisibleForGroup) {
+        if (previewVisibleForGroup) {
             // Keep the preview outside any SelectionContainer. Its native
             // TextureView and expand control must not share a selection
             // gesture surface with the surrounding timeline text.
@@ -948,8 +952,9 @@ private fun TaskGroupCard(
                 onSurfaceDestroyed = onPreviewSurfaceDestroyed,
                 onExpand = { taskPreviewState.sessionKey?.let(onOpenPreview) },
                 onExpandBoundsChanged = onPreviewExpandBoundsChanged,
+                agentLifecycle = state.toPreviewLifecycle(),
             )
-        } else if (active && previewExpandedForGroup) {
+        } else if (previewExpandedForGroup) {
             // Fullscreen owns the decoder surface. Keep this equal-sized slot
             // in the timeline so opening/closing the viewer cannot change the
             // LazyColumn's measured content or clamp its scroll offset.
@@ -1067,9 +1072,10 @@ private fun RunningStatusIndicator(
         return
     }
 
-    val waitingForCompanion = !companionConnected ||
-        currentPurpose.equals("Waiting for desktop Codex bridge", ignoreCase = true) ||
-        (currentPurpose.equals("Preparing request", ignoreCase = true) && elapsedSeconds >= COMPANION_WAIT_CALLOUT_SECONDS)
+    // A slow Codex startup or a released request does not mean that the LAN
+    // companion is disconnected. The phone-side heartbeat lease is the source
+    // of truth for this recovery card.
+    val waitingForCompanion = !companionConnected
     if (waitingForCompanion) {
         CompanionRecoveryCard(
             elapsedSeconds = elapsedSeconds,
@@ -1207,9 +1213,9 @@ private fun CompanionRecoveryCard(
     RecoveryCard(
         icon = R.drawable.ic_laptop,
         title = "Desktop companion not connected",
-        detail = "DHD has not sent any phone action yet. Check the Codex companion and try again.",
+        detail = "DHD is waiting for the desktop companion. Connect this phone on your local network.",
         accent = colors.warningAmber,
-        actionLabel = "Open desktop companion",
+        actionLabel = "View connection instructions",
         onAction = onOpenCompanion,
         trailing = "Waiting ${elapsedSeconds}s",
     )
@@ -2552,7 +2558,7 @@ fun SettingsScreen(
     apps: List<InstalledUserApp>,
     permissions: AppPermissionRepository,
     developerStatus: DeveloperModeStatus,
-    bridgeServer: DevBridgeServer,
+    companionConnected: Boolean,
     themeMode: ThemeMode,
     onSelectThemeMode: (ThemeMode) -> Unit,
     visibleReasoningEfforts: List<ReasoningEffort>,
@@ -2569,7 +2575,6 @@ fun SettingsScreen(
     val colors = LocalAssistantColors.current
     val isFullAccess = remember(permissions.isFullAccessEnabled()) { permissions.isFullAccessEnabled() }
     val enabledCount = remember(permissions.enabledPackages()) { permissions.enabledPackages().size }
-    val lanAddresses = remember { bridgeServer.lanIpv4Addresses() }
     var isAppearanceMenuOpen by remember { mutableStateOf(false) }
     var isReasoningMenuOpen by remember { mutableStateOf(false) }
 
@@ -2900,57 +2905,58 @@ fun SettingsScreen(
                             )
                         }
 
-                        HorizontalDivider(thickness = 2.dp, color = colors.cardDivider)
-
-                        // Desktop companion Row -> Opens dedicated screen
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { onOpenCompanion() }
-                                .padding(horizontal = 16.dp, vertical = 14.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_laptop),
-                                contentDescription = "Desktop companion",
-                                tint = colors.textPrimary,
-                                modifier = Modifier.size(22.dp),
-                            )
-                            Column(
+                        // Connection instructions are only useful while the companion is offline.
+                        if (!companionConnected) {
+                            HorizontalDivider(thickness = 2.dp, color = colors.cardDivider)
+                            Row(
                                 modifier = Modifier
-                                    .weight(1f)
-                                    .padding(start = 14.dp),
+                                    .fillMaxWidth()
+                                    .clickable { onOpenCompanion() }
+                                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                                verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                Text(
-                                    text = "Desktop companion",
-                                    fontWeight = FontWeight.Medium,
-                                    color = colors.textPrimary,
-                                    fontSize = 15.sp,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                                Text(
-                                    text = if (lanAddresses.isEmpty()) "Offline" else "Ready on Wi-Fi",
-                                    fontSize = 12.sp,
-                                    color = colors.textSecondary,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = if (lanAddresses.isEmpty()) "Offline" else "Ready",
-                                    color = colors.textSecondary,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    modifier = Modifier.padding(end = 4.dp),
-                                )
                                 Icon(
-                                    painter = painterResource(R.drawable.ic_chevron_right),
-                                    contentDescription = "Open Companion settings",
-                                    tint = colors.textSecondary,
-                                    modifier = Modifier.size(18.dp),
+                                    painter = painterResource(R.drawable.ic_laptop),
+                                    contentDescription = "Desktop companion connection instructions",
+                                    tint = colors.textPrimary,
+                                    modifier = Modifier.size(22.dp),
                                 )
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(start = 14.dp),
+                                ) {
+                                    Text(
+                                        text = "Connect desktop companion",
+                                        fontWeight = FontWeight.Medium,
+                                        color = colors.textPrimary,
+                                        fontSize = 15.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    Text(
+                                        text = "View connection instructions",
+                                        fontSize = 12.sp,
+                                        color = colors.textSecondary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        text = "Set up",
+                                        color = colors.textSecondary,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        modifier = Modifier.padding(end = 4.dp),
+                                    )
+                                    Icon(
+                                        painter = painterResource(R.drawable.ic_chevron_right),
+                                        contentDescription = "Open connection instructions",
+                                        tint = colors.textSecondary,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                }
                             }
                         }
 
@@ -3096,6 +3102,8 @@ fun TaskDisplaysScreen(
     records: List<TaskDisplayUiRecord>,
     onView: (TaskDisplayUiRecord) -> Unit,
     onEnd: (TaskDisplayUiRecord) -> Unit,
+    fullSizeLayoutForPackage: (String) -> Boolean = { false },
+    onSetFullSizeLayout: (String, Boolean) -> Unit = { _, _ -> },
     onBack: () -> Unit,
 ) {
     val colors = LocalAssistantColors.current
@@ -3209,6 +3217,11 @@ fun TaskDisplaysScreen(
                         nowEpochMs = nowEpochMs,
                         onView = { onView(record) },
                         onEnd = { endCandidate = record },
+                        fullSizeLayoutEnabled = record.packageName
+                            ?.takeIf(String::isNotBlank)
+                            ?.let(fullSizeLayoutForPackage)
+                            ?: false,
+                        onSetFullSizeLayout = onSetFullSizeLayout,
                     )
                 }
             }
@@ -3257,8 +3270,16 @@ private fun TaskDisplayManagerCard(
     nowEpochMs: Long,
     onView: () -> Unit,
     onEnd: () -> Unit,
+    fullSizeLayoutEnabled: Boolean,
+    onSetFullSizeLayout: (String, Boolean) -> Unit,
 ) {
     val colors = LocalAssistantColors.current
+    val packageName = record.packageName?.takeIf(String::isNotBlank)
+    val appLabel = record.appLabel ?: packageName ?: "this app"
+    var layoutDialogVisible by rememberSaveable(record.sessionKey) { mutableStateOf(false) }
+    var pendingFullSizeLayout by remember(record.sessionKey, fullSizeLayoutEnabled) {
+        mutableStateOf(fullSizeLayoutEnabled)
+    }
     val statusColor = when (record.lifecycle) {
         TaskDisplayLifecycle.RUNNING -> colors.accentGreen
         TaskDisplayLifecycle.PAUSED -> colors.accentBlue
@@ -3278,9 +3299,7 @@ private fun TaskDisplayManagerCard(
         shape = RoundedCornerShape(20.dp),
         color = colors.settingsCard,
         border = BorderStroke(1.dp, colors.borderColor),
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(enabled = canView, onClick = onView),
+        modifier = Modifier.fillMaxWidth(),
     ) {
         Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 15.dp)) {
             Row(verticalAlignment = Alignment.Top) {
@@ -3345,6 +3364,32 @@ private fun TaskDisplayManagerCard(
                 )
             }
 
+            if (packageName != null) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                    horizontalArrangement = Arrangement.End,
+                ) {
+                    TextButton(
+                        onClick = {
+                            pendingFullSizeLayout = fullSizeLayoutEnabled
+                            layoutDialogVisible = true
+                        },
+                        enabled = canView,
+                    ) {
+                        Text(
+                            text = if (fullSizeLayoutEnabled) {
+                                "Full-size layout on"
+                            } else {
+                                "Display looks wrong?"
+                            },
+                            color = if (canView) colors.accentBlue else colors.textSecondary,
+                        )
+                    }
+                }
+            }
+
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -3358,11 +3403,83 @@ private fun TaskDisplayManagerCard(
                     fontSize = 11.sp,
                     modifier = Modifier.weight(1f),
                 )
+                TextButton(onClick = onView, enabled = canView) {
+                    Text("View", color = if (canView) colors.accentBlue else colors.textSecondary)
+                }
                 TextButton(onClick = onEnd, enabled = canEnd) {
                     Text("End", color = if (canEnd) colors.errorRed else colors.textSecondary)
                 }
             }
         }
+    }
+
+    if (layoutDialogVisible && packageName != null) {
+        AlertDialog(
+            onDismissRequest = { layoutDialogVisible = false },
+            containerColor = colors.surfaceCard,
+            titleContentColor = colors.textPrimary,
+            textContentColor = colors.textSecondary,
+            shape = RoundedCornerShape(20.dp),
+            title = { Text("App display looks wrong?", fontWeight = FontWeight.SemiBold) },
+            text = {
+                Column {
+                    Text(
+                        "If $appLabel looks squished, cut off, or leaves a large empty area, " +
+                            "try the full-size app layout. This only affects $appLabel and " +
+                            "applies the next time it is opened.",
+                        fontSize = 14.sp,
+                        lineHeight = 20.sp,
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 18.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Use full-size app layout",
+                                color = colors.textPrimary,
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                "Helpful when the app does not fit the display correctly.",
+                                color = colors.textSecondary,
+                                fontSize = 12.sp,
+                                lineHeight = 17.sp,
+                                modifier = Modifier.padding(top = 3.dp),
+                            )
+                        }
+                        Switch(
+                            checked = pendingFullSizeLayout,
+                            onCheckedChange = { pendingFullSizeLayout = it },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = colors.textPrimary,
+                                checkedTrackColor = colors.accentBlue,
+                                uncheckedThumbColor = colors.textSecondary,
+                                uncheckedTrackColor = colors.borderColor,
+                            ),
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onSetFullSizeLayout(packageName, pendingFullSizeLayout)
+                        layoutDialogVisible = false
+                    },
+                ) {
+                    Text("Save", color = colors.accentBlue, fontWeight = FontWeight.SemiBold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { layoutDialogVisible = false }) {
+                    Text("Cancel", color = colors.textSecondary)
+                }
+            },
+        )
     }
 }
 
@@ -3690,13 +3807,10 @@ private fun PairingInstruction(
 }
 
 @Composable
-fun CompanionScreen(
-    bridgeServer: DevBridgeServer,
+fun CompanionInstructionsScreen(
     onBack: () -> Unit,
 ) {
     val colors = LocalAssistantColors.current
-    var lanAddresses by remember { mutableStateOf(bridgeServer.lanIpv4Addresses()) }
-    var pairingCode by remember { mutableStateOf(bridgeServer.pairingCode) }
 
     Scaffold(
         containerColor = colors.background,
@@ -3707,7 +3821,7 @@ fun CompanionScreen(
                     titleContentColor = colors.textPrimary,
                     navigationIconContentColor = colors.textPrimary,
                 ),
-                title = { Text("Desktop Companion", fontWeight = FontWeight.SemiBold, fontSize = 17.sp) },
+                title = { Text("Connect desktop companion", fontWeight = FontWeight.SemiBold, fontSize = 17.sp) },
                 navigationIcon = {
                     Surface(
                         shape = CircleShape,
@@ -3741,100 +3855,123 @@ fun CompanionScreen(
             contentPadding = PaddingValues(top = 14.dp, bottom = 24.dp),
         ) {
             item {
-                SettingsSectionHeader("Connection")
+                SettingsSectionHeader("How to connect")
                 Surface(
                     shape = RoundedCornerShape(20.dp),
                     color = colors.settingsCard,
                     modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Column {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 14.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_laptop),
-                                contentDescription = "Desktop companion",
-                                tint = colors.textPrimary,
-                                modifier = Modifier.size(22.dp),
-                            )
-                            Column(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .padding(start = 14.dp),
-                            ) {
-                                Text(
-                                    text = "Wireless bridge",
-                                    fontWeight = FontWeight.Medium,
-                                    color = colors.textPrimary,
-                                    fontSize = 15.sp,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                                Text(
-                                    text = if (lanAddresses.isEmpty()) "Offline" else "Connected on local Wi-Fi",
-                                    fontSize = 12.sp,
-                                    color = colors.textSecondary,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
-                            Text(
-                                text = if (lanAddresses.isEmpty()) "Offline" else "Ready",
-                                color = colors.textSecondary,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Medium,
-                                modifier = Modifier.padding(start = 8.dp),
-                            )
-                        }
-
-                        HorizontalDivider(thickness = 2.dp, color = colors.cardDivider)
-
-                        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Text(
-                                    text = "Pairing code",
-                                    fontSize = 12.sp,
-                                    color = colors.textSecondary,
-                                )
-                                TextButton(
-                                    onClick = {
-                                        pairingCode = bridgeServer.refreshPairingCode()
-                                        lanAddresses = bridgeServer.lanIpv4Addresses()
-                                    },
-                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                                ) {
-                                    Text("Refresh", color = colors.accentBlue, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                                }
-                            }
-                            Text(
-                                text = pairingCode.chunked(4).joinToString("-"),
-                                fontSize = 24.sp,
-                                fontWeight = FontWeight.Bold,
-                                letterSpacing = 2.sp,
-                                color = colors.textPrimary,
-                                modifier = Modifier.padding(vertical = 4.dp),
-                            )
-                            Text(
-                                text = "Enter code in desktop companion",
-                                fontSize = 12.sp,
-                                color = colors.textSecondary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
+                    Column(
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 16.dp),
+                        verticalArrangement = Arrangement.spacedBy(16.dp),
+                    ) {
+                        CompanionInstructionStep(
+                            number = "1",
+                            title = "Start the desktop companion",
+                            detail = "Open DHD's desktop companion on your computer. Its local dashboard is usually available at localhost:8766.",
+                        )
+                        CompanionInstructionStep(
+                            number = "2",
+                            title = "Use the same local network",
+                            detail = "Keep the phone and computer on the same local network. Wi-Fi and Ethernet are fine if the network allows them to reach each other.",
+                        )
+                        CompanionInstructionStep(
+                            number = "3",
+                            title = "Select this phone",
+                            detail = "On the desktop companion, choose Refresh phones and select this phone from the phone list.",
+                        )
+                        CompanionInstructionStep(
+                            number = "4",
+                            title = "Approve the connection",
+                            detail = "Approve the request when it appears on this phone. No pairing code needs to be entered.",
+                        )
                     }
                 }
-                SettingsSectionFooter("The companion coordinates requests with desktop Codex over your local Wi-Fi.")
+                SettingsSectionFooter("If the phone is not listed, check the local network and the computer's firewall, then use Refresh phones again.")
             }
         }
     }
+
+}
+
+@Composable
+private fun CompanionInstructionStep(
+    number: String,
+    title: String,
+    detail: String,
+) {
+    val colors = LocalAssistantColors.current
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.Top,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(28.dp)
+                .background(colors.accentBlue, CircleShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = number,
+                color = Color.White,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(start = 12.dp),
+        ) {
+            Text(
+                text = title,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = colors.textPrimary,
+            )
+            Text(
+                text = detail,
+                fontSize = 12.sp,
+                lineHeight = 18.sp,
+                color = colors.textSecondary,
+                modifier = Modifier.padding(top = 3.dp),
+            )
+        }
+    }
+}
+
+@Composable
+fun CompanionPairingApprovalDialog(
+    pending: PendingCompanionPairing?,
+    bridgeServer: DevBridgeServer,
+) {
+    val colors = LocalAssistantColors.current
+    pending ?: return
+    AlertDialog(
+        onDismissRequest = { bridgeServer.rejectPendingCompanionPairing() },
+        containerColor = colors.surfaceCard,
+        titleContentColor = colors.textPrimary,
+        textContentColor = colors.textSecondary,
+        shape = RoundedCornerShape(20.dp),
+        title = { Text("Allow desktop companion?", fontWeight = FontWeight.SemiBold) },
+        text = {
+            Text(
+                text = "${pending.desktopName} wants to connect to DHD on this local network. Approve only if you recognize this computer.",
+                fontSize = 14.sp,
+                lineHeight = 20.sp,
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = { bridgeServer.approvePendingCompanionPairing() }) {
+                Text("Approve", color = colors.accentBlue, fontWeight = FontWeight.SemiBold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = { bridgeServer.rejectPendingCompanionPairing() }) {
+                Text("Reject", color = colors.textSecondary)
+            }
+        },
+    )
 }
 
 @Composable
@@ -4239,6 +4376,18 @@ private fun LiveDisplayPreviewState.isExpanded(expandedSessionKey: String?): Boo
         (sessionKey == expandedSessionKey || runSessionKey == expandedSessionKey)
 
 private fun SessionState.isActive(): Boolean = this is SessionState.Running || this is SessionState.Paused
+
+private fun SessionState.toPreviewLifecycle(): TaskDisplayLifecycle? = when (this) {
+    is SessionState.Running -> if (attentionReason != null) {
+        TaskDisplayLifecycle.PAUSED
+    } else {
+        TaskDisplayLifecycle.RUNNING
+    }
+    is SessionState.Paused -> TaskDisplayLifecycle.PAUSED
+    is SessionState.Stopped -> TaskDisplayLifecycle.STOPPED
+    is SessionState.Completed -> TaskDisplayLifecycle.COMPLETED
+    SessionState.Idle -> null
+}
 
 private fun SessionState.sessionIdOrNullForUi(): String? = when (this) {
     SessionState.Idle -> null

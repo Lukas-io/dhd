@@ -64,7 +64,10 @@ internal class DhdMaintenanceBootstrap(
             )
         }
 
-        repeat(20) {
+        // A shell-UID app_process can take a few seconds to come back after
+        // replacing an older daemon. Do not report a false bootstrap failure
+        // while the new capability set is still coming up.
+        repeat(50) {
             if (client.isCompatible()) return
             delay(100)
         }
@@ -86,7 +89,18 @@ internal class DhdMaintenanceBootstrap(
             // never assembled from user or model text.
             runCatching { adb.shellV2("kill -TERM $pid") }
         }
-        repeat(10) {
+        repeat(20) {
+            if (!client().isReady()) return
+            delay(100)
+        }
+
+        // If the old process did not honor TERM, kill only the exact PIDs
+        // returned by pidof. This prevents the new display implementation
+        // from being shadowed by a stale daemon on the persisted port.
+        pids.forEach { pid ->
+            runCatching { adb.shellV2("kill -KILL $pid") }
+        }
+        repeat(20) {
             if (!client().isReady()) return
             delay(100)
         }

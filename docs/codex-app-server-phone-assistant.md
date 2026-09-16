@@ -87,21 +87,22 @@ guard fingerprint; it does not claim that every screenshot pixel was
 compared. Other reason codes identify rotation, display identity or size,
 package, activity, and observation replacement.
 
-For the normal wireless path, start the local companion dashboard and pair by
-short code. DHD Settings → Companion connection shows the code. The dashboard
-broadcasts the code on the local network; the phone bridge matches it and
-returns the current phone route and bridge credential to the dashboard. No
-phone IP, port, or token needs to be copied:
+For the normal wireless path, start the local companion dashboard and discover
+the phone on the local network. The dashboard starts its worker automatically.
+Select the intended phone in the Connection tab, then approve the one-time
+request in DHD Settings → Companion connection. The phone bridge returns the
+current route and bridge credential only after approval. No phone IP, port,
+token, or pairing code needs to be copied:
 
 ```powershell
 pnpm companion:dashboard
 ```
 
-Open the dashboard at `http://127.0.0.1:8766`, open the Connection tab, enter
-the DHD pairing code, and choose **Pair phone**. The phone and laptop must be
-on the same reachable local network. The phone bridge listens for pairing
-discovery on UDP port `8766` and continues to serve the authenticated bridge
-on TCP port `8765`.
+Open the dashboard at `http://127.0.0.1:8766`, open the Connection tab, choose
+**Refresh phones**, and select a phone. The phone and laptop must be on the
+same reachable local network. The phone bridge listens for discovery and
+approval on UDP port `8766` and continues to serve the authenticated bridge on
+TCP port `8765`.
 
 For a desktop dashboard around the same worker, run this from the repository
 root:
@@ -110,18 +111,16 @@ root:
 pnpm companion:dashboard
 ```
 
-The companion dashboard stores the discovered phone route, device identity,
-pairing code, and bridge credential locally. If the phone receives a new local
-IP, **Check link** can rediscover it using the saved code and restart the
-worker with the new route. The dashboard does not replace the phone-owned
-policy or action layer and does not require Docker or a new dependency
-download.
+The companion dashboard stores the discovered phone route, device identity, and
+bridge credential locally. If the phone receives a new local IP, **Check link**
+can rediscover it by device identity and refresh the saved route. The dashboard
+does not replace the phone-owned policy or action layer and does not require
+Docker or a new dependency download.
 
-The pairing code is a local discovery secret and the bridge credential is
-returned over the local network after the code matches. This is still a
-development protocol without TLS, so use it only on a trusted network and do
-not forward ports `8765` or `8766` from the router to the internet. Refreshing
-the code in DHD revokes the old code.
+The bridge credential is returned over the local network only after the phone
+approves the request. This is still a development protocol without TLS, so use
+it only on a trusted network and do not forward ports `8765` or `8766` from the
+router to the internet.
 
 If a local USB/ADB fallback is useful, start the phone-side app and forward
 its loopback port instead:

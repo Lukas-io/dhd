@@ -71,12 +71,12 @@ cd ../..
 On the phone, the full pairing instructions are here - 
 [`apps/dhd-android/README.md`](apps/dhd-android/README.md). The app is also quite intuitive
 
-The normal development path is now wireless: open DHD Settings → Companion
-connection, copy the short pairing code, and enter it in the companion
-dashboard. The companion broadcasts that code locally, the phone bridge
-answers with its current route, and the worker connects without manual IP,
-port, or token copying. `adb forward` remains available as a loopback-only
-fallback.
+The normal development path is now wireless: open the companion dashboard and
+refresh the phone list. Select the intended phone, then approve the one-time
+request in DHD Settings → Companion connection. The companion learns the
+phone's current route and receives its bridge credential only after approval;
+there is no code, IP, port, or token to copy. `adb forward` remains available
+as a loopback-only fallback for development.
 
 ### DHD companion
 
@@ -86,9 +86,10 @@ After `pnpm dhd:setup` has completed, run the companion dashboard:
 pnpm companion:dashboard
 ```
 
-The dashboard pairs with the phone by short code, and shows local activity. The discovered
-connection is saved locally so the companion can rediscover the phone when its
-local network address changes.
+The dashboard starts its worker automatically, pairs with a selected phone on
+the local network, and shows local activity. The discovered connection is saved
+locally so the companion can rediscover the phone when its local network
+address changes.
 
 For a direct worker run, use `pnpm companion:worker`. The companion passes
 `CODEX_HOME` only to its App Server child, so no manual environment override is

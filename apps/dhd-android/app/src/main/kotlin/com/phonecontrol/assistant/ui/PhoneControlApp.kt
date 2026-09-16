@@ -39,6 +39,7 @@ import com.phonecontrol.assistant.PhoneControlApplication
 import com.phonecontrol.assistant.apps.InstalledAppsRepository
 import com.phonecontrol.assistant.data.DHD_CONVERSATION_ID
 import com.phonecontrol.assistant.domain.ReasoningEffort
+import com.phonecontrol.assistant.execution.TaskDisplayLayoutPreferences
 
 data class AssistantColorScheme(
     val isDark: Boolean,
@@ -265,7 +266,16 @@ fun PhoneControlApp(
     val developerModeController = application.developerModeController
     val developerStatus by developerModeController.status.collectAsState()
     val companionConnected by application.devBridgeServer.companionConnected.collectAsState()
+    val pendingCompanionPairing by application.devBridgeServer.pendingCompanionPairing.collectAsState()
     val apps = remember { InstalledAppsRepository(context).listLaunchableUserApps() }
+    val taskDisplayLayoutPreferences = remember { TaskDisplayLayoutPreferences(context) }
+    var fullSizeLayoutPackages by remember {
+        mutableStateOf(taskDisplayLayoutPreferences.fullSizeLayoutPackages())
+    }
+    val setFullSizeLayout: (String, Boolean) -> Unit = { packageName, enabled ->
+        taskDisplayLayoutPreferences.setFullSizeLayoutEnabled(packageName, enabled)
+        fullSizeLayoutPackages = taskDisplayLayoutPreferences.fullSizeLayoutPackages()
+    }
 
     val navController = rememberNavController()
     val initialNavigationRoute = when (initialRoute) {
@@ -412,7 +422,7 @@ fun PhoneControlApp(
                             apps = apps,
                             permissions = permissions,
                             developerStatus = developerStatus,
-                            bridgeServer = application.devBridgeServer,
+                            companionConnected = companionConnected,
                             themeMode = themeMode,
                             onSelectThemeMode = setThemeMode,
                             visibleReasoningEfforts = visibleReasoningEfforts,
@@ -439,6 +449,10 @@ fun PhoneControlApp(
                                 navController.popBackStack()
                             },
                             onEnd = onEndTaskDisplay,
+                            fullSizeLayoutForPackage = { packageName ->
+                                packageName in fullSizeLayoutPackages
+                            },
+                            onSetFullSizeLayout = setFullSizeLayout,
                             onBack = { navController.popBackStack() },
                         )
                     }
@@ -453,10 +467,15 @@ fun PhoneControlApp(
                     }
 
                     composable(AppRoutes.COMPANION) {
-                        CompanionScreen(
-                            bridgeServer = application.devBridgeServer,
-                            onBack = { navController.popBackStack() },
-                        )
+                        if (companionConnected) {
+                            LaunchedEffect(companionConnected) {
+                                navController.popBackStack()
+                            }
+                        } else {
+                            CompanionInstructionsScreen(
+                                onBack = { navController.popBackStack() },
+                            )
+                        }
                     }
 
                     composable(AppRoutes.APPROVED_APPS) {
@@ -467,6 +486,11 @@ fun PhoneControlApp(
                         )
                     }
                 }
+
+                CompanionPairingApprovalDialog(
+                    pending = pendingCompanionPairing,
+                    bridgeServer = application.devBridgeServer,
+                )
 
                 LaunchedEffect(initialNavigationRoute) {
                     initialNavigationRoute?.let { route ->
@@ -484,6 +508,10 @@ fun PhoneControlApp(
                             viewerSessionKey = record.sessionKey
                         },
                         onEnd = onEndTaskDisplay,
+                        fullSizeLayoutForPackage = { packageName ->
+                            packageName in fullSizeLayoutPackages
+                        },
+                        onSetFullSizeLayout = setFullSizeLayout,
                         onBack = { taskDisplaysSheetVisible = false },
                     )
                 }

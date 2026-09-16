@@ -1,12 +1,26 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, afterEach, vi } from "vitest";
+
+const createConnectionMock = vi.hoisted(() => vi.fn());
+
+vi.mock("node:net", () => ({
+  default: {
+    createConnection: createConnectionMock
+  }
+}));
 
 import {
   bridgeConfigurationError,
   buildBridgePayload,
   isLoopbackBridgeHost,
   parsePort,
+  requestBridge,
   type BridgeRequest,
 } from "../src/phone-assistant-bridge.js";
+
+afterEach(() => {
+  vi.useRealTimers();
+  createConnectionMock.mockReset();
+});
 
 describe("phone assistant bridge configuration", () => {
   it("recognizes loopback hosts, including IPv6 loopback", () => {
@@ -37,5 +51,26 @@ describe("phone assistant bridge configuration", () => {
     expect(parsePort("8765")).toBe(8765);
     expect(() => parsePort("0")).toThrow();
     expect(() => parsePort("65536")).toThrow();
+  });
+
+  it("times out when a TCP connection never reaches the phone", async () => {
+    vi.useFakeTimers();
+    const socket = {
+      destroy: vi.fn(),
+      on: vi.fn(),
+      once: vi.fn(),
+      setTimeout: vi.fn()
+    };
+    createConnectionMock.mockReturnValue(socket);
+
+    const result = requestBridge(
+      { type: "status", requestId: "request-timeout" },
+      { host: "127.0.0.1", port: 8765, timeoutMs: 100 }
+    );
+    const rejection = expect(result).rejects.toThrow("Timed out waiting for the phone assistant bridge.");
+
+    await vi.advanceTimersByTimeAsync(100);
+    await rejection;
+    expect(socket.destroy).toHaveBeenCalledTimes(1);
   });
 });

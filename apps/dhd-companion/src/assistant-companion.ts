@@ -44,6 +44,8 @@ import {
 
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 const BRIDGE_POLL_TIMEOUT_MS = 5_000;
+const COMPANION_HEARTBEAT_INTERVAL_MS = 2_500;
+const COMPANION_HEARTBEAT_TIMEOUT_MS = 4_000;
 const APP_SERVER_REQUEST_TIMEOUT_MS = 30_000;
 const STREAM_BRIDGE_TIMEOUT_MS = 5_000;
 const MAX_AGENT_FEEDBACK_CHARS = 4_000;
@@ -202,6 +204,7 @@ export class CodexAppServerClient {
   private hasCurrentDhdThread = false;
   private activeTurnId: string | null = null;
   private interruptRequested = false;
+  private turnRequested = false;
   private activeTiming: PhaseTimer | null = null;
   private userMessageLogged = false;
   private activeModel = resolveCodexModel();
@@ -209,7 +212,10 @@ export class CodexAppServerClient {
 
   /** True while this client still owns an in-flight App Server turn. */
   get isTurnInFlight(): boolean {
-    return this.turnCompletion !== null;
+    // A turn is also in flight while initialize/resume/thread-start is still
+    // running. The completion promise is created only after initialize, so
+    // relying on it alone loses a phone-side Stop during that handoff.
+    return this.turnRequested || this.turnCompletion !== null;
   }
 
   /** True when the active thread and turn ids are available for steering. */
@@ -277,6 +283,7 @@ export class CodexAppServerClient {
     isContinuation = false,
   ): Promise<TurnResult> {
     const logger = timing ?? new PhaseTimer("codex-turn");
+    this.turnRequested = true;
     this.activeTiming = logger;
     this.userMessageLogged = false;
     this.interruptRequested = false;
@@ -383,7 +390,13 @@ export class CodexAppServerClient {
           effort: normalizeCodexEffort(reasoningEffort),
           serviceTier,
           cwd: this.runtimeCwd,
-          input: isContinuation ? [] : [{ type: "text", text: phoneRequest }],
+          // A continuation is a real, minimal user turn so the model can
+          // advance from the persisted tool responses and errors in the
+          // resumed thread. The phone-side continuation run remains hidden
+          // from DHD's local timeline; this text is only the App Server input.
+          input: isContinuation
+            ? [{ type: "text", text: "continue" }]
+            : [{ type: "text", text: phoneRequest }],
         });
         // `turn/start` returns the initial turn object. The notification is
         // also tracked below, but capturing this response makes user-driven
@@ -418,6 +431,7 @@ export class CodexAppServerClient {
       await this.stopProcess();
       throw error;
     } finally {
+      this.turnRequested = false;
       this.activeThreadId = null;
       this.activeTurnId = null;
       this.interruptRequested = false;
@@ -532,19 +546,30 @@ export class CodexAppServerClient {
         new Error(`Could not start Codex App Server: ${error.message}`),
       ),
     );
-    child.once("close", (code, signal) => {
-      if (this.child === child) {
-        this.child = null;
-        this.reader = null;
-        this.initialized = false;
-        this.loadedThreadIds.clear();
-      }
-      this.failPending(
-        new Error(
-          `Codex App Server exited before completing the turn (code=${code ?? "?"}, signal=${signal ?? "?"}).`,
-        ),
-      );
-    });
+    child.once("close", (code, signal) =>
+      this.handleChildClose(child, code, signal),
+    );
+  }
+
+  private handleChildClose(
+    child: ChildProcessWithoutNullStreams,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): void {
+    // stopProcess() detaches the old child before starting its replacement,
+    // but Windows can deliver the old child's close event after that
+    // replacement has already begun initialize. Never let a stale close
+    // reject the replacement child's pending RPCs.
+    if (this.child !== child) return;
+    this.child = null;
+    this.reader = null;
+    this.initialized = false;
+    this.loadedThreadIds.clear();
+    this.failPending(
+      new Error(
+        `Codex App Server exited before completing the turn (code=${code ?? "?"}, signal=${signal ?? "?"}).`,
+      ),
+    );
   }
 
   private handleLine(line: string): void {
@@ -1513,6 +1538,40 @@ interface ActiveCodexTurn {
  */
 let activeCodexTurn: ActiveCodexTurn | null = null;
 
+/** Keep phone-side companion presence alive independently of task polling. */
+async function maintainCompanionHeartbeat(
+  isStopping: () => boolean,
+): Promise<void> {
+  let lastHealthy: boolean | undefined;
+  while (!isStopping()) {
+    try {
+      const response = await requestBridge(
+        { type: "heartbeat", requestId: randomUUID() },
+        { timeoutMs: COMPANION_HEARTBEAT_TIMEOUT_MS },
+      );
+      if (response.ok !== true) {
+        throw new Error(
+          typeof response.message === "string"
+            ? response.message
+            : "The phone bridge rejected the companion heartbeat.",
+        );
+      }
+      if (lastHealthy === false) {
+        console.error("[phone-assistant-companion] phone bridge heartbeat restored");
+      }
+      lastHealthy = true;
+    } catch (error) {
+      if (lastHealthy !== false) {
+        console.error(
+          `[phone-assistant-companion] phone bridge heartbeat unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      lastHealthy = false;
+    }
+    if (!isStopping()) await delay(COMPANION_HEARTBEAT_INTERVAL_MS);
+  }
+}
+
 export async function runAssistantCompanion(): Promise<void> {
   const pollIntervalMs = parsePollInterval(process.env.PHONE_ASSISTANT_POLL_MS);
   let stopping = false;
@@ -1531,6 +1590,26 @@ export async function runAssistantCompanion(): Promise<void> {
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
+
+  let codexWarmup: Promise<boolean> | null = null;
+  const scheduleCodexWarmup = (scope: string): void => {
+    // Codex startup can take longer than the phone presence lease. Keep the
+    // bridge poll loop alive while warming the App Server in the background.
+    if (codexWarmup) return;
+    const operation = prewarmCodexClient(codexClient, scope);
+    codexWarmup = operation;
+    void operation.then(
+      () => {
+        if (codexWarmup === operation) codexWarmup = null;
+      },
+      (error) => {
+        console.error(
+          `[phone-assistant-companion] Codex warmup runner failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        if (codexWarmup === operation) codexWarmup = null;
+      },
+    );
+  };
 
   console.error(
     "[phone-assistant-companion] waiting for a request typed in the Android app",
@@ -1551,8 +1630,9 @@ export async function runAssistantCompanion(): Promise<void> {
     "[phone-assistant-companion] a logged-in Codex CLI must be available on this companion host",
   );
 
+  const heartbeatPromise = maintainCompanionHeartbeat(() => stopping);
   try {
-    await prewarmCodexClient(codexClient, "codex-prewarm");
+    scheduleCodexWarmup("codex-prewarm");
     while (!stopping) {
       const pollStartedAt = performance.now();
       if (debugTimingEnabled()) logCompanionPhase("poll:start");
@@ -1570,7 +1650,7 @@ export async function runAssistantCompanion(): Promise<void> {
           }
           if (pending.warmupRequested === true) {
             logCompanionPhase("codex:warmup_requested");
-            await prewarmCodexClient(codexClient, "codex-app-open-warmup");
+            scheduleCodexWarmup("codex-app-open-warmup");
           }
           if (pending.ok === true && pending.available === true) {
             logCompanionPhase(
@@ -1608,7 +1688,9 @@ export async function runAssistantCompanion(): Promise<void> {
       if (!stopping) await delay(pollIntervalMs);
     }
   } finally {
+    stopping = true;
     if (pendingRun) await pendingRun;
+    await heartbeatPromise;
     await codexClient.close();
   }
 }
@@ -1793,8 +1875,6 @@ async function processPendingRequest(
 }
 
 async function processPendingSteer(active: ActiveCodexTurn): Promise<void> {
-  if (!active.client.isTurnInFlight) return;
-
   const pending = await requestBridge(
     {
       type: "pending_steer",

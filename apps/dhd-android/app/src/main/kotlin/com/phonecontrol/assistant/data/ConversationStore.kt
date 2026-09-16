@@ -397,7 +397,7 @@ class ConversationStore(context: Context) {
         StartedRun(DHD_CONVERSATION_ID, runId, messageId)
     }
 
-    /** Start a hidden local run for a Codex continuation with no new user message. */
+    /** Start a hidden local run for a Codex continuation with no local user message. */
     fun startContinuationRun(runId: String, requestedConversationId: String? = null): StartedRun? = synchronized(lock) {
         val now = System.currentTimeMillis()
         val conversationId = canonicalConversationId(requestedConversationId)

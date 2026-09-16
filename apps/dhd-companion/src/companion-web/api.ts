@@ -13,17 +13,19 @@ export interface CompanionSettingsSnapshot {
   port: number;
   tokenConfigured: boolean;
   pairingConfigured: boolean;
+  /** Safe device identifier used to label the matching discovered phone. */
+  pairedDeviceId?: string;
 }
 
-export interface CompanionSettingsInput {
-  host: string;
-  port: number;
-  /** An empty value keeps the token already saved in the companion. */
-  token?: string;
+export interface PairingDeviceInput {
+  deviceId: string;
 }
 
-export interface PairingInput {
-  code: string;
+/** Safe-to-display discovery metadata; no bridge token or pairing nonce. */
+export interface DiscoveredPhoneSnapshot {
+  deviceId: string;
+  deviceName: string;
+  model?: string;
 }
 
 export interface PhoneSnapshot {
@@ -103,11 +105,9 @@ export interface BridgeCheckResult {
 
 export interface CompanionClientApi {
   getState(): Promise<CompanionState>;
-  saveSettings(input: CompanionSettingsInput): Promise<CompanionState>;
-  pairWithPhone(input: PairingInput): Promise<CompanionState>;
+  discoverPhones(): Promise<DiscoveredPhoneSnapshot[]>;
+  pairWithDiscoveredPhone(input: PairingDeviceInput): Promise<CompanionState>;
   checkConnection(): Promise<BridgeCheckResult>;
-  startCompanion(): Promise<CompanionState>;
-  stopCompanion(): Promise<CompanionState>;
   clearLogs(): Promise<CompanionState>;
   clearToolCalls(): Promise<CompanionState>;
   onState(callback: (state: CompanionState) => void): () => void;

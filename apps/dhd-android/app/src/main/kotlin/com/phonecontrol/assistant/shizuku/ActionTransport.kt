@@ -553,8 +553,9 @@ class TypedPhoneActionTransport(
                 if (current.taskId != session.taskId || current.displayId != session.displayId) {
                     return@withSession unavailableProcessResult("The task display changed before input dispatch.")
                 }
-                val scoped = when (command.firstOrNull()) {
-                    "input" -> listOf("input", "-d", session.displayId.toString()) + command.drop(1)
+                val inputCommand = scaleTaskInputCommand(session, command)
+                val scoped = when (inputCommand.firstOrNull()) {
+                    "input" -> listOf("input", "-d", session.displayId.toString()) + inputCommand.drop(1)
                     else -> command
                 }
                 processRunner.run(scoped)
@@ -571,6 +572,41 @@ class TypedPhoneActionTransport(
         stdout = ByteArray(0),
         stderr = message,
     )
+
+    /** Map the fixed observation space into an app logical canvas when needed. */
+    private fun scaleTaskInputCommand(
+        session: TaskDisplaySession,
+        command: List<String>,
+    ): List<String> {
+        if (command.firstOrNull() != "input" ||
+            (session.appDisplayWidth == session.geometry.width &&
+                session.appDisplayHeight == session.geometry.height)
+        ) {
+            return command
+        }
+        val logicalWidth = session.appDisplayWidth
+        val logicalHeight = session.appDisplayHeight
+        fun scale(value: String, sourceSize: Int, targetSize: Int): String =
+            ((value.toLong() * targetSize + sourceSize / 2) / sourceSize)
+                .toInt()
+                .coerceIn(0, targetSize - 1)
+                .toString()
+
+        return command.toMutableList().apply {
+            when (getOrNull(1)) {
+                "tap" -> if (size >= 4) {
+                    this[2] = scale(this[2], session.geometry.width, logicalWidth)
+                    this[3] = scale(this[3], session.geometry.height, logicalHeight)
+                }
+                "swipe" -> if (size >= 6) {
+                    this[2] = scale(this[2], session.geometry.width, logicalWidth)
+                    this[3] = scale(this[3], session.geometry.height, logicalHeight)
+                    this[4] = scale(this[4], session.geometry.width, logicalWidth)
+                    this[5] = scale(this[5], session.geometry.height, logicalHeight)
+                }
+            }
+        }
+    }
 
     private suspend fun freshCheck(
         action: PhoneAction,

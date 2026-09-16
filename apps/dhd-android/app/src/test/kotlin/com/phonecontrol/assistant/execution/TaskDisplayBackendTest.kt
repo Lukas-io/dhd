@@ -18,6 +18,27 @@ class TaskDisplayBackendTest {
     }
 
     @Test
+    fun `full-size app layout uses a larger logical canvas without changing stream geometry`() {
+        val standard = TaskDisplaySpec()
+
+        val fullSize = standard.withFullSizeAppLayout(enabled = true)
+
+        assertEquals(standard.width, fullSize.width)
+        assertEquals(standard.height, fullSize.height)
+        assertEquals(standard.densityDpi, fullSize.densityDpi)
+        assertEquals(standard.densityDpi, fullSize.appDensityDpi)
+        assertEquals(945, fullSize.appDisplayWidth)
+        assertEquals(2_048, fullSize.appDisplayHeight)
+    }
+
+    @Test
+    fun `standard app layout remains unchanged when full-size mode is disabled`() {
+        val standard = TaskDisplaySpec()
+
+        assertEquals(standard, standard.withFullSizeAppLayout(enabled = false))
+    }
+
+    @Test
     fun `display sessions reject the default display`() {
         assertThrows(IllegalArgumentException::class.java) {
             TaskDisplaySession(
