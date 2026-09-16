@@ -4631,8 +4631,19 @@ private fun SettingsSectionFooter(text: String) {
 private fun LiveDisplayPreviewState.belongsToRun(runSessionKey: String?): Boolean =
     runSessionKey != null && (sessionKey == runSessionKey || this.runSessionKey == runSessionKey)
 
-private fun LiveDisplayPreviewState.belongsToGroup(groupId: String): Boolean =
-    sessionKey == groupId || runSessionKey == groupId
+/**
+ * Conversation cards are keyed by coordinator run, not by the retained
+ * native display owner. A later run can claim the same display, so accepting
+ * both identities here would mount one live preview in both the old and new
+ * task cards. Keep the display-key fallback for callers that do not have a
+ * run binding yet.
+ */
+internal fun LiveDisplayPreviewState.belongsToGroup(groupId: String): Boolean =
+    if (runSessionKey != null) {
+        runSessionKey == groupId
+    } else {
+        sessionKey == groupId
+    }
 
 private fun LiveDisplayPreviewState.isExpanded(expandedSessionKey: String?): Boolean =
     expandedSessionKey != null &&

@@ -2,6 +2,7 @@ package com.phonecontrol.assistant.ui
 
 import com.phonecontrol.assistant.data.TimelineItem
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -64,6 +65,16 @@ class TimelineGroupingTest {
         assertEquals(2, groups.size)
         assertEquals(setOf(firstRunId), groups[0].runIds)
         assertEquals(setOf(secondRunId), groups[1].runIds)
+    }
+
+    @Test
+    fun `retained display preview follows current run instead of old display owner`() {
+        val preview = LiveDisplayPreviewState.live(
+            sessionKey = "old-display-owner",
+        ).copy(runSessionKey = "current-run")
+
+        assertFalse(preview.belongsToGroup("old-display-owner"))
+        assertTrue(preview.belongsToGroup("current-run"))
     }
 
     @Test
