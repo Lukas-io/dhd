@@ -6,5 +6,8 @@
     "composite": true
   },
   "include": ["src/**/*.ts", "src/**/*.cts"],
-  "exclude": ["node_modules", "dist", "tests"]
+  "exclude": ["node_modules", "dist", "tests"],
+  "references": [
+    { "path": "../../packages/screenshot-markers" }
+  ]
 }

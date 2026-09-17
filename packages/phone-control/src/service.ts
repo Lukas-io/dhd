@@ -99,7 +99,6 @@ interface SequenceActionExecution {
 const DEFAULT_WAIT_TIMEOUT_MS = 10_000;
 const MAX_WAIT_TIMEOUT_MS = 30_000;
 const DEFAULT_POLL_INTERVAL_MS = 250;
-const POINTER_START_DELAY_MS = 150;
 const DEFAULT_ACTION_LOG_PATH = resolve(
   process.cwd(),
   "logs",
@@ -1545,7 +1544,6 @@ export class PhoneControlService {
         outcome: "pending",
         phase: "start"
       });
-      await this.#sleep(POINTER_START_DELAY_MS);
     }
 
     const preflightMs = elapsedMilliseconds(preflightStarted);

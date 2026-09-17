@@ -973,7 +973,12 @@ describe("phone-control service safety", () => {
     adb.tap = async () => {
       order.push("tap");
     };
-    const service = createService(adb, logger);
+    const sleeps: number[] = [];
+    const service = createService(adb, logger, {
+      sleep: async (milliseconds) => {
+        sleeps.push(milliseconds);
+      }
+    });
     const observed = await service.observe();
 
     await service.execute({
@@ -982,6 +987,7 @@ describe("phone-control service safety", () => {
     });
 
     expect(order.slice(0, 2)).toEqual(["audit:start", "tap"]);
+    expect(sleeps).toEqual([]);
   });
 
   it("rejects coordinates outside the current display", async () => {

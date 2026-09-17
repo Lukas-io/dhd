@@ -15,4 +15,18 @@ data class PhoneProcessResult(
  */
 interface PhoneProcessRunner {
     suspend fun run(command: List<String>): PhoneProcessResult
+
+    /**
+     * Run a command and notify the caller when the underlying process
+     * transport has accepted the request. Implementations that cannot expose
+     * a later boundary retain the safe fallback of invoking the callback just
+     * before the command starts.
+     */
+    suspend fun run(
+        command: List<String>,
+        onStarted: (() -> Unit)?,
+    ): PhoneProcessResult {
+        onStarted?.invoke()
+        return run(command)
+    }
 }

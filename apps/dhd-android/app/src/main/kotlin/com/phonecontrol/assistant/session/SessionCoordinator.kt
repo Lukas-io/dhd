@@ -2,6 +2,7 @@ package com.phonecontrol.assistant.session
 
 import com.phonecontrol.assistant.domain.ActivityEvent
 import com.phonecontrol.assistant.domain.ActivityEventKind
+import com.phonecontrol.assistant.domain.ClickPhase
 import com.phonecontrol.assistant.domain.ObservationSnapshot
 import com.phonecontrol.assistant.domain.PhoneAction
 import com.phonecontrol.assistant.domain.ReasoningEffort
@@ -163,7 +164,7 @@ class SessionCoordinator(
     val events: StateFlow<List<ActivityEvent>> = _events.asStateFlow()
     val toolCalls: StateFlow<List<DhdToolCall>> = _toolCalls.asStateFlow()
 
-    /** Latest successful task-display gesture for the read-only live preview. */
+    /** Latest task-display pointer feedback for the read-only live preview. */
     val pointerEvent: StateFlow<TaskPointerEvent?> = _pointerEvent.asStateFlow()
 
     /** Stable owner key used by the phone bridge to choose the task display. */
@@ -880,7 +881,47 @@ class SessionCoordinator(
             observationId = action.metadata.observationId,
             targetDescription = action.metadata.targetDescription,
         )
-        val result = transport.executeForSession(targetSessionKey, action, observation)
+        val tapAction = action as? TapAction
+        val stillActiveBeforeDispatch = synchronized(lock) {
+            _state.value.sessionIdOrNull == running.sessionId && _state.value.isActive
+        }
+        if (!stillActiveBeforeDispatch) return ActionExecutionResult.SessionNotRunning
+
+        var clickPressPublished = false
+        val beforeInput = if (tapAction != null && observation != null) {
+            {
+                if (!clickPressPublished) {
+                    clickPressPublished = true
+                    publishPointerEvent(
+                        sessionId = running.sessionId,
+                        action = tapAction,
+                        observation = observation,
+                        clickPhase = ClickPhase.PRESSED,
+                    )
+                }
+            }
+        } else {
+            null
+        }
+        val onPointerMove = if (tapAction != null && observation != null) {
+            {
+                publishPointerEvent(
+                    sessionId = running.sessionId,
+                    action = tapAction,
+                    observation = observation,
+                    clickPhase = ClickPhase.MOVING,
+                )
+            }
+        } else {
+            null
+        }
+        val result = transport.executeForSession(
+            targetSessionKey,
+            action,
+            observation,
+            beforeInput,
+            onPointerMove,
+        )
         val stillActive = synchronized(lock) {
             _state.value.sessionIdOrNull == running.sessionId && _state.value.isActive
         }
@@ -890,7 +931,7 @@ class SessionCoordinator(
         } else {
             ActivityEventKind.ACTION_FAILED
         }
-        if (result is TransportResult.Succeeded) {
+        if (result is TransportResult.Succeeded && action !is TapAction) {
             publishPointerEvent(running.sessionId, action, observation)
         }
         appendEvent(
@@ -906,14 +947,17 @@ class SessionCoordinator(
         return ActionExecutionResult.TransportFinished(result)
     }
 
-    /** Publish visual feedback only after the display-scoped command succeeds. */
+    /** Publish visual feedback for a gesture or one phase of a click. */
     private fun publishPointerEvent(
         sessionId: String,
         action: PhoneAction,
         observation: ObservationSnapshot?,
+        clickPhase: ClickPhase = ClickPhase.PRESSED,
     ) = synchronized(lock) {
         val current = _state.value
-        if (current.sessionIdOrNull != sessionId || !current.isActive || observation == null) return@synchronized
+        if (current.sessionIdOrNull != sessionId || !current.isActive || observation == null) {
+            return@synchronized
+        }
         val sequence = (_pointerEvent.value?.sequence ?: 0L) + 1L
         val nextEvent = when (action) {
             is TapAction -> TaskPointerEvent.Click(
@@ -923,6 +967,7 @@ class SessionCoordinator(
                 y = action.y,
                 displayWidth = observation.width,
                 displayHeight = observation.height,
+                phase = clickPhase,
             )
 
             is SwipeAction -> TaskPointerEvent.Swipe(

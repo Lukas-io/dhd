@@ -558,21 +558,22 @@ describe("DHD phone tool contract", () => {
     }).success).toBe(false);
   });
 
-  it("accepts an optional scroll gesture center in both execution surfaces", () => {
-    const scroll = {
-      type: "scroll" as const,
-      direction: "down" as const,
-      amount: "medium" as const,
-      x: 180,
-      y: 600,
+  it("accepts coordinate-scoped swipes in both execution surfaces", () => {
+    const swipe = {
+      type: "swipe" as const,
+      startX: 180,
+      startY: 600,
+      endX: 180,
+      endY: 200,
+      durationMs: 350,
       metadata
     };
 
-    expect(dhdExecuteActionSchema.safeParse(scroll).success).toBe(true);
+    expect(dhdExecuteActionSchema.safeParse(swipe).success).toBe(true);
     expect(dhdExecuteSequenceInputSchema.safeParse({
       observationId: "obs-1",
       actions: [{
-        ...scroll,
+        ...swipe,
         metadata: {
           purpose: metadata.purpose,
           targetDescription: metadata.targetDescription

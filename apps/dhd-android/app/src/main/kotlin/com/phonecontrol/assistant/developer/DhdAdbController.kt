@@ -279,11 +279,19 @@ class DhdAdbController(context: Context) {
         }
     }
 
-    internal suspend fun execute(command: List<String>, binaryOutput: Boolean = false): PhoneProcessResult =
+    internal suspend fun execute(
+        command: List<String>,
+        binaryOutput: Boolean = false,
+        onStarted: (() -> Unit)? = null,
+    ): PhoneProcessResult =
         commandMutex.withLock {
             if (!started.get() || !isPaired()) return@withLock unavailableResult()
             try {
-                val result = maintenanceBootstrap.client().execute(command, binaryOutput)
+                val result = maintenanceBootstrap.client().execute(
+                    command,
+                    binaryOutput,
+                    onStarted,
+                )
                 if (result.exitCode == null && !result.timedOut) {
                     handleMaintenanceUnavailable(result.stderr)
                 }

@@ -19,6 +19,7 @@ import com.phonecontrol.assistant.domain.SwipeAction
 import com.phonecontrol.assistant.domain.TapAction
 import com.phonecontrol.assistant.domain.TypeAction
 import com.phonecontrol.assistant.domain.WaitAction
+import com.phonecontrol.assistant.domain.TASK_CLICK_MOVE_DURATION_MS
 import kotlinx.coroutines.delay
 
 sealed interface TransportResult {
@@ -31,8 +32,8 @@ sealed interface TransportResult {
     data class Succeeded(
         val message: String,
         /**
-         * The exact screenshot captured by the freshness check immediately
-         * before input dispatch. This is diagnostic metadata for the desktop
+         * The exact screenshot captured by the freshness check that approved
+         * input dispatch. This is diagnostic metadata for the desktop
          * companion and is never part of the model-facing action result.
          */
         val beforeScreenshot: ByteArray? = null,
@@ -60,7 +61,15 @@ interface PhoneActionTransport {
         sessionKey: String,
         action: PhoneAction,
         observation: ObservationSnapshot?,
-    ): TransportResult = execute(action, observation)
+        /** Called when the transport is handing the physical input to the bridge. */
+        beforeInput: (() -> Unit)? = null,
+        /** Called after transport preflight and before the cursor starts moving. */
+        onPointerMove: (() -> Unit)? = null,
+    ): TransportResult {
+        onPointerMove?.invoke()
+        beforeInput?.invoke()
+        return execute(action, observation)
+    }
 
     /** Invalidate queued/in-flight work before a task display is released. */
     fun cancelSession(sessionKey: String) = Unit
@@ -127,10 +136,14 @@ class TypedPhoneActionTransport(
         sessionKey: String,
         action: PhoneAction,
         observation: ObservationSnapshot?,
+        beforeInput: (() -> Unit)?,
+        onPointerMove: (() -> Unit)?,
     ): TransportResult = executeInternal(
         sessionKey = sessionKey,
         action = action,
         observation = observation,
+        beforeInput = beforeInput,
+        onPointerMove = onPointerMove,
     )
 
     override fun cancelSession(sessionKey: String) {
@@ -181,6 +194,8 @@ class TypedPhoneActionTransport(
         sessionKey: String?,
         action: PhoneAction,
         observation: ObservationSnapshot?,
+        beforeInput: (() -> Unit)? = null,
+        onPointerMove: (() -> Unit)? = null,
     ): TransportResult {
         if (!executionReadyProvider()) {
             return TransportResult.Rejected(
@@ -224,7 +239,13 @@ class TypedPhoneActionTransport(
 
         return when (action) {
             is OpenAppAction -> openApp(action, observation, sessionKey)
-            is TapAction -> tap(action, requireObservation(observation), sessionKey)
+            is TapAction -> tap(
+                action,
+                requireObservation(observation),
+                sessionKey,
+                beforeInput,
+                onPointerMove,
+            )
             is TypeAction -> type(action, requireObservation(observation), sessionKey)
             is SwipeAction -> swipe(action, requireObservation(observation), sessionKey)
             is BackAction -> back(action, requireObservation(observation), sessionKey)
@@ -340,6 +361,8 @@ class TypedPhoneActionTransport(
         action: TapAction,
         observation: ObservationSnapshot,
         sessionKey: String?,
+        beforeInput: (() -> Unit)?,
+        onPointerMove: (() -> Unit)?,
     ): TransportResult {
         val before = when (val check = freshCheck(action, observation, sessionKey)) {
             is FreshCheck.Rejected -> return check.result
@@ -353,7 +376,13 @@ class TypedPhoneActionTransport(
             )
         }
 
-        val result = runForSession(sessionKey, listOf("input", "tap", action.x.toString(), action.y.toString()), observation)
+        val result = runForSession(
+            sessionKey,
+            listOf("input", "tap", action.x.toString(), action.y.toString()),
+            observation,
+            beforeInput,
+            onPointerMove,
+        )
         return commandResult(
             result,
             successMessage = "Tapped ${action.x},${action.y}: ${action.metadata.purpose}",
@@ -481,19 +510,27 @@ class TypedPhoneActionTransport(
         sessionKey: String?,
         command: List<String>,
         observation: ObservationSnapshot,
+        beforeInput: (() -> Unit)? = null,
+        onPointerMove: (() -> Unit)? = null,
     ): PhoneProcessResult {
-        if (sessionKey == null) return processRunner.run(command)
+        if (sessionKey == null) {
+            onPointerMove?.invoke()
+            if (onPointerMove != null) delay(TASK_CLICK_MOVE_DURATION_MS)
+            return processRunner.run(command, onStarted = beforeInput)
+        }
         val session = taskDisplayBackend?.current(sessionKey)
             ?: return unavailableProcessResult("The task display is no longer available.")
         if (observation.taskSessionKey != sessionKey || observation.taskId != session.taskId) {
             return unavailableProcessResult("The task display changed before input dispatch.")
         }
-        return runOnTaskDisplay(session, command)
+        return runOnTaskDisplay(session, command, beforeInput, onPointerMove)
     }
 
     private suspend fun runOnTaskDisplay(
         session: TaskDisplaySession,
         command: List<String>,
+        beforeInput: (() -> Unit)? = null,
+        onPointerMove: (() -> Unit)? = null,
     ): PhoneProcessResult {
         val backend = taskDisplayBackend
             ?: return unavailableProcessResult("The task display is no longer available.")
@@ -509,7 +546,9 @@ class TypedPhoneActionTransport(
                     "input" -> listOf("input", "-d", session.displayId.toString()) + inputCommand.drop(1)
                     else -> command
                 }
-                processRunner.run(scoped)
+                onPointerMove?.invoke()
+                if (onPointerMove != null) delay(TASK_CLICK_MOVE_DURATION_MS)
+                processRunner.run(scoped, onStarted = beforeInput)
             }
         } catch (error: kotlinx.coroutines.CancellationException) {
             throw error

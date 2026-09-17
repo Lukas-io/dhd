@@ -4,8 +4,8 @@ package com.phonecontrol.assistant.domain
  * A gesture that the task-display preview can render as visual feedback.
  *
  * These events are presentation metadata only. They never grant the preview
- * an input path and are emitted only after the corresponding phone command
- * has completed successfully.
+ * an input path. Click movement is emitted after transport preflight and
+ * before dispatch, while the pressed phase is emitted at the input boundary.
  */
 sealed interface TaskPointerEvent {
     val sequence: Long
@@ -20,6 +20,7 @@ sealed interface TaskPointerEvent {
         val y: Int,
         override val displayWidth: Int,
         override val displayHeight: Int,
+        val phase: ClickPhase = ClickPhase.PRESSED,
     ) : TaskPointerEvent
 
     data class Swipe(
@@ -34,3 +35,10 @@ sealed interface TaskPointerEvent {
         override val displayHeight: Int,
     ) : TaskPointerEvent
 }
+
+enum class ClickPhase {
+    MOVING,
+    PRESSED,
+}
+
+const val TASK_CLICK_MOVE_DURATION_MS = 120L
