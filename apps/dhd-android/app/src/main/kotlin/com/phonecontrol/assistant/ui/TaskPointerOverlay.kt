@@ -34,14 +34,18 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.phonecontrol.assistant.domain.ClickPhase
 import com.phonecontrol.assistant.domain.ScrollDirection
 import com.phonecontrol.assistant.domain.TaskPointerEvent
+import com.phonecontrol.assistant.domain.TASK_CLICK_MOVE_DURATION_MS
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.max
+
+private const val CLICK_PRESS_DURATION_MS = 150L
+private const val CLICK_PRESS_DOWN_MS = 60
 
 private enum class CursorMode {
     ARROW,
@@ -73,8 +77,7 @@ internal fun TaskPointerOverlay(
 ) {
     val cursorX = remember { Animatable(0f) }
     val cursorY = remember { Animatable(0f) }
-    val clickPulse = remember { Animatable(0f) }
-    val clickRotation = remember { Animatable(0f) }
+    val clickScale = remember { Animatable(1f) }
     val trackAlpha = remember { Animatable(0f) }
     var cursorMode by remember { mutableStateOf<CursorMode?>(null) }
     var gestureEvent by remember { mutableStateOf<TaskPointerEvent?>(null) }
@@ -96,6 +99,19 @@ internal fun TaskPointerOverlay(
             gestureEvent = null
             showBadge = false
             trackAlpha.snapTo(0f)
+            if (pointer is TaskPointerEvent.Click) {
+                cursorMode = CursorMode.ARROW
+                val target = mapDisplayPoint(
+                    pointer.x,
+                    pointer.y,
+                    pointer.displayWidth,
+                    pointer.displayHeight,
+                )
+                cursorX.snapTo(target.x)
+                cursorY.snapTo(target.y)
+                clickScale.snapTo(1f)
+                hasCursor = true
+            }
             return@LaunchedEffect
         }
         if (pointer?.sequence == lastSeenSequence) return@LaunchedEffect
@@ -114,39 +130,44 @@ internal fun TaskPointerOverlay(
                 gestureEvent = null
                 showBadge = false
                 trackAlpha.snapTo(0f)
-                moveCursor(
-                    cursorX = cursorX,
-                    cursorY = cursorY,
-                    target = mapDisplayPoint(
-                        pointer.x,
-                        pointer.y,
-                        pointer.displayWidth,
-                        pointer.displayHeight,
-                    ),
-                    hasCursor = hasCursor,
+                val target = mapDisplayPoint(
+                    pointer.x,
+                    pointer.y,
+                    pointer.displayWidth,
+                    pointer.displayHeight,
                 )
-                hasCursor = true
-                clickPulse.snapTo(0f)
-                clickRotation.snapTo(0f)
-                kotlinx.coroutines.coroutineScope {
-                    launch {
-                        clickPulse.animateTo(1f, tween(480, easing = LinearEasing))
+                when (pointer.phase) {
+                    ClickPhase.MOVING -> {
+                        moveCursor(
+                            cursorX = cursorX,
+                            cursorY = cursorY,
+                            target = target,
+                            hasCursor = hasCursor,
+                            durationMs = TASK_CLICK_MOVE_DURATION_MS,
+                        )
+                        hasCursor = true
+                        clickScale.snapTo(1f)
                     }
-                    launch {
-                        clickRotation.animateTo(
-                            targetValue = 0f,
+
+                    ClickPhase.PRESSED -> {
+                        // Freshness capture and visual travel can overlap, so
+                        // snap here as a guard against a late recomposition
+                        // or a newly attached preview surface.
+                        cursorX.snapTo(target.x)
+                        cursorY.snapTo(target.y)
+                        hasCursor = true
+                        clickScale.snapTo(1f)
+                        clickScale.animateTo(
+                            targetValue = 1f,
                             animationSpec = keyframes {
-                                durationMillis = 480
-                                32f at 135
-                                32f at 265
-                                -4f at 390
-                                0f at 480
+                                durationMillis = CLICK_PRESS_DURATION_MS.toInt()
+                                0.78f at CLICK_PRESS_DOWN_MS
+                                1f at CLICK_PRESS_DURATION_MS.toInt()
                             },
                         )
+                        clickScale.snapTo(1f)
                     }
                 }
-                clickPulse.snapTo(0f)
-                clickRotation.snapTo(0f)
             }
 
             is TaskPointerEvent.Scroll,
@@ -200,8 +221,7 @@ internal fun TaskPointerOverlay(
             } else if (cursorMode == CursorMode.ARROW && pointer is TaskPointerEvent.Click) {
                 drawArrow(
                     point = Offset(cursorX.value * size.width, cursorY.value * size.height),
-                    rotation = clickRotation.value,
-                    pulse = clickPulse.value,
+                    scaleFactor = clickScale.value,
                 )
             }
         }
@@ -238,6 +258,7 @@ private suspend fun moveCursor(
     cursorY: Animatable<Float, AnimationVector1D>,
     target: Offset,
     hasCursor: Boolean,
+    durationMs: Long = 200L,
 ) {
     if (!hasCursor) {
         cursorX.snapTo(target.x)
@@ -245,8 +266,8 @@ private suspend fun moveCursor(
         return
     }
     kotlinx.coroutines.coroutineScope {
-        launch { cursorX.animateTo(target.x, tween(200, easing = LinearEasing)) }
-        launch { cursorY.animateTo(target.y, tween(200, easing = LinearEasing)) }
+        launch { cursorX.animateTo(target.x, tween(durationMs.toInt(), easing = LinearEasing)) }
+        launch { cursorY.animateTo(target.y, tween(durationMs.toInt(), easing = LinearEasing)) }
     }
 }
 
@@ -314,8 +335,8 @@ private fun normalizedPoint(x: Int, y: Int, width: Int, height: Int): Offset = O
     y = y.coerceIn(0, height - 1).toFloat() / height,
 )
 
-private fun DrawScope.drawArrow(point: Offset, rotation: Float, pulse: Float) {
-    val scale = 16.dp.toPx() / 48f
+private fun DrawScope.drawArrow(point: Offset, scaleFactor: Float) {
+    val scale = 16.dp.toPx() / 48f * scaleFactor
     val left = point.x - 4f * scale
     val top = point.y - 4f * scale
     val path = Path().apply {
@@ -325,27 +346,17 @@ private fun DrawScope.drawArrow(point: Offset, rotation: Float, pulse: Float) {
         lineTo(left + 16f * scale, top + 38f * scale)
         close()
     }
-    if (pulse > 0f) {
-        drawCircle(
-            color = Color(0xFF00E6FF).copy(alpha = (1f - pulse) * 0.45f),
-            radius = 5.dp.toPx() + 16.dp.toPx() * pulse,
-            center = point,
-            style = Stroke(width = 2.dp.toPx()),
-        )
-    }
-    rotate(rotation, pivot = point) {
-        drawPath(
-            path = path,
-            color = Color(0xFF00E6FF).copy(alpha = 0.42f),
-            style = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round),
-        )
-        drawPath(path = path, color = Color(0xFF2B8CDB))
-        drawPath(
-            path = path,
-            color = Color.White,
-            style = Stroke(width = 1.3.dp.toPx(), join = StrokeJoin.Round),
-        )
-    }
+    drawPath(
+        path = path,
+        color = Color(0xFF00E6FF).copy(alpha = 0.42f),
+        style = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round),
+    )
+    drawPath(path = path, color = Color(0xFF2B8CDB))
+    drawPath(
+        path = path,
+        color = Color.White,
+        style = Stroke(width = 1.3.dp.toPx(), join = StrokeJoin.Round),
+    )
 }
 
 private fun DrawScope.drawMouse(

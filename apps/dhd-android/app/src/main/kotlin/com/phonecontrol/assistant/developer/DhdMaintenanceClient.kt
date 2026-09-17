@@ -34,7 +34,11 @@ internal class DhdMaintenanceClient(
                 displayLogicalCanvas
     }
 
-    fun execute(command: List<String>, binaryOutput: Boolean = false): PhoneProcessResult {
+    fun execute(
+        command: List<String>,
+        binaryOutput: Boolean = false,
+        onStarted: (() -> Unit)? = null,
+    ): PhoneProcessResult {
         require(command.isNotEmpty()) { "A maintenance command must not be empty." }
         Socket().use { socket ->
             socket.tcpNoDelay = true
@@ -44,6 +48,11 @@ internal class DhdMaintenanceClient(
             val output = DataOutputStream(socket.getOutputStream())
             DhdMaintenanceProtocol.writeRequest(output, token, command, binaryOutput)
             output.flush()
+            // The request is now on the daemon's loopback socket. This is the
+            // closest boundary the app can observe before the daemon starts
+            // the actual /system/bin process, and avoids showing the press
+            // pulse while the client is still connecting or serializing args.
+            onStarted?.invoke()
             val response = DhdMaintenanceProtocol.readResponse(input)
             return PhoneProcessResult(
                 exitCode = response.exitCode.takeUnless { it == DhdMaintenanceProtocol.EXIT_CODE_UNAVAILABLE },

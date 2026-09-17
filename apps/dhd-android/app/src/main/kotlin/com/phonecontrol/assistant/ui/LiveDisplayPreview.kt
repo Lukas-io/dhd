@@ -111,7 +111,7 @@ data class LiveDisplayPreviewState(
      * current run's message group.
      */
     val runSessionKey: String? = null,
-    /** Latest successful gesture to render above the read-only stream. */
+    /** Latest pointer feedback to render above the read-only stream. */
     val pointerEvent: TaskPointerEvent? = null,
     /** Sanitized purpose shown in the full-screen viewer footer. */
     val purpose: String? = null,

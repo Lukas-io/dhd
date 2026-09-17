@@ -1,7 +1,9 @@
 package com.phonecontrol.assistant.session
 
 import com.phonecontrol.assistant.domain.ActionMetadata
+import com.phonecontrol.assistant.domain.ClickPhase
 import com.phonecontrol.assistant.domain.ObservationSnapshot
+import com.phonecontrol.assistant.domain.PhoneAction
 import com.phonecontrol.assistant.domain.ReasoningEffort
 import com.phonecontrol.assistant.domain.ScreenProtection
 import com.phonecontrol.assistant.domain.ScreenProtectionStatus
@@ -97,6 +99,105 @@ class SessionCoordinatorTest {
         assertTrue(pointer is TaskPointerEvent.Click)
         assertEquals(500, (pointer as TaskPointerEvent.Click).x)
         assertEquals(900, pointer.y)
+        assertEquals(ClickPhase.PRESSED, pointer.phase)
+    }
+
+    @Test
+    fun `click movement is published before input and press at the input boundary`() = runTest {
+        val phases = mutableListOf<ClickPhase>()
+        lateinit var coordinator: SessionCoordinator
+        val transport = object : PhoneActionTransport {
+            override suspend fun execute(
+                action: PhoneAction,
+                observation: ObservationSnapshot?,
+            ): TransportResult = TransportResult.Succeeded("executed")
+
+            override suspend fun executeForSession(
+                sessionKey: String,
+                action: PhoneAction,
+                observation: ObservationSnapshot?,
+                beforeInput: (() -> Unit)?,
+                onPointerMove: (() -> Unit)?,
+            ): TransportResult {
+                onPointerMove?.invoke()
+                phases += (coordinator.pointerEvent.value as TaskPointerEvent.Click).phase
+                beforeInput?.invoke()
+                phases += (coordinator.pointerEvent.value as TaskPointerEvent.Click).phase
+                return TransportResult.Succeeded("executed")
+            }
+        }
+        coordinator = SessionCoordinator(
+            enabledPackagesProvider = { setOf("com.example.shop") },
+            policyEngine = PolicyEngine(),
+            transport = transport,
+        )
+        coordinator.start("Buy dinner")
+
+        val result = coordinator.executeAction(
+            TapAction(
+                x = 500,
+                y = 900,
+                metadata = ActionMetadata(
+                    purpose = "Place order",
+                    observationId = observation.id,
+                    targetDescription = "Place order button",
+                ),
+            ),
+            observation,
+        )
+
+        assertTrue(result is ActionExecutionResult.TransportFinished)
+        assertEquals(listOf(ClickPhase.MOVING, ClickPhase.PRESSED), phases)
+        assertEquals(ClickPhase.PRESSED, (coordinator.pointerEvent.value as TaskPointerEvent.Click).phase)
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `click dispatch does not add a second travel wait`() = runTest {
+        var transportCalls = 0
+        val transport = object : PhoneActionTransport {
+            override suspend fun execute(
+                action: PhoneAction,
+                observation: ObservationSnapshot?,
+            ): TransportResult = TransportResult.Succeeded("executed")
+
+            override suspend fun executeForSession(
+                sessionKey: String,
+                action: PhoneAction,
+                observation: ObservationSnapshot?,
+                beforeInput: (() -> Unit)?,
+                onPointerMove: (() -> Unit)?,
+            ): TransportResult {
+                onPointerMove?.invoke()
+                beforeInput?.invoke()
+                transportCalls += 1
+                return TransportResult.Succeeded("executed")
+            }
+        }
+        val coordinator = SessionCoordinator(
+            enabledPackagesProvider = { setOf("com.example.shop") },
+            policyEngine = PolicyEngine(),
+            transport = transport,
+        )
+        coordinator.start("Buy dinner")
+
+        fun tap(x: Int, y: Int) = TapAction(
+            x = x,
+            y = y,
+            metadata = ActionMetadata(
+                purpose = "Place order",
+                observationId = observation.id,
+                targetDescription = "Place order button",
+            ),
+        )
+
+        coordinator.executeAction(tap(500, 900), observation)
+        val second = async { coordinator.executeAction(tap(700, 1200), observation) }
+
+        runCurrent()
+        assertTrue(second.isCompleted)
+        assertEquals(2, transportCalls)
+        assertTrue(second.await() is ActionExecutionResult.TransportFinished)
     }
 
     @Test
