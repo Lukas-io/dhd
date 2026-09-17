@@ -17,6 +17,7 @@ import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.produceState
+import androidx.lifecycle.lifecycleScope
 import com.phonecontrol.assistant.developer.TaskPreviewState
 import com.phonecontrol.assistant.execution.TaskDisplayRecord
 import com.phonecontrol.assistant.execution.TaskDisplaySession
@@ -31,6 +32,12 @@ import com.phonecontrol.assistant.ui.LiveDisplayPreviewState
 import com.phonecontrol.assistant.ui.LiveDisplayPreviewStatus
 import com.phonecontrol.assistant.ui.TaskDisplayLifecycle
 import com.phonecontrol.assistant.ui.TaskDisplayUiRecord
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+
+private const val CONVERSATION_EXPIRY_CHECK_INTERVAL_MS = 1_000L
 
 class MainActivity : ComponentActivity() {
     private var pendingRequest: String? = null
@@ -41,6 +48,7 @@ class MainActivity : ComponentActivity() {
     private var overlayPermissionGranted by mutableStateOf(false)
     private var pendingOverlayEnable = false
     private var overlayActivityToken: OverlayVisibilityGate.Token? = null
+    private var conversationExpiryMonitor: Job? = null
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
@@ -229,6 +237,21 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         val app = application as? PhoneControlApplication
+        app?.let {
+            // A conversation that aged out while the app was not visible is
+            // expired immediately. The foreground monitor below handles the
+            // separate case where the app stays open across the boundary.
+            it.conversationStore.expireInactiveConversation()
+            conversationExpiryMonitor?.cancel()
+            conversationExpiryMonitor = lifecycleScope.launch {
+                while (isActive) {
+                    delay(CONVERSATION_EXPIRY_CHECK_INTERVAL_MS)
+                    if (!it.conversationStore.conversationExpiryPrompt.value) {
+                        it.conversationStore.promptForInactiveConversation()
+                    }
+                }
+            }
+        }
         if (overlayActivityToken == null) {
             overlayActivityToken = app?.overlayVisibilityGate?.acquire(
                 com.phonecontrol.assistant.overlay.OverlayHideReason.DHD_ACTIVITY,
@@ -246,6 +269,9 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        conversationExpiryMonitor?.cancel()
+        conversationExpiryMonitor = null
+        (application as? PhoneControlApplication)?.conversationStore?.dismissInactiveConversationPrompt()
         overlayActivityToken?.close()
         overlayActivityToken = null
         super.onStop()

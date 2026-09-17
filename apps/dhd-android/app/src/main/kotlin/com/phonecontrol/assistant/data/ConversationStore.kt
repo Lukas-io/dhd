@@ -27,6 +27,10 @@ import java.util.UUID
 
 const val DHD_CONVERSATION_ID = "dhd-assistant"
 const val DHD_THREAD_INACTIVITY_MS = 3 * 60 * 60 * 1000L
+
+internal fun hasDhdConversationExpired(lastActivityEpochMs: Long, nowEpochMs: Long): Boolean =
+    nowEpochMs - lastActivityEpochMs >= DHD_THREAD_INACTIVITY_MS
+
 const val DHD_LIST_ALLOWED_APPS_TOOL = "dhd_list_allowed_apps"
 const val DHD_FOREGROUND_APP_TOOL = "dhd_get_foreground_app"
 const val DHD_EXECUTE_TOOL = "dhd_execute"
@@ -327,6 +331,8 @@ class ConversationStore(context: Context) {
     private val timelineFlows = mutableMapOf<String, MutableStateFlow<List<TimelineItem>>>()
 
     val conversations: StateFlow<List<ConversationSummary>> = _conversations.asStateFlow()
+    private val _conversationExpiryPrompt = MutableStateFlow(false)
+    val conversationExpiryPrompt: StateFlow<Boolean> = _conversationExpiryPrompt.asStateFlow()
 
     init {
         refreshConversations()
@@ -339,6 +345,58 @@ class ConversationStore(context: Context) {
         }.asStateFlow()
     }
 
+    /** Report whether the DHD conversation should ask the user before expiring. */
+    fun promptForInactiveConversation(nowEpochMs: Long = System.currentTimeMillis()): Boolean = synchronized(lock) {
+        val existing = dao.findConversation(DHD_CONVERSATION_ID)
+        val shouldPrompt = existing != null &&
+            hasDhdConversationExpired(existing.updatedAtEpochMs, nowEpochMs)
+        _conversationExpiryPrompt.value = shouldPrompt
+        shouldPrompt
+    }
+
+    fun dismissInactiveConversationPrompt() = synchronized(lock) {
+        _conversationExpiryPrompt.value = false
+    }
+
+    /** Keep a stale conversation and restart its inactivity window. */
+    fun keepInactiveConversation(nowEpochMs: Long = System.currentTimeMillis()): Boolean = synchronized(lock) {
+        val existing = dao.findConversation(DHD_CONVERSATION_ID) ?: run {
+            _conversationExpiryPrompt.value = false
+            return@synchronized false
+        }
+        if (!hasDhdConversationExpired(existing.updatedAtEpochMs, nowEpochMs)) {
+            _conversationExpiryPrompt.value = false
+            return@synchronized false
+        }
+
+        dao.updateConversation(
+            existing.copy(
+                updatedAtEpochMs = nowEpochMs,
+                deleted = false,
+            ),
+        )
+        _conversationExpiryPrompt.value = false
+        refreshConversations()
+        true
+    }
+
+    /** Clear the DHD conversation once it has been inactive for the full window. */
+    fun expireInactiveConversation(nowEpochMs: Long = System.currentTimeMillis()): Boolean = synchronized(lock) {
+        val existing = dao.findConversation(DHD_CONVERSATION_ID) ?: run {
+            _conversationExpiryPrompt.value = false
+            return@synchronized false
+        }
+        if (!hasDhdConversationExpired(existing.updatedAtEpochMs, nowEpochMs)) {
+            _conversationExpiryPrompt.value = false
+            return@synchronized false
+        }
+
+        clearConversationRows(DHD_CONVERSATION_ID)
+        _conversationExpiryPrompt.value = false
+        refreshConversations()
+        true
+    }
+
     fun startRun(runId: String, request: String, requestedConversationId: String? = null): StartedRun = synchronized(lock) {
         val now = System.currentTimeMillis()
         val safeRequest = request.trim().take(MAX_MESSAGE_CHARS)
@@ -349,12 +407,13 @@ class ConversationStore(context: Context) {
         // to require a full fresh conversation.
         val existing = dao.findConversation(DHD_CONVERSATION_ID)
         val resetConversation = existing != null &&
-            now - existing.updatedAtEpochMs >= DHD_THREAD_INACTIVITY_MS
+            hasDhdConversationExpired(existing.updatedAtEpochMs, now)
         if (resetConversation) {
             // A thread rotation is a full conversation reset from the user's
             // perspective. Keep the old remote Codex thread unbound, but clear
             // the local presentation history before creating the new run.
             clearConversationRows(DHD_CONVERSATION_ID)
+            _conversationExpiryPrompt.value = false
         }
         val conversation = if (existing == null || resetConversation) {
             ConversationEntity(
@@ -659,6 +718,9 @@ class ConversationStore(context: Context) {
         val canonicalId = canonicalConversationId(conversationId)
         if (dao.findConversation(canonicalId) == null) return@synchronized false
         clearConversationRows(canonicalId)
+        if (canonicalId == DHD_CONVERSATION_ID) {
+            _conversationExpiryPrompt.value = false
+        }
         // Keep the flow instance that Compose is already collecting alive and
         // publish the empty state before dropping it from the cache. A
         // collector must not stay stuck displaying the deleted timeline.

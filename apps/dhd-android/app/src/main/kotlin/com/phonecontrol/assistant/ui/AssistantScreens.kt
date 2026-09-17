@@ -71,6 +71,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
@@ -169,6 +170,79 @@ import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.random.Random
+
+private const val STALE_CONVERSATION_COUNTDOWN_SECONDS = 5
+
+@Composable
+internal fun ConversationExpiryDialog(
+    onKeep: () -> Unit,
+    onClear: () -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    var secondsRemaining by remember {
+        mutableStateOf(STALE_CONVERSATION_COUNTDOWN_SECONDS)
+    }
+
+    LaunchedEffect(Unit) {
+        for (remaining in STALE_CONVERSATION_COUNTDOWN_SECONDS downTo 1) {
+            secondsRemaining = remaining
+            delay(1_000L)
+        }
+        onClear()
+    }
+
+    AlertDialog(
+        onDismissRequest = onKeep,
+        containerColor = colors.surfaceCard,
+        titleContentColor = colors.textPrimary,
+        textContentColor = colors.textSecondary,
+        shape = RoundedCornerShape(20.dp),
+        title = { Text("This conversation is stale", fontWeight = FontWeight.SemiBold) },
+        text = {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Box(
+                    modifier = Modifier.size(112.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator(
+                        progress = {
+                            secondsRemaining.toFloat() / STALE_CONVERSATION_COUNTDOWN_SECONDS
+                        },
+                        modifier = Modifier.fillMaxSize(),
+                        color = colors.accentBlue,
+                        trackColor = colors.composerBackground,
+                        strokeWidth = 5.dp,
+                    )
+                    Text(
+                        text = secondsRemaining.toString(),
+                        fontSize = 40.sp,
+                        fontWeight = FontWeight.Light,
+                        color = colors.textPrimary,
+                    )
+                }
+                Text(
+                    "This chat has been inactive for 3 hours and will clear automatically. " +
+                        "Keep it to continue this conversation.",
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onClear) {
+                Text("Clear now", color = colors.accentBlue, fontWeight = FontWeight.SemiBold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onKeep) {
+                Text("Keep conversation", color = colors.textSecondary)
+            }
+        },
+    )
+}
 
 @Composable
 fun AssistantScreen(
