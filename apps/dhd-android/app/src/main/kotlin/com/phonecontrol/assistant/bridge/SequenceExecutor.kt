@@ -6,7 +6,6 @@ import com.phonecontrol.assistant.domain.KeypressAction
 import com.phonecontrol.assistant.domain.OpenAppAction
 import com.phonecontrol.assistant.domain.ObservationSnapshot
 import com.phonecontrol.assistant.domain.PhoneAction
-import com.phonecontrol.assistant.domain.ScrollAction
 import com.phonecontrol.assistant.domain.SwipeAction
 import com.phonecontrol.assistant.domain.StaleObservationDiagnostics
 import com.phonecontrol.assistant.domain.TapAction
@@ -171,7 +170,6 @@ internal class SequenceExecutor(
             is TapAction -> action.copy(metadata = metadata)
             is TypeAction -> action.copy(metadata = metadata)
             is SwipeAction -> action.copy(metadata = metadata)
-            is ScrollAction -> action.copy(metadata = metadata)
             is BackAction -> action.copy(metadata = metadata)
             is KeypressAction -> action.copy(metadata = metadata)
             is WaitAction -> action.copy(metadata = metadata)

@@ -25,9 +25,6 @@ import com.phonecontrol.assistant.domain.ObservationSize
 import com.phonecontrol.assistant.domain.ObservationSnapshot
 import com.phonecontrol.assistant.domain.PhoneAction
 import com.phonecontrol.assistant.domain.ReasoningEffort
-import com.phonecontrol.assistant.domain.ScrollAction
-import com.phonecontrol.assistant.domain.ScrollAmount
-import com.phonecontrol.assistant.domain.ScrollDirection
 import com.phonecontrol.assistant.domain.StaleObservationDiagnostics
 import com.phonecontrol.assistant.domain.StaleObservationReason
 import com.phonecontrol.assistant.domain.SwipeAction
@@ -2153,19 +2150,6 @@ class DevBridgeServer(
                 metadata = metadata,
             )
 
-            "scroll" -> {
-                val hasX = json.has("x")
-                val hasY = json.has("y")
-                require(hasX == hasY) { "Scroll x and y must be provided together." }
-                ScrollAction(
-                    direction = enumValue<ScrollDirection>(json.getString("direction")),
-                    amount = enumValue<ScrollAmount>(json.getString("amount")),
-                    metadata = metadata,
-                    x = if (hasX) json.getInt("x") else null,
-                    y = if (hasY) json.getInt("y") else null,
-                )
-            }
-
             "back" -> BackAction(metadata)
 
             "keypress" -> KeypressAction(
@@ -2176,7 +2160,7 @@ class DevBridgeServer(
             "wait" -> WaitAction(json.getLong("durationMs"), metadata)
 
             else -> throw IllegalArgumentException(
-                "Unsupported action type. Use open_app, tap, type, swipe, scroll, back, keypress, or wait.",
+                "Unsupported action type. Use open_app, tap, type, swipe, back, keypress, or wait.",
             )
         }
     }
@@ -2214,7 +2198,6 @@ class DevBridgeServer(
         is TapAction -> "tap"
         is TypeAction -> "type"
         is SwipeAction -> "swipe"
-        is ScrollAction -> "scroll"
         is BackAction -> "back"
         is KeypressAction -> "keypress"
         is WaitAction -> "wait"

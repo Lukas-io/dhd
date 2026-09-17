@@ -15,13 +15,10 @@ import com.phonecontrol.assistant.domain.KeypressAction
 import com.phonecontrol.assistant.domain.KeypressKey
 import com.phonecontrol.assistant.domain.OpenAppAction
 import com.phonecontrol.assistant.domain.PhoneAction
-import com.phonecontrol.assistant.domain.ScrollAction
 import com.phonecontrol.assistant.domain.SwipeAction
 import com.phonecontrol.assistant.domain.TapAction
 import com.phonecontrol.assistant.domain.TypeAction
 import com.phonecontrol.assistant.domain.WaitAction
-import com.phonecontrol.assistant.domain.TASK_SCROLL_DURATION_MS
-import com.phonecontrol.assistant.domain.calculateTaskScrollGesture
 import kotlinx.coroutines.delay
 
 sealed interface TransportResult {
@@ -230,7 +227,6 @@ class TypedPhoneActionTransport(
             is TapAction -> tap(action, requireObservation(observation), sessionKey)
             is TypeAction -> type(action, requireObservation(observation), sessionKey)
             is SwipeAction -> swipe(action, requireObservation(observation), sessionKey)
-            is ScrollAction -> scroll(action, requireObservation(observation), sessionKey)
             is BackAction -> back(action, requireObservation(observation), sessionKey)
             is KeypressAction -> keypress(action, requireObservation(observation), sessionKey)
             is WaitAction -> wait(action, requireObservation(observation), sessionKey)
@@ -455,51 +451,6 @@ class TypedPhoneActionTransport(
         val result = runForSession(sessionKey, listOf("input", "keyevent", keyCode), observation)
         return commandResult(result, successMessage = "$displayName: ${action.metadata.purpose}")
             .withBeforeScreenshot(before.screenshot)
-    }
-
-    private suspend fun scroll(
-        action: ScrollAction,
-        observation: ObservationSnapshot,
-        sessionKey: String?,
-    ): TransportResult {
-        val before = when (val check = freshCheck(action, observation, sessionKey)) {
-            is FreshCheck.Rejected -> return check.result
-            is FreshCheck.Ready -> check
-        }
-        val current = before.snapshot
-        if ((action.x == null) != (action.y == null) ||
-            (action.x != null && !current.contains(action.x, action.y!!))
-        ) {
-            return TransportResult.Rejected(
-                RejectionCode.INVALID_COORDINATE,
-                "Scroll coordinate ${action.x},${action.y} is outside the ${current.width}x${current.height} display.",
-            )
-        }
-        val gesture = calculateTaskScrollGesture(
-            width = current.width,
-            height = current.height,
-            direction = action.direction,
-            amount = action.amount,
-            centerX = action.x,
-            centerY = action.y,
-        )
-        val result = runForSession(
-            sessionKey,
-            listOf(
-                "input",
-                "swipe",
-                gesture.startX.toString(),
-                gesture.startY.toString(),
-                gesture.endX.toString(),
-                gesture.endY.toString(),
-                TASK_SCROLL_DURATION_MS.toString(),
-            ),
-            observation,
-        )
-        return commandResult(
-            result,
-            successMessage = "Scrolled ${action.direction.name.lowercase()} (${action.amount.name.lowercase()}): ${action.metadata.purpose}",
-        ).withBeforeScreenshot(before.screenshot)
     }
 
     private suspend fun wait(

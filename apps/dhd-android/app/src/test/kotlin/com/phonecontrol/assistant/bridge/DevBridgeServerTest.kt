@@ -160,4 +160,23 @@ class DevBridgeServerTest {
         assertTrue(message.contains("exact displayRef"))
         assertTrue(message.contains("pass its displayRef to dhd_open_app"))
     }
+
+    @Test
+    fun `app display layout response makes next-open semantics explicit`() {
+        val response = buildAppDisplayLayoutResponse(
+            requestId = "request-layout",
+            packageName = "com.example.chowdeck",
+            appLabel = "Chowdeck",
+            layout = "full_size",
+            changed = true,
+        )
+
+        assertEquals("app_display_layout_updated", response.getString("type"))
+        assertEquals("full_size", response.getString("layout"))
+        assertTrue(response.getBoolean("fullSizeLayoutEnabled"))
+        assertTrue(response.getBoolean("appliesNextOpen"))
+        assertTrue(response.getBoolean("currentDisplayUnchanged"))
+        assertTrue(response.getBoolean("displayGeometryUnchanged"))
+        assertTrue(response.getString("message").contains("Chowdeck"))
+    }
 }

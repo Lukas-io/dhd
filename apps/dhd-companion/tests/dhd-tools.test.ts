@@ -16,6 +16,7 @@ import {
   dhdObserveInputSchema,
   dhdOpenAppInputSchema,
   dhdRequestAttentionInputSchema,
+  dhdSetAppDisplayLayoutInputSchema,
   isGuardRegionsEnabled,
   toMcpResult
 } from "../src/dhd-tools.js";
@@ -295,6 +296,7 @@ describe("DHD phone tool contract", () => {
     const dynamicNames = buildDhdDynamicTools().map((tool) => String(tool.name));
     const listTool = record(buildDhdDynamicTools().find((tool) => tool.name === "dhd_list_allowed_apps"));
     const browseTool = record(buildDhdDynamicTools().find((tool) => tool.name === "dhd_browse_app"));
+    const layoutTool = record(buildDhdDynamicTools().find((tool) => tool.name === "dhd_set_app_display_layout"));
     const foregroundTool = record(buildDhdDynamicTools().find((tool) => tool.name === "dhd_get_foreground_app"));
     const observeTool = record(buildDhdDynamicTools().find((tool) => tool.name === "dhd_observe"));
     const openAppTool = record(buildDhdDynamicTools().find((tool) => tool.name === "dhd_open_app"));
@@ -304,6 +306,7 @@ describe("DHD phone tool contract", () => {
     expect(DHD_TOOL_NAMES).toEqual([
       "dhd_list_allowed_apps",
       "dhd_browse_app",
+      "dhd_set_app_display_layout",
       "dhd_list_displays",
       "dhd_close_display",
       "dhd_get_foreground_app",
@@ -325,6 +328,16 @@ describe("DHD phone tool contract", () => {
     expect(record(listTool.inputSchema).properties).toHaveProperty("includeAll");
     expect(String(browseTool.description)).toContain("package names");
     expect(record(browseTool.inputSchema).properties).toHaveProperty("query");
+    expect(String(layoutTool.description)).toContain("next time the app is opened");
+    expect(record(layoutTool.inputSchema).properties).toEqual({
+      packageName: {
+        type: "string",
+        minLength: 1,
+        pattern: "^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+$",
+      },
+      layout: { type: "string", enum: ["standard", "full_size"] },
+    });
+    expect(record(layoutTool.inputSchema).required).toEqual(["packageName", "layout"]);
     expect(String(foregroundTool.description)).toContain("read-only");
     expect(record(foregroundTool.inputSchema).properties).toHaveProperty("displayRef");
     expect(record(foregroundTool.inputSchema).properties).not.toHaveProperty("displayId");
@@ -365,7 +378,7 @@ describe("DHD phone tool contract", () => {
     const openAppMetadata = record(record(openApp.inputSchema).properties).metadata;
     expect(record(openAppMetadata).properties).not.toHaveProperty("observationId");
     expect(record(openAppMetadata).required).toEqual(["purpose", "targetDescription"]);
-    expect(actionTypes).toEqual(["tap", "type", "swipe", "scroll", "back", "keypress", "wait"]);
+    expect(actionTypes).toEqual(["tap", "type", "swipe", "back", "keypress", "wait"]);
     expect(actionTypes).not.toContain("open_app");
     expect(actionTypes).not.toContain("click_coordinate");
     const firstActionVariant = record(variants[0]);
@@ -403,6 +416,12 @@ describe("DHD phone tool contract", () => {
       y: 20,
       metadata
     }).success).toBe(false);
+    expect(dhdExecuteActionSchema.safeParse({
+      type: "scroll",
+      direction: "down",
+      amount: "medium",
+      metadata
+    }).success).toBe(false);
   });
 
   it("validates explicit app discovery inputs", () => {
@@ -410,6 +429,22 @@ describe("DHD phone tool contract", () => {
     expect(dhdListAllowedAppsInputSchema.parse({ includeAll: true })).toEqual({ includeAll: true });
     expect(dhdBrowseAppInputSchema.parse({ query: "  Spotify  " })).toEqual({ query: "Spotify" });
     expect(dhdBrowseAppInputSchema.safeParse({ query: " " }).success).toBe(false);
+    expect(dhdSetAppDisplayLayoutInputSchema.parse({
+      packageName: "com.example.store",
+      layout: "full_size",
+    })).toEqual({
+      packageName: "com.example.store",
+      layout: "full_size",
+    });
+    expect(dhdSetAppDisplayLayoutInputSchema.safeParse({
+      packageName: "com.example.store",
+      layout: "compact",
+    }).success).toBe(false);
+    expect(dhdSetAppDisplayLayoutInputSchema.safeParse({
+      packageName: "com.example.store",
+      layout: "standard",
+      extra: true,
+    }).success).toBe(false);
     expect(dhdGetForegroundAppInputSchema.parse({})).toEqual({});
     expect(dhdGetForegroundAppInputSchema.safeParse({ unexpected: true }).success).toBe(false);
     expect(dhdListDisplaysInputSchema.parse({})).toEqual({});

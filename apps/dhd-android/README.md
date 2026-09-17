@@ -23,7 +23,7 @@ notifications, request handoff, and observation/action execution.
 - Foreground service with a persistent notification showing the current
   purpose, Pause/Resume and Stop actions. Opening the notification returns to
   the DHD assistant timeline.
-- Typed action models for `open_app`, `tap`, `type`, `swipe`, `scroll`,
+- Typed action models for `open_app`, `tap`, `type`, `swipe`,
   `keypress`, `back` and `wait`.
   Input actions carry a purpose, target description, and observation ID;
   `open_app` establishes its launch baseline internally and returns a fresh

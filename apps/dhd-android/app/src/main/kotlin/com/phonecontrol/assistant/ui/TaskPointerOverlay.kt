@@ -37,15 +37,22 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.phonecontrol.assistant.domain.ScrollDirection
 import com.phonecontrol.assistant.domain.TaskPointerEvent
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 import kotlin.math.max
 
 private enum class CursorMode {
     ARROW,
     MOUSE,
+}
+
+private enum class SwipeDirection {
+    UP,
+    DOWN,
+    LEFT,
+    RIGHT,
 }
 
 private data class GestureVisual(
@@ -54,7 +61,7 @@ private data class GestureVisual(
     val endX: Int,
     val endY: Int,
     val durationMs: Long,
-    val direction: ScrollDirection?,
+    val direction: SwipeDirection?,
     val label: String,
     val icon: String,
     val displayWidth: Int,
@@ -149,7 +156,6 @@ internal fun TaskPointerOverlay(
                 clickRotation.snapTo(0f)
             }
 
-            is TaskPointerEvent.Scroll,
             is TaskPointerEvent.Swipe -> {
                 cursorMode = CursorMode.MOUSE
                 gestureEvent = pointer
@@ -251,38 +257,39 @@ private suspend fun moveCursor(
 }
 
 private fun TaskPointerEvent.toGestureVisual(): GestureVisual = when (this) {
-    is TaskPointerEvent.Scroll -> GestureVisual(
-        startX = startX,
-        startY = startY,
-        endX = endX,
-        endY = endY,
-        durationMs = durationMs,
-        direction = direction,
-        label = "Scroll ${direction.name.lowercase().replaceFirstChar { it.uppercase() }}",
-        icon = when (direction) {
-            ScrollDirection.UP -> "⤒"
-            ScrollDirection.DOWN -> "⤓"
-            ScrollDirection.LEFT -> "⇤"
-            ScrollDirection.RIGHT -> "⇥"
-        },
-        displayWidth = displayWidth,
-        displayHeight = displayHeight,
-    )
-
     is TaskPointerEvent.Swipe -> GestureVisual(
         startX = startX,
         startY = startY,
         endX = endX,
         endY = endY,
         durationMs = durationMs,
-        direction = null,
-        label = "Swipe",
-        icon = "↝",
+        direction = swipeDirection(startX, startY, endX, endY),
+        label = swipeDirection(startX, startY, endX, endY)?.let {
+            "Swipe ${it.name.lowercase().replaceFirstChar { character -> character.uppercase() }}"
+        } ?: "Swipe",
+        icon = when (swipeDirection(startX, startY, endX, endY)) {
+            SwipeDirection.UP -> "⤒"
+            SwipeDirection.DOWN -> "⤓"
+            SwipeDirection.LEFT -> "⇤"
+            SwipeDirection.RIGHT -> "⇥"
+            null -> "↝"
+        },
         displayWidth = displayWidth,
         displayHeight = displayHeight,
     )
 
     is TaskPointerEvent.Click -> error("Clicks do not have a gesture track.")
+}
+
+private fun swipeDirection(startX: Int, startY: Int, endX: Int, endY: Int): SwipeDirection? {
+    val deltaX = endX - startX
+    val deltaY = endY - startY
+    if (deltaX == 0 && deltaY == 0) return null
+    return if (abs(deltaX) >= abs(deltaY)) {
+        if (deltaX >= 0) SwipeDirection.RIGHT else SwipeDirection.LEFT
+    } else {
+        if (deltaY >= 0) SwipeDirection.DOWN else SwipeDirection.UP
+    }
 }
 
 private fun mapDisplayPoint(
@@ -350,7 +357,7 @@ private fun DrawScope.drawArrow(point: Offset, rotation: Float, pulse: Float) {
 
 private fun DrawScope.drawMouse(
     center: Offset,
-    direction: ScrollDirection?,
+    direction: SwipeDirection?,
     wheelProgress: Float,
 ) {
     val mouseWidth = 14.dp.toPx()
@@ -379,11 +386,11 @@ private fun DrawScope.drawMouse(
     )
     val travel = (wheelProgress * 2f - 1f) * 2.5.dp.toPx()
     val wheelX = left + mouseWidth / 2f + when (direction) {
-        ScrollDirection.LEFT, ScrollDirection.RIGHT -> travel
+        SwipeDirection.LEFT, SwipeDirection.RIGHT -> travel
         else -> 0f
     }
     val wheelY = top + mouseHeight * 0.25f + when (direction) {
-        ScrollDirection.UP, ScrollDirection.DOWN -> travel
+        SwipeDirection.UP, SwipeDirection.DOWN -> travel
         else -> 0f
     }
     drawRoundRect(

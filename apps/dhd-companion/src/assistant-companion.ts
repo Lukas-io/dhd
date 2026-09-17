@@ -27,8 +27,6 @@ import {
   DHD_MAX_TEXT_CHARS,
   DHD_MAX_TYPE_TEXT_CHARS,
   DHD_MAX_WAIT_DURATION_MS,
-  DHD_SCROLL_AMOUNTS,
-  DHD_SCROLL_DIRECTIONS,
   dhdToolDescription,
   isDhdToolName,
   isGuardRegionsEnabled,
@@ -1089,16 +1087,6 @@ export function buildDhdDynamicTools(
         durationMs: { type: "integer", minimum: 1, maximum: DHD_MAX_SWIPE_DURATION_MS },
       },
       required: ["type", "startX", "startY", "endX", "endY"],
-    },
-    {
-      properties: {
-        type: { const: DHD_ACTION_TYPES.scroll },
-        direction: { type: "string", enum: [...DHD_SCROLL_DIRECTIONS] },
-        amount: { type: "string", enum: [...DHD_SCROLL_AMOUNTS] },
-        x: { type: "integer", minimum: 0 },
-        y: { type: "integer", minimum: 0 },
-      },
-      required: ["type", "direction", "amount"],
     },
     { properties: { type: { const: DHD_ACTION_TYPES.back } }, required: ["type"] },
     {

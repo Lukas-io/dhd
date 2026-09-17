@@ -19,8 +19,6 @@ import {
   DHD_MAX_TEXT_CHARS,
   DHD_MAX_TYPE_TEXT_CHARS,
   DHD_MAX_WAIT_DURATION_MS,
-  DHD_SCROLL_AMOUNTS,
-  DHD_SCROLL_DIRECTIONS,
   dhdToolDescription,
   isGuardRegionsEnabled,
 } from "./dhd-tool-contract.js";
@@ -143,19 +141,6 @@ export function createDhdToolSchemas(enableGuardRegions: boolean = isGuardRegion
       .strict(),
     z
       .object({
-        type: z.literal(DHD_ACTION_TYPES.scroll),
-        direction: z.enum(DHD_SCROLL_DIRECTIONS),
-        amount: z.enum(DHD_SCROLL_AMOUNTS),
-        // When supplied, x/y identify the center of the scroll gesture in
-        // task-display pixels. The phone validates the pair against the
-        // current display geometry before sending input.
-        x: z.number().int().min(0).optional(),
-        y: z.number().int().min(0).optional(),
-        metadata: actionMetadataSchema
-      })
-      .strict(),
-    z
-      .object({
         type: z.literal(DHD_ACTION_TYPES.back),
         metadata: actionMetadataSchema
       })
@@ -212,16 +197,6 @@ export function createDhdToolSchemas(enableGuardRegions: boolean = isGuardRegion
               endX: z.number().int().min(0),
               endY: z.number().int().min(0),
               durationMs: z.number().int().min(1).max(DHD_MAX_SWIPE_DURATION_MS).optional(),
-              metadata: sequenceActionMetadataSchema
-            })
-            .strict(),
-          z
-            .object({
-              type: z.literal(DHD_ACTION_TYPES.scroll),
-              direction: z.enum(DHD_SCROLL_DIRECTIONS),
-              amount: z.enum(DHD_SCROLL_AMOUNTS),
-              x: z.number().int().min(0).optional(),
-              y: z.number().int().min(0).optional(),
               metadata: sequenceActionMetadataSchema
             })
             .strict(),

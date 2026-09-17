@@ -5,13 +5,10 @@ import com.phonecontrol.assistant.domain.ActivityEventKind
 import com.phonecontrol.assistant.domain.ObservationSnapshot
 import com.phonecontrol.assistant.domain.PhoneAction
 import com.phonecontrol.assistant.domain.ReasoningEffort
-import com.phonecontrol.assistant.domain.ScrollAction
 import com.phonecontrol.assistant.domain.SwipeAction
 import com.phonecontrol.assistant.domain.TapAction
 import com.phonecontrol.assistant.domain.TaskPointerEvent
 import com.phonecontrol.assistant.domain.StaleObservationDiagnostics
-import com.phonecontrol.assistant.domain.TASK_SCROLL_DURATION_MS
-import com.phonecontrol.assistant.domain.calculateTaskScrollGesture
 import com.phonecontrol.assistant.domain.userFacingActivityLabel
 import com.phonecontrol.assistant.data.ConversationStore
 import com.phonecontrol.assistant.data.RunStatus
@@ -939,29 +936,6 @@ class SessionCoordinator(
                 displayWidth = observation.width,
                 displayHeight = observation.height,
             )
-
-            is ScrollAction -> calculateTaskScrollGesture(
-                width = observation.width,
-                height = observation.height,
-                direction = action.direction,
-                amount = action.amount,
-                centerX = action.x,
-                centerY = action.y,
-            ).let { gesture ->
-                TaskPointerEvent.Scroll(
-                    sequence = sequence,
-                    sessionId = sessionId,
-                    direction = action.direction,
-                    amount = action.amount,
-                    startX = gesture.startX,
-                    startY = gesture.startY,
-                    endX = gesture.endX,
-                    endY = gesture.endY,
-                    durationMs = TASK_SCROLL_DURATION_MS,
-                    displayWidth = observation.width,
-                    displayHeight = observation.height,
-                )
-            }
 
             else -> return@synchronized
         }
