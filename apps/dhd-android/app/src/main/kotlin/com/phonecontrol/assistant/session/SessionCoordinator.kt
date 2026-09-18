@@ -903,17 +903,29 @@ class SessionCoordinator(
         } else {
             null
         }
-        val onPointerMove = if (tapAction != null && observation != null) {
-            {
-                publishPointerEvent(
-                    sessionId = running.sessionId,
-                    action = tapAction,
-                    observation = observation,
-                    clickPhase = ClickPhase.MOVING,
-                )
+        val onPointerMove = when {
+            tapAction != null && observation != null -> {
+                {
+                    publishPointerEvent(
+                        sessionId = running.sessionId,
+                        action = tapAction,
+                        observation = observation,
+                        clickPhase = ClickPhase.MOVING,
+                    )
+                }
             }
-        } else {
-            null
+
+            action is SwipeAction && observation != null -> {
+                {
+                    publishPointerEvent(
+                        sessionId = running.sessionId,
+                        action = action,
+                        observation = observation,
+                    )
+                }
+            }
+
+            else -> null
         }
         val result = transport.executeForSession(
             targetSessionKey,
@@ -930,9 +942,6 @@ class SessionCoordinator(
             ActivityEventKind.ACTION_SUCCEEDED
         } else {
             ActivityEventKind.ACTION_FAILED
-        }
-        if (result is TransportResult.Succeeded && action !is TapAction) {
-            publishPointerEvent(running.sessionId, action, observation)
         }
         appendEvent(
             eventKind,

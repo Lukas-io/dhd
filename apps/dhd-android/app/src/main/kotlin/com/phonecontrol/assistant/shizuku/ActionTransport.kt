@@ -247,7 +247,13 @@ class TypedPhoneActionTransport(
                 onPointerMove,
             )
             is TypeAction -> type(action, requireObservation(observation), sessionKey)
-            is SwipeAction -> swipe(action, requireObservation(observation), sessionKey)
+            is SwipeAction -> swipe(
+                action,
+                requireObservation(observation),
+                sessionKey,
+                beforeInput,
+                onPointerMove,
+            )
             is BackAction -> back(action, requireObservation(observation), sessionKey)
             is KeypressAction -> keypress(action, requireObservation(observation), sessionKey)
             is WaitAction -> wait(action, requireObservation(observation), sessionKey)
@@ -417,6 +423,8 @@ class TypedPhoneActionTransport(
         action: SwipeAction,
         observation: ObservationSnapshot,
         sessionKey: String?,
+        beforeInput: (() -> Unit)?,
+        onPointerMove: (() -> Unit)?,
     ): TransportResult {
         val before = when (val check = freshCheck(action, observation, sessionKey)) {
             is FreshCheck.Rejected -> return check.result
@@ -441,6 +449,8 @@ class TypedPhoneActionTransport(
                 action.durationMs.toString(),
             ),
             observation,
+            beforeInput,
+            onPointerMove,
         )
         return commandResult(
             result,

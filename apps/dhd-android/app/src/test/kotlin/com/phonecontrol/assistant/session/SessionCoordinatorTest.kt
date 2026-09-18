@@ -7,6 +7,7 @@ import com.phonecontrol.assistant.domain.PhoneAction
 import com.phonecontrol.assistant.domain.ReasoningEffort
 import com.phonecontrol.assistant.domain.ScreenProtection
 import com.phonecontrol.assistant.domain.ScreenProtectionStatus
+import com.phonecontrol.assistant.domain.SwipeAction
 import com.phonecontrol.assistant.domain.TapAction
 import com.phonecontrol.assistant.domain.TaskPointerEvent
 import com.phonecontrol.assistant.policy.PolicyEngine
@@ -149,6 +150,58 @@ class SessionCoordinatorTest {
         assertTrue(result is ActionExecutionResult.TransportFinished)
         assertEquals(listOf(ClickPhase.MOVING, ClickPhase.PRESSED), phases)
         assertEquals(ClickPhase.PRESSED, (coordinator.pointerEvent.value as TaskPointerEvent.Click).phase)
+    }
+
+    @Test
+    fun `swipe movement is published before input`() = runTest {
+        val order = mutableListOf<String>()
+        lateinit var coordinator: SessionCoordinator
+        val transport = object : PhoneActionTransport {
+            override suspend fun execute(
+                action: PhoneAction,
+                observation: ObservationSnapshot?,
+            ): TransportResult = TransportResult.Succeeded("executed")
+
+            override suspend fun executeForSession(
+                sessionKey: String,
+                action: PhoneAction,
+                observation: ObservationSnapshot?,
+                beforeInput: (() -> Unit)?,
+                onPointerMove: (() -> Unit)?,
+            ): TransportResult {
+                onPointerMove?.invoke()
+                assertTrue(coordinator.pointerEvent.value is TaskPointerEvent.Swipe)
+                order += "pointer"
+                order += "input"
+                return TransportResult.Succeeded("executed")
+            }
+        }
+        coordinator = SessionCoordinator(
+            enabledPackagesProvider = { setOf("com.example.shop") },
+            policyEngine = PolicyEngine(),
+            transport = transport,
+        )
+        coordinator.start("Buy dinner")
+
+        val result = coordinator.executeAction(
+            SwipeAction(
+                startX = 500,
+                startY = 1600,
+                endX = 500,
+                endY = 700,
+                durationMs = 400,
+                metadata = ActionMetadata(
+                    purpose = "Scroll to the menu",
+                    observationId = observation.id,
+                    targetDescription = "Menu list",
+                ),
+            ),
+            observation,
+        )
+
+        assertTrue(result is ActionExecutionResult.TransportFinished)
+        assertEquals(listOf("pointer", "input"), order)
+        assertTrue(coordinator.pointerEvent.value is TaskPointerEvent.Swipe)
     }
 
     @Test
