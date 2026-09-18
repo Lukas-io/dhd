@@ -229,8 +229,10 @@ enum class LiveDisplayPreviewStatus {
 const val DEFAULT_LIVE_DISPLAY_PREVIEW_ASPECT_RATIO = 9f / 16f
 
 private const val FULLSCREEN_DISPLAY_SCALE = 0.90f
-private const val FULLSCREEN_DISPLAY_CORNER_RADIUS_DP = 12
+internal const val LIVE_DISPLAY_CORNER_RADIUS_DP = 12
 private val FULLSCREEN_PURPOSE_SLOT_HEIGHT = 48.dp
+
+internal fun liveDisplayCornerShape() = RoundedCornerShape(LIVE_DISPLAY_CORNER_RADIUS_DP.dp)
 
 /**
  * Renders the agent's virtual display continuously into a read-only surface.
@@ -290,7 +292,7 @@ fun LiveDisplayPreview(
 
     val previewAspectRatio = state.aspectRatio.takeIf { it.isFinite() && it > 0f }
         ?: DEFAULT_LIVE_DISPLAY_PREVIEW_ASPECT_RATIO
-    val shape = RoundedCornerShape(FULLSCREEN_DISPLAY_CORNER_RADIUS_DP.dp)
+    val shape = liveDisplayCornerShape()
     val previewContainerModifier = if (showCardChrome) {
         Modifier
             .background(colors.surfaceCard, shape)
@@ -327,7 +329,8 @@ fun LiveDisplayPreview(
         MaterialSurface(
             modifier = Modifier
                 .width(previewWidth)
-                .height(previewHeight),
+                .height(previewHeight)
+                .clip(shape),
             shape = shape,
             color = if (showCardChrome) colors.surfaceCard else Color.Transparent,
             shadowElevation = if (showCardChrome) 2.dp else 0.dp,
@@ -448,7 +451,7 @@ internal fun LiveDisplayPreviewPlaceholder(
     val colors = LocalAssistantColors.current
     val previewAspectRatio = state.aspectRatio.takeIf { it.isFinite() && it > 0f }
         ?: DEFAULT_LIVE_DISPLAY_PREVIEW_ASPECT_RATIO
-    val shape = RoundedCornerShape(FULLSCREEN_DISPLAY_CORNER_RADIUS_DP.dp)
+    val shape = liveDisplayCornerShape()
     val previewContainerModifier = if (showCardChrome) {
         Modifier
             .background(colors.surfaceCard, shape)
@@ -472,7 +475,8 @@ internal fun LiveDisplayPreviewPlaceholder(
         MaterialSurface(
             modifier = Modifier
                 .width(previewWidth)
-                .height(previewHeight),
+                .height(previewHeight)
+                .clip(shape),
             shape = shape,
             color = if (showCardChrome) colors.surfaceCard else Color.Transparent,
             shadowElevation = if (showCardChrome) 2.dp else 0.dp,
@@ -780,7 +784,7 @@ private fun FullScreenPreviewSurface(
     val latestOnSurfaceAvailable = rememberUpdatedState(onSurfaceAvailable)
     val latestOnSurfaceDestroyed = rememberUpdatedState(onSurfaceDestroyed)
     var textureView by remember { mutableStateOf<ReadOnlyPreviewTextureView?>(null) }
-    val phoneShape = RoundedCornerShape(FULLSCREEN_DISPLAY_CORNER_RADIUS_DP.dp)
+    val phoneShape = liveDisplayCornerShape()
     val colors = LocalAssistantColors.current
 
     val previewLifecycle = LocalLifecycleOwner.current.lifecycle
