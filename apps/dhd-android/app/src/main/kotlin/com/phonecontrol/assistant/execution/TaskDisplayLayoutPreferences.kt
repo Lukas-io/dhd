@@ -5,9 +5,10 @@ import android.content.Context
 /**
  * Per-app display-layout preferences for the fixed task display.
  *
- * This intentionally stores a user-facing choice rather than a package
- * exception. The standard layout remains the default; an app can opt into a
- * larger logical canvas when its content is clipped or scaled incorrectly.
+ * This intentionally stores a per-app choice rather than a package exception.
+ * The standard layout remains the default; the Task Displays UI or the DHD
+ * layout tool can opt an app into a larger logical canvas when its content is
+ * clipped or scaled incorrectly.
  */
 class TaskDisplayLayoutPreferences(context: Context) {
     private val preferences = context.applicationContext.getSharedPreferences(

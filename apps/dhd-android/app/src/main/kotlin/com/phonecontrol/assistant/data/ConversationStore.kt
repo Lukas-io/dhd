@@ -37,6 +37,7 @@ const val DHD_EXECUTE_TOOL = "dhd_execute"
 const val DHD_EXECUTE_SEQUENCE_TOOL = "dhd_execute_sequence"
 const val DHD_OPEN_APP_TOOL = "dhd_open_app"
 const val DHD_BROWSE_APP_TOOL = "dhd_browse_app"
+const val DHD_SET_APP_DISPLAY_LAYOUT_TOOL = "dhd_set_app_display_layout"
 const val DHD_OBSERVE_TOOL = "dhd_observe"
 
 /** Local, app-private conversation metadata. Codex remains the remote context source of truth. */

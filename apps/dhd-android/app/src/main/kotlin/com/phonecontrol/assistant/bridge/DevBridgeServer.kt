@@ -15,6 +15,7 @@ import com.phonecontrol.assistant.data.DHD_EXECUTE_SEQUENCE_TOOL
 import com.phonecontrol.assistant.data.DHD_LIST_ALLOWED_APPS_TOOL
 import com.phonecontrol.assistant.data.DHD_OBSERVE_TOOL
 import com.phonecontrol.assistant.data.DHD_OPEN_APP_TOOL
+import com.phonecontrol.assistant.data.DHD_SET_APP_DISPLAY_LAYOUT_TOOL
 import com.phonecontrol.assistant.domain.ActionMetadata
 import com.phonecontrol.assistant.domain.BackAction
 import com.phonecontrol.assistant.domain.GuardRegion
@@ -48,6 +49,7 @@ import com.phonecontrol.assistant.execution.PhoneObservationProvider
 import com.phonecontrol.assistant.execution.TransportResult
 import com.phonecontrol.assistant.execution.TaskDisplayBackend
 import com.phonecontrol.assistant.execution.TaskDisplayCloseResult
+import com.phonecontrol.assistant.execution.TaskDisplayLayoutPreferences
 import com.phonecontrol.assistant.execution.TaskDisplayResolution
 import com.phonecontrol.assistant.execution.TaskDisplayStatus
 import com.phonecontrol.assistant.execution.taskDisplayReference
@@ -67,6 +69,7 @@ import java.security.MessageDigest
 import java.util.UUID
 import java.util.Collections
 import java.util.LinkedHashMap
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -116,6 +119,7 @@ class DevBridgeServer(
 ) {
     private val preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
     private val installedAppsRepository = InstalledAppsRepository(context)
+    private val taskDisplayLayoutPreferences = TaskDisplayLayoutPreferences(context)
     val authenticationToken: String = preferences.getString(KEY_AUTH_TOKEN, null)
         ?.trim()
         ?.takeIf(String::isNotEmpty)
@@ -590,6 +594,9 @@ class DevBridgeServer(
                     "browse_apps" -> withDhdTool(json, DHD_BROWSE_APP_TOOL) {
                         browseApps(requestId, json, writer)
                     }
+                    "set_app_display_layout" -> withDhdTool(json, DHD_SET_APP_DISPLAY_LAYOUT_TOOL) {
+                        setAppDisplayLayout(requestId, json, writer)
+                    }
                     "list_displays" -> listDisplays(requestId, writer)
                     "close_display" -> closeDisplay(requestId, json, writer)
                     "foreground_app" -> withDhdTool(json, DHD_FOREGROUND_APP_TOOL) {
@@ -665,6 +672,7 @@ class DevBridgeServer(
         DHD_OBSERVE_TOOL -> json.optString("purpose").trim().takeIf(String::isNotBlank)
             ?: defaultDhdToolPurpose(toolName)
         DHD_OPEN_APP_TOOL -> openingAppPurpose(json)
+        DHD_SET_APP_DISPLAY_LAYOUT_TOOL -> appDisplayLayoutPurpose(json)
         DHD_EXECUTE_TOOL -> {
             val action = json.optJSONObject("action")
             if (action?.optString("type")?.equals("open_app", ignoreCase = true) == true) {
@@ -690,6 +698,22 @@ class DevBridgeServer(
             ?.let(::appLabel)
             ?.takeIf { it.isNotBlank() && !it.equals(packageName, ignoreCase = true) }
         return label?.let { "Opening $it" } ?: defaultDhdToolPurpose(DHD_OPEN_APP_TOOL)
+    }
+
+    private fun appDisplayLayoutPurpose(json: JSONObject): String {
+        val packageName = json.optString("packageName")
+            .trim()
+            .takeIf(String::isNotBlank)
+        val label = packageName
+            ?.let(::appLabel)
+            ?.takeIf { it.isNotBlank() && !it.equals(packageName, ignoreCase = true) }
+        return when (json.optString("layout").trim().lowercase(Locale.ROOT)) {
+            "full_size" -> label?.let { "Fitting $it to the task display" }
+                ?: "Fitting the app to the task display"
+            "standard" -> label?.let { "Restoring ${it}'s standard task layout" }
+                ?: "Restoring the standard task layout"
+            else -> defaultDhdToolPurpose(DHD_SET_APP_DISPLAY_LAYOUT_TOOL)
+        }
     }
 
     private fun startSession(
@@ -1298,6 +1322,76 @@ class DevBridgeServer(
         )
     }
 
+    private fun setAppDisplayLayout(
+        requestId: String,
+        json: JSONObject,
+        writer: BufferedWriter,
+    ) {
+        val packageName = json.optString("packageName").trim()
+        if (!PACKAGE_PATTERN.matches(packageName)) {
+            write(
+                writer,
+                errorResponse(requestId, "packageName is not a valid Android package name.")
+                    .put("code", "INVALID_PACKAGE"),
+            )
+            return
+        }
+
+        val layout = json.optString("layout").trim().lowercase(Locale.ROOT)
+        val enabled = when (layout) {
+            "full_size" -> true
+            "standard" -> false
+            else -> {
+                write(
+                    writer,
+                    errorResponse(requestId, "layout must be either full_size or standard.")
+                        .put("code", "INVALID_APP_DISPLAY_LAYOUT"),
+                )
+                return
+            }
+        }
+
+        val app = installedAppsRepository.listLaunchableApps()
+            .firstOrNull { it.packageName == packageName }
+        if (app == null) {
+            write(
+                writer,
+                errorResponse(requestId, "No launchable app matches packageName=$packageName.")
+                    .put("code", "APP_NOT_FOUND"),
+            )
+            return
+        }
+
+        val fullAccess = fullAccessProvider()
+        val allowed = fullAccess || packageName in allowedPackagesProvider()
+        if (!allowed) {
+            write(
+                writer,
+                errorResponse(requestId, "The app is not allowed for the current DHD access mode.")
+                    .put("code", "APP_NOT_ALLOWED"),
+            )
+            return
+        }
+
+        coordinator.recordPurpose(
+            purpose = if (enabled) "Saving full-size app layout" else "Restoring standard app layout",
+            targetDescription = app.label,
+            toolName = DHD_SET_APP_DISPLAY_LAYOUT_TOOL,
+        )
+        val changed = taskDisplayLayoutPreferences.isFullSizeLayoutEnabled(packageName) != enabled
+        taskDisplayLayoutPreferences.setFullSizeLayoutEnabled(packageName, enabled)
+        write(
+            writer,
+            buildAppDisplayLayoutResponse(
+                requestId = requestId,
+                packageName = packageName,
+                appLabel = app.label,
+                layout = layout,
+                changed = changed,
+            ),
+        )
+    }
+
     private suspend fun listDisplays(
         requestId: String,
         writer: BufferedWriter,
@@ -1810,9 +1904,13 @@ class DevBridgeServer(
         // A successful action may intentionally navigate to another activity,
         // system surface, or package. Capture what is actually on screen and
         // let the model decide what the new observation means.
-        val postSession = target?.session ?: taskSessionKey?.let { key ->
+        // An app-layout change can retire the target display while the open
+        // action is executing. Resolve the post-action session again so the
+        // response observes the replacement generation instead of the stale
+        // pre-open session.
+        val postSession = taskSessionKey?.let { key ->
             taskDisplayBackend?.current(key)
-        }
+        } ?: target?.session
         when (val captured = captureWithRetry(
             expectedPackageName = null,
             guardRegions = emptyList(),
@@ -2745,6 +2843,38 @@ internal fun buildBrowseAppsResponse(
     )
     .put("count", apps.size)
     .put("truncated", truncated)
+
+internal fun buildAppDisplayLayoutResponse(
+    requestId: String,
+    packageName: String,
+    appLabel: String,
+    layout: String,
+    changed: Boolean,
+): JSONObject {
+    val fullSize = layout == "full_size"
+    val layoutDescription = if (fullSize) "full-size" else "standard"
+    return JSONObject()
+        .put("type", "app_display_layout_updated")
+        .put("requestId", requestId)
+        .put("ok", true)
+        .put("appLabel", appLabel)
+        .put("packageName", packageName)
+        .put("layout", layout)
+        .put("fullSizeLayoutEnabled", fullSize)
+        .put("changed", changed)
+        .put("appliesNextOpen", true)
+        .put("requiresFreshDisplay", changed)
+        .put("currentDisplayUnchanged", true)
+        .put("displayGeometryUnchanged", true)
+        .put(
+            "message",
+            if (changed) {
+                "$layoutDescription app layout saved for $appLabel. The next dhd_open_app call without displayRef will use a fresh DHD task display with this layout."
+            } else {
+                "$layoutDescription app layout is already active for $appLabel. Future compatible opens may reuse the current DHD task display."
+            },
+        )
+}
 
 /**
  * Add an actionable display inventory to a session-limit failure. The list

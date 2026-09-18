@@ -32,6 +32,27 @@ class TaskDisplayBackendTest {
     }
 
     @Test
+    fun `layout matcher identifies the display generation that must be recreated`() {
+        val standard = TaskDisplaySession(
+            sessionKey = "run-standard",
+            taskId = "task-standard",
+            displayId = 7,
+            geometry = TaskDisplayGeometry(720, 1_560, 420, 0),
+            packageName = "com.example.app",
+        )
+        val fullSize = standard.copy(
+            sessionKey = "run-full-size",
+            taskId = "task-full-size",
+            appDisplayWidth = 945,
+            appDisplayHeight = 2_048,
+        )
+
+        assertTrue(taskDisplayAppLayoutMatches(standard, TaskDisplaySpec()))
+        assertTrue(taskDisplayAppLayoutMatches(fullSize, TaskDisplaySpec().withFullSizeAppLayout(true)))
+        assertTrue(!taskDisplayAppLayoutMatches(standard, TaskDisplaySpec().withFullSizeAppLayout(true)))
+    }
+
+    @Test
     fun `standard app layout remains unchanged when full-size mode is disabled`() {
         val standard = TaskDisplaySpec()
 

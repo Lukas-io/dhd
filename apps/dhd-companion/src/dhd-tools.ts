@@ -104,6 +104,13 @@ export function createDhdToolSchemas(enableGuardRegions: boolean = isGuardRegion
     })
     .strict();
 
+  const dhdSetAppDisplayLayoutInputSchema = z
+    .object({
+      packageName: packageNameSchema,
+      layout: z.enum(["standard", "full_size"]),
+    })
+    .strict();
+
   const dhdListDisplaysInputSchema = z.object({}).strict();
 
   const dhdCloseDisplayInputSchema = z
@@ -269,6 +276,7 @@ export function createDhdToolSchemas(enableGuardRegions: boolean = isGuardRegion
     dhdOpenAppInputSchema,
     dhdListAllowedAppsInputSchema,
     dhdBrowseAppInputSchema,
+    dhdSetAppDisplayLayoutInputSchema,
     dhdListDisplaysInputSchema,
     dhdCloseDisplayInputSchema,
     dhdGetForegroundAppInputSchema,
@@ -290,6 +298,7 @@ const defaultDhdToolSchemas = createDhdToolSchemas(isGuardRegionsEnabled());
 export const dhdOpenAppInputSchema = defaultDhdToolSchemas.dhdOpenAppInputSchema;
 export const dhdListAllowedAppsInputSchema = defaultDhdToolSchemas.dhdListAllowedAppsInputSchema;
 export const dhdBrowseAppInputSchema = defaultDhdToolSchemas.dhdBrowseAppInputSchema;
+export const dhdSetAppDisplayLayoutInputSchema = defaultDhdToolSchemas.dhdSetAppDisplayLayoutInputSchema;
 export const dhdListDisplaysInputSchema = defaultDhdToolSchemas.dhdListDisplaysInputSchema;
 export const dhdCloseDisplayInputSchema = defaultDhdToolSchemas.dhdCloseDisplayInputSchema;
 export const dhdGetForegroundAppInputSchema = defaultDhdToolSchemas.dhdGetForegroundAppInputSchema;
@@ -701,6 +710,17 @@ export async function invokeDhdTool(
           query: parsed.query
         });
         });
+    case "dhd_set_app_display_layout":
+      return safely(() => {
+        const parsed = parseInput(schemas.dhdSetAppDisplayLayoutInputSchema, input);
+        return requestBridge({
+          type: "set_app_display_layout",
+          tool: "dhd_set_app_display_layout",
+          requestId: randomUUID(),
+          packageName: parsed.packageName,
+          layout: parsed.layout,
+        });
+      });
     case "dhd_list_displays":
       return safely(() => {
         parseInput(schemas.dhdListDisplaysInputSchema, input);
@@ -839,6 +859,15 @@ export function createDhdMcpServer(
       inputSchema: schemas.dhdBrowseAppInputSchema.shape
     },
     async (input) => invokeDhdTool("dhd_browse_app", input)
+  );
+
+  server.registerTool(
+    "dhd_set_app_display_layout",
+    {
+      description: dhdToolDescription("dhd_set_app_display_layout", enableGuardRegions),
+      inputSchema: schemas.dhdSetAppDisplayLayoutInputSchema.shape,
+    },
+    async (input) => invokeDhdTool("dhd_set_app_display_layout", input),
   );
 
   server.registerTool(

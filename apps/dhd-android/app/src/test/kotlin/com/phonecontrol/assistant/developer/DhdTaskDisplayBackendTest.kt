@@ -1,6 +1,7 @@
 package com.phonecontrol.assistant.developer
 
 import com.phonecontrol.assistant.execution.TaskDisplayStatus
+import com.phonecontrol.assistant.execution.TaskDisplayRecord
 import java.io.IOException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -51,6 +52,50 @@ class DhdTaskDisplayBackendTest {
                 ownerCancelled = false,
             ),
         )
+    }
+
+    @Test
+    fun `explicitly ended display wins over its terminal expiry timestamp`() {
+        val ended = TaskDisplayRecord(
+            sessionKey = "ended-run",
+            taskId = "ended-task",
+            packageName = "com.example.app",
+            displayId = 7,
+            width = 720,
+            height = 1_560,
+            densityDpi = 420,
+            rotation = 0,
+            status = TaskDisplayStatus.ENDED,
+            createdAtEpochMs = 1L,
+            terminalAtEpochMs = 10L,
+            expiresAtEpochMs = 10L,
+        )
+
+        val result = taskDisplayUnavailableForRecord(ended, nowEpochMs = 20L)
+
+        assertEquals("DISPLAY_ENDED", result.code)
+    }
+
+    @Test
+    fun `expired display remains expired when it is not explicitly ended`() {
+        val expired = TaskDisplayRecord(
+            sessionKey = "expired-run",
+            taskId = "expired-task",
+            packageName = "com.example.app",
+            displayId = 8,
+            width = 720,
+            height = 1_560,
+            densityDpi = 420,
+            rotation = 0,
+            status = TaskDisplayStatus.EXPIRED,
+            createdAtEpochMs = 1L,
+            terminalAtEpochMs = 10L,
+            expiresAtEpochMs = 10L,
+        )
+
+        val result = taskDisplayUnavailableForRecord(expired, nowEpochMs = 20L)
+
+        assertEquals("DISPLAY_EXPIRED", result.code)
     }
 
     @Test

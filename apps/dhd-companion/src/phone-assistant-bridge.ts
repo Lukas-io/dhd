@@ -54,6 +54,7 @@ const TERMINAL_MESSAGE_TYPES = new Set([
   "session_failed",
   "allowed_apps",
   "browse_apps",
+  "app_display_layout_updated",
   "displays",
   "display_closed",
   "foreground_app",

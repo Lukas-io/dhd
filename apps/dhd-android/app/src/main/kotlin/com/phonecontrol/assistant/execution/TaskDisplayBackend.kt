@@ -134,6 +134,12 @@ data class TaskDisplayTarget(
         get() = record.displayRef
 }
 
+/** Result of preparing a task display for an app launch. */
+data class TaskDisplayOpenResult(
+    val session: TaskDisplaySession,
+    val created: Boolean,
+)
+
 sealed interface TaskDisplayResolution {
     data class Ready(val target: TaskDisplayTarget) : TaskDisplayResolution
 
@@ -163,6 +169,16 @@ fun taskDisplayReference(sessionKey: String, displayId: Int): String {
         digest.take(7).forEach { byte -> append("%02x".format(byte.toInt() and 0xff)) }
     }
 }
+
+/** Whether a display's app-visible logical canvas matches the requested spec. */
+internal fun taskDisplayAppLayoutMatches(
+    session: TaskDisplaySession,
+    expectedSpec: TaskDisplaySpec,
+): Boolean = session.geometry.width == expectedSpec.width &&
+    session.geometry.height == expectedSpec.height &&
+    session.geometry.densityDpi == expectedSpec.densityDpi &&
+    session.appDisplayWidth == (expectedSpec.appDisplayWidth ?: expectedSpec.width) &&
+    session.appDisplayHeight == (expectedSpec.appDisplayHeight ?: expectedSpec.height)
 
 /**
  * Apply a terminal state without touching the display itself. Keeping this
@@ -256,6 +272,20 @@ interface TaskDisplayBackend {
         packageName: String,
         spec: TaskDisplaySpec = TaskDisplaySpec(),
     ): TaskDisplaySession
+
+    /**
+     * Reuse a valid matching display for an app launch, or create one when no
+     * reusable display exists. Implementations must recreate an incompatible
+     * current display when the app-visible layout changed.
+     */
+    suspend fun openApp(
+        sessionKey: String,
+        packageName: String,
+        spec: TaskDisplaySpec = TaskDisplaySpec(),
+    ): TaskDisplayOpenResult {
+        current(sessionKey)?.let { return TaskDisplayOpenResult(it, created = false) }
+        return TaskDisplayOpenResult(create(sessionKey, packageName, spec), created = true)
+    }
 
     /** Return the current session for a coordinator key, if it still exists. */
     suspend fun current(sessionKey: String): TaskDisplaySession?

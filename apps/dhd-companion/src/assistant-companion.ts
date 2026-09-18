@@ -1153,6 +1153,23 @@ export function buildDhdDynamicTools(
       },
     ),
     dynamicTool(
+      "dhd_set_app_display_layout",
+      dhdToolDescription("dhd_set_app_display_layout", enableGuardRegions),
+      {
+        type: "object",
+        properties: {
+          packageName: {
+            type: "string",
+            minLength: 1,
+            pattern: "^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+$",
+          },
+          layout: { type: "string", enum: ["standard", "full_size"] },
+        },
+        required: ["packageName", "layout"],
+        additionalProperties: false,
+      },
+    ),
+    dynamicTool(
       "dhd_list_displays",
       dhdToolDescription("dhd_list_displays", enableGuardRegions),
       emptySchema(),

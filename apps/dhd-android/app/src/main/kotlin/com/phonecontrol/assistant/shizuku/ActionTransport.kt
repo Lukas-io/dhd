@@ -249,33 +249,31 @@ class TypedPhoneActionTransport(
                     "The task display is unavailable; ${action.packageName} was not opened.",
                 )
             return try {
-                val current = backend.current(sessionKey)
-                if (current == null) {
-                    backend.create(sessionKey, action.packageName)
-                } else {
-                    val launchIntent = context.packageManager.getLaunchIntentForPackage(action.packageName)
-                        ?: return TransportResult.Rejected(
-                            RejectionCode.COMMAND_FAILED,
-                            "No launchable activity was found for ${action.packageName}.",
-                        )
-                    val component = launchIntent.component
-                        ?: return TransportResult.Rejected(
-                            RejectionCode.COMMAND_FAILED,
-                            "The launch intent for ${action.packageName} has no explicit component.",
-                        )
-                    if (component.packageName != action.packageName) {
-                        return TransportResult.Rejected(
-                            RejectionCode.COMMAND_FAILED,
-                            "The launch intent resolved outside the requested package.",
-                        )
-                    }
+                val launchIntent = context.packageManager.getLaunchIntentForPackage(action.packageName)
+                    ?: return TransportResult.Rejected(
+                        RejectionCode.COMMAND_FAILED,
+                        "No launchable activity was found for ${action.packageName}.",
+                    )
+                val component = launchIntent.component
+                    ?: return TransportResult.Rejected(
+                        RejectionCode.COMMAND_FAILED,
+                        "The launch intent for ${action.packageName} has no explicit component.",
+                    )
+                if (component.packageName != action.packageName) {
+                    return TransportResult.Rejected(
+                        RejectionCode.COMMAND_FAILED,
+                        "The launch intent resolved outside the requested package.",
+                    )
+                }
+                val opened = backend.openApp(sessionKey, action.packageName)
+                if (!opened.created) {
                     val result = runOnTaskDisplay(
-                        current,
+                        opened.session,
                         listOf(
                             "am",
                             "start",
                             "--display",
-                            current.displayId.toString(),
+                            opened.session.displayId.toString(),
                             "-W",
                             "-n",
                             "${component.packageName}/${component.className}",

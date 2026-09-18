@@ -24,6 +24,10 @@ describe("DHD bridge tool metadata", () => {
   it("sends the canonical tool name for every dynamic phone tool", async () => {
     await invokeDhdTool("dhd_list_allowed_apps", {});
     await invokeDhdTool("dhd_browse_app", { query: "Spotify" });
+    await invokeDhdTool("dhd_set_app_display_layout", {
+      packageName: "com.example.store",
+      layout: "full_size",
+    });
     await invokeDhdTool("dhd_get_foreground_app", {});
     await invokeDhdTool("dhd_observe", { purpose: "Inspect the current screen" });
     await invokeDhdTool("dhd_open_app", {
@@ -50,6 +54,7 @@ describe("DHD bridge tool metadata", () => {
     expect(bridge.requestBridge.mock.calls.map(([request]) => request.tool)).toEqual([
       "dhd_list_allowed_apps",
       "dhd_browse_app",
+      "dhd_set_app_display_layout",
       "dhd_get_foreground_app",
       "dhd_observe",
       "dhd_open_app",
