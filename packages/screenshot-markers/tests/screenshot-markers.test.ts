@@ -64,6 +64,26 @@ describe("ScreenshotMarkerPresenter", () => {
     });
   });
 
+  it("uses the phone-provided initial pointer for a fresh calibration marker", () => {
+    const screenshot = createPng(120, 160, [20, 20, 20]);
+    const presenter = new ScreenshotMarkerPresenter({
+      chooseAnchor: () => ({ x: 18, y: 26 })
+    });
+
+    const rendered = presenter.render(screenshot, observation(0, "obs-1"), {
+      reset: true,
+      initialPointer: { x: 94, y: 132 }
+    });
+
+    expect(rendered.marker).toEqual({
+      kind: "calibration",
+      x: 94,
+      y: 132,
+      coordinateSpace: "display"
+    });
+    expect(presenter.render(screenshot, observation(0, "obs-2")).marker).toEqual(rendered.marker);
+  });
+
   it("isolates displays and resets a closed display", () => {
     const screenshot = createPng(120, 160, [20, 20, 20]);
     let next = 0;

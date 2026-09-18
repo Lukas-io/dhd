@@ -104,6 +104,21 @@ class SessionCoordinatorTest {
     }
 
     @Test
+    fun `publishes an initial calibration pointer for an active task display`() {
+        val coordinator = coordinator()
+        coordinator.start("Open the shopping app")
+
+        val pointer = coordinator.publishCalibrationPointerEvent(observation)
+        val calibration = pointer ?: error("Expected a calibration pointer")
+
+        assertEquals(calibration, coordinator.pointerEvent.value)
+        assertTrue(calibration.x in 0 until observation.width)
+        assertTrue(calibration.y in 0 until observation.height)
+        assertEquals(observation.width, calibration.displayWidth)
+        assertEquals(observation.height, calibration.displayHeight)
+    }
+
+    @Test
     fun `click movement is published before input and press at the input boundary`() = runTest {
         val phases = mutableListOf<ClickPhase>()
         lateinit var coordinator: SessionCoordinator

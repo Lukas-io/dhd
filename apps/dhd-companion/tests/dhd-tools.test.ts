@@ -176,6 +176,36 @@ describe("DHD phone tool contract", () => {
     expect((tapped.structuredContent as Record<string, any>).screenshotMarker).not.toEqual(firstMarker);
   });
 
+  it("uses the Android-provided initial pointer and keeps it out of model output", () => {
+    const result = toMcpResult(
+      {
+        type: "completed",
+        ok: true,
+        initialPointer: { x: 0, y: 0 },
+        observation: {
+          id: "marker-obs-initial-pointer",
+          displayId: 93,
+          packageName: "com.example.app",
+          rotation: 0,
+          width: 1,
+          height: 1,
+        },
+        screenshotBase64: pngBase64,
+        screenshotMimeType: "image/png",
+      },
+      undefined,
+      { resetMarker: true, initialPointer: { x: 0, y: 0 } },
+    );
+
+    expect((result.structuredContent as Record<string, any>).screenshotMarker).toEqual({
+      kind: "calibration",
+      x: 0,
+      y: 0,
+      coordinateSpace: "display",
+    });
+    expect(result.structuredContent).not.toHaveProperty("initialPointer");
+  });
+
   it("returns compact before-tap evidence followed by the current post-action image", () => {
     const result = toMcpResult(
       {

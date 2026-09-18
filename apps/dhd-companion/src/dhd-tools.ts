@@ -352,6 +352,7 @@ function withoutScreenshot(message: BridgeMessage): Record<string, unknown> {
   delete copy.beforeScreenshotBase64;
   delete copy.beforeScreenshotMimeType;
   delete copy.beforeObservation;
+  delete copy.initialPointer;
   return copy;
 }
 
@@ -402,6 +403,7 @@ interface DhdMarkerContext {
   resetMarker?: boolean;
   action?: Record<string, unknown>;
   sequenceActions?: readonly Record<string, unknown>[];
+  initialPointer?: ScreenshotMarkerPoint;
 }
 
 function markerObservation(message: BridgeMessage): ScreenshotMarkerObservation | undefined {
@@ -426,6 +428,12 @@ function tapPoint(value: Record<string, unknown> | undefined): ScreenshotMarkerP
     return undefined;
   }
   return { x: value.x as number, y: value.y as number };
+}
+
+function initialPointerPoint(message: BridgeMessage): ScreenshotMarkerPoint | undefined {
+  const pointer = readRecord(message.initialPointer);
+  if (!Number.isInteger(pointer.x) || !Number.isInteger(pointer.y)) return undefined;
+  return { x: pointer.x as number, y: pointer.y as number };
 }
 
 function successfulSequenceTap(
@@ -469,7 +477,10 @@ function renderScreenshot(
     const rendered = screenshotMarkerPresenter.render(
       Buffer.from(screenshot.base64, "base64"),
       observation,
-      { lastTap: markerForContext(message, context) }
+      {
+        lastTap: markerForContext(message, context),
+        initialPointer: context?.initialPointer,
+      }
     );
     const base64 = Buffer.from(rendered.screenshot).toString("base64");
     return {
@@ -719,13 +730,14 @@ export async function invokeDhdTool(
       }, undefined, options);
     case "dhd_open_app":
       let openedAction: Record<string, unknown> | undefined;
-      return safely(() => {
+      let openedInitialPointer: ScreenshotMarkerPoint | undefined;
+      return safely(async () => {
         const parsed = parseInput(schemas.dhdOpenAppInputSchema, input);
         openedAction = {
           type: "open_app",
           packageName: parsed.packageName,
         };
-        return requestBridge({
+        const message = await requestBridge({
           type: "execute_action",
           tool: "dhd_open_app",
           requestId: randomUUID(),
@@ -736,7 +748,13 @@ export async function invokeDhdTool(
             metadata: parsed.metadata
           }
         });
-      }, () => ({ resetMarker: true, action: openedAction }), options);
+        openedInitialPointer = initialPointerPoint(message);
+        return message;
+      }, () => ({
+        resetMarker: true,
+        action: openedAction,
+        initialPointer: openedInitialPointer,
+      }), options);
     case "dhd_execute":
       let executedAction: Record<string, unknown> | undefined;
       return safely(() => {

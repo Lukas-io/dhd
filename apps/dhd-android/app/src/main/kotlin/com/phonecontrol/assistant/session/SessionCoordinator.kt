@@ -31,6 +31,15 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlin.math.roundToInt
+import kotlin.random.Random
+
+private val CALIBRATION_ANCHORS = arrayOf(
+    0.18f to 0.16f,
+    0.82f to 0.16f,
+    0.18f to 0.84f,
+    0.82f to 0.84f,
+)
 
 sealed interface SessionState {
     data object Idle : SessionState
@@ -994,6 +1003,33 @@ class SessionCoordinator(
             else -> return@synchronized
         }
         _pointerEvent.value = nextEvent
+    }
+
+    /**
+     * Publish the initial calibration cursor for a freshly opened task
+     * display. This is presentation metadata only; it does not dispatch an
+     * input action or alter the observation.
+     */
+    fun publishCalibrationPointerEvent(
+        observation: ObservationSnapshot,
+    ): TaskPointerEvent.Calibration? = synchronized(lock) {
+        val current = _state.value
+        val sessionId = current.sessionIdOrNull ?: return@synchronized null
+        if (!current.isActive || observation.width <= 0 || observation.height <= 0) {
+            return@synchronized null
+        }
+
+        val (xRatio, yRatio) = CALIBRATION_ANCHORS[Random.nextInt(CALIBRATION_ANCHORS.size)]
+        val nextEvent = TaskPointerEvent.Calibration(
+            sequence = (_pointerEvent.value?.sequence ?: 0L) + 1L,
+            sessionId = sessionId,
+            x = (observation.width * xRatio).roundToInt().coerceIn(0, observation.width - 1),
+            y = (observation.height * yRatio).roundToInt().coerceIn(0, observation.height - 1),
+            displayWidth = observation.width,
+            displayHeight = observation.height,
+        )
+        _pointerEvent.value = nextEvent
+        nextEvent
     }
 
     fun close() {

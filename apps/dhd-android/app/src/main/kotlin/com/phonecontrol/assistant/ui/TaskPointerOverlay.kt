@@ -85,6 +85,19 @@ internal fun TaskPointerOverlay(
                     hasCursor = true
                 }
 
+                is TaskPointerEvent.Calibration -> {
+                    val target = mapDisplayPoint(
+                        pointer.x,
+                        pointer.y,
+                        pointer.displayWidth,
+                        pointer.displayHeight,
+                    )
+                    cursorX.snapTo(target.x)
+                    cursorY.snapTo(target.y)
+                    clickScale.snapTo(1f)
+                    hasCursor = true
+                }
+
                 is TaskPointerEvent.Swipe -> {
                     val target = mapDisplayPoint(
                         pointer.endX,
@@ -151,6 +164,20 @@ internal fun TaskPointerOverlay(
                 }
             }
 
+            is TaskPointerEvent.Calibration -> {
+                gestureEvent = null
+                val target = mapDisplayPoint(
+                    pointer.x,
+                    pointer.y,
+                    pointer.displayWidth,
+                    pointer.displayHeight,
+                )
+                cursorX.snapTo(target.x)
+                cursorY.snapTo(target.y)
+                clickScale.snapTo(1f)
+                hasCursor = true
+            }
+
             is TaskPointerEvent.Swipe -> {
                 gestureEvent = pointer
                 val visual = pointer.toGestureVisual()
@@ -192,7 +219,7 @@ internal fun TaskPointerOverlay(
                     point = Offset(cursorX.value * size.width, cursorY.value * size.height),
                     scaleFactor = 1f,
                 )
-            } else if (event is TaskPointerEvent.Click) {
+            } else if (event is TaskPointerEvent.Click || event is TaskPointerEvent.Calibration) {
                 drawArrow(
                     point = Offset(cursorX.value * size.width, cursorY.value * size.height),
                     scaleFactor = clickScale.value,
@@ -232,6 +259,7 @@ private fun TaskPointerEvent.toGestureVisual(): GestureVisual = when (this) {
     )
 
     is TaskPointerEvent.Click -> error("Clicks do not have a gesture track.")
+    is TaskPointerEvent.Calibration -> error("Calibration points do not have a gesture track.")
 }
 
 private fun mapDisplayPoint(

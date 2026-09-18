@@ -1833,6 +1833,11 @@ class DevBridgeServer(
             }
 
             is ObservationCaptureResult.Succeeded -> {
+                val initialPointer = if (action is OpenAppAction) {
+                    coordinator.publishCalibrationPointerEvent(captured.snapshot)
+                } else {
+                    null
+                }
                 remember(captured.snapshot)
                 val response = JSONObject()
                     .put("type", "completed")
@@ -1843,6 +1848,14 @@ class DevBridgeServer(
                     .put("observation", snapshotJson(captured.snapshot))
                     .put("screenshotBase64", Base64.encodeToString(captured.screenshot, Base64.NO_WRAP))
                     .put("screenshotMimeType", "image/png")
+                initialPointer?.let { pointer ->
+                    response.put(
+                        "initialPointer",
+                        JSONObject()
+                            .put("x", pointer.x)
+                            .put("y", pointer.y),
+                    )
+                }
                 addBeforeDebug(
                     response,
                     observation,

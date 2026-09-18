@@ -34,6 +34,19 @@ sealed interface TaskPointerEvent {
         override val displayWidth: Int,
         override val displayHeight: Int,
     ) : TaskPointerEvent
+
+    /**
+     * A presentation-only calibration point shown when a task display first
+     * becomes available. It is not an input action and must not be replayed.
+     */
+    data class Calibration(
+        override val sequence: Long,
+        override val sessionId: String,
+        val x: Int,
+        val y: Int,
+        override val displayWidth: Int,
+        override val displayHeight: Int,
+    ) : TaskPointerEvent
 }
 
 enum class ClickPhase {
