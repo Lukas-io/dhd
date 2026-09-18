@@ -2106,6 +2106,11 @@ private fun TraceStepRowContent(
     } else {
         null
     }
+    val labelStyle = TextStyle(
+        brush = shimmer?.brush,
+        fontSize = 13.5.sp,
+        fontWeight = FontWeight.Normal,
+    )
 
     Row(
         modifier = Modifier
@@ -2121,27 +2126,14 @@ private fun TraceStepRowContent(
             tint = shimmer?.let { iconColor.copy(alpha = it.pulseAlpha) } ?: iconColor,
             modifier = Modifier.size(18.dp),
         )
-        if (shimmer != null) {
-            Text(
-                text = label,
-                fontSize = 13.5.sp,
-                style = TextStyle(brush = shimmer.brush),
-                fontWeight = FontWeight.Normal,
-                modifier = Modifier.weight(1f),
-                maxLines = 4,
-                overflow = TextOverflow.Ellipsis,
-            )
-        } else {
-            Text(
-                text = label,
-                fontSize = 13.5.sp,
-                color = colors.textPrimary,
-                fontWeight = FontWeight.Normal,
-                modifier = Modifier.weight(1f),
-                maxLines = 4,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
+        Text(
+            text = label,
+            color = if (shimmer == null) colors.textPrimary else Color.Unspecified,
+            style = labelStyle,
+            modifier = Modifier.weight(1f),
+            maxLines = 4,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
