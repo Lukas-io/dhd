@@ -54,6 +54,7 @@ data class AssistantColorScheme(
     val userBubble: Color,
     val userBubbleText: Color,
     val accentBlue: Color,
+    val accentCyan: Color,
     val accentGreen: Color,
     val accentPurple: Color,
     val accentGold: Color,
@@ -81,6 +82,7 @@ val DarkAssistantColors = AssistantColorScheme(
     userBubble = Color(0xFF1B2D4B),
     userBubbleText = Color.White,
     accentBlue = Color(0xFF2C67C5), // Specified #2C67C5
+    accentCyan = Color(0xFF22D3EE),
     accentGreen = Color(0xFF10A37F),
     accentPurple = Color(0xFFB38CFF),
     accentGold = Color(0xFFFACC15),
@@ -108,6 +110,7 @@ val LightAssistantColors = AssistantColorScheme(
     userBubble = Color(0xFFE5E7EB),
     userBubbleText = Color(0xFF0D0D0D),
     accentBlue = Color(0xFF2C67C5),
+    accentCyan = Color(0xFF0891B2),
     accentGreen = Color(0xFF10A37F),
     accentPurple = Color(0xFF7C3AED),
     accentGold = Color(0xFFA16207),

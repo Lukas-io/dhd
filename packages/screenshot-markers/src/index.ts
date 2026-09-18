@@ -157,6 +157,7 @@ export class ScreenshotMarkerPresenter {
     options: {
       reset?: boolean;
       lastTap?: ScreenshotMarkerPoint;
+      initialPointer?: ScreenshotMarkerPoint;
     } = {}
   ): ScreenshotMarkerRender {
     const displayId = normalizeDisplayId(observation.displayId);
@@ -165,6 +166,10 @@ export class ScreenshotMarkerPresenter {
     const dimensions = observation.screenshotDimensions;
     let state: MarkerState;
     if (options.reset || !compatible) {
+      const calibrationPoint =
+        options.initialPointer && pointInBounds(options.initialPointer, dimensions)
+          ? options.initialPointer
+          : this.#chooseAnchor(dimensions);
       state = {
         packageName: observation.packageName,
         rotation: observation.rotation,
@@ -172,7 +177,7 @@ export class ScreenshotMarkerPresenter {
         height: dimensions.height,
         marker: {
           kind: "calibration" as const,
-          ...this.#chooseAnchor(dimensions),
+          ...calibrationPoint,
           coordinateSpace: "display" as const
         }
       };

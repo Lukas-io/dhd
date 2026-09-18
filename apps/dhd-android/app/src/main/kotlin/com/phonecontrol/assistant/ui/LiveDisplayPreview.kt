@@ -12,7 +12,6 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -46,7 +45,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.geometry.Offset
@@ -111,7 +109,7 @@ data class LiveDisplayPreviewState(
      * current run's message group.
      */
     val runSessionKey: String? = null,
-    /** Latest successful gesture to render above the read-only stream. */
+    /** Latest pointer feedback to render above the read-only stream. */
     val pointerEvent: TaskPointerEvent? = null,
     /** Sanitized purpose shown in the full-screen viewer footer. */
     val purpose: String? = null,
@@ -229,8 +227,11 @@ enum class LiveDisplayPreviewStatus {
 const val DEFAULT_LIVE_DISPLAY_PREVIEW_ASPECT_RATIO = 9f / 16f
 
 private const val FULLSCREEN_DISPLAY_SCALE = 0.90f
-private const val FULLSCREEN_DISPLAY_CORNER_RADIUS_DP = 12
+internal const val LIVE_DISPLAY_CORNER_RADIUS_DP = 12
+private val LIVE_DISPLAY_SHADOW_ELEVATION = 2.dp
 private val FULLSCREEN_PURPOSE_SLOT_HEIGHT = 48.dp
+
+internal fun liveDisplayCornerShape() = RoundedCornerShape(LIVE_DISPLAY_CORNER_RADIUS_DP.dp)
 
 /**
  * Renders the agent's virtual display continuously into a read-only surface.
@@ -250,8 +251,6 @@ fun LiveDisplayPreview(
     onExpand: () -> Unit = {},
     onExpandBoundsChanged: (Rect?) -> Unit = {},
     showCardChrome: Boolean = true,
-    /** Agent lifecycle shown separately from the decoder's stream status. */
-    agentLifecycle: TaskDisplayLifecycle? = null,
 ) {
     val latestOnSurfaceAvailable = rememberUpdatedState(onSurfaceAvailable)
     val latestOnSurfaceDestroyed = rememberUpdatedState(onSurfaceDestroyed)
@@ -290,7 +289,7 @@ fun LiveDisplayPreview(
 
     val previewAspectRatio = state.aspectRatio.takeIf { it.isFinite() && it > 0f }
         ?: DEFAULT_LIVE_DISPLAY_PREVIEW_ASPECT_RATIO
-    val shape = RoundedCornerShape(FULLSCREEN_DISPLAY_CORNER_RADIUS_DP.dp)
+    val shape = liveDisplayCornerShape()
     val previewContainerModifier = if (showCardChrome) {
         Modifier
             .background(colors.surfaceCard, shape)
@@ -327,10 +326,11 @@ fun LiveDisplayPreview(
         MaterialSurface(
             modifier = Modifier
                 .width(previewWidth)
-                .height(previewHeight),
+                .height(previewHeight)
+                .clip(shape),
             shape = shape,
             color = if (showCardChrome) colors.surfaceCard else Color.Transparent,
-            shadowElevation = if (showCardChrome) 2.dp else 0.dp,
+            shadowElevation = if (showCardChrome) LIVE_DISPLAY_SHADOW_ELEVATION else 0.dp,
         ) {
             Box(modifier = Modifier.fillMaxSize()) {
                 AndroidView(
@@ -360,16 +360,7 @@ fun LiveDisplayPreview(
                     PreviewStatusOverlay(state = state)
                 }
 
-                if (state.status == LiveDisplayPreviewStatus.LIVE &&
-                    agentLifecycle != null &&
-                    agentLifecycle != TaskDisplayLifecycle.RUNNING
-                ) {
-                    RetainedPreviewStatusBadge(lifecycle = agentLifecycle)
-                }
-
-                if (state.status == LiveDisplayPreviewStatus.LIVE &&
-                    (agentLifecycle == null || agentLifecycle == TaskDisplayLifecycle.RUNNING)
-                ) {
+                if (state.status == LiveDisplayPreviewStatus.LIVE) {
                     TaskPointerOverlay(event = state.pointerEvent)
                 }
             }
@@ -406,34 +397,6 @@ fun LiveDisplayPreview(
     }
 }
 
-@Composable
-private fun BoxScope.RetainedPreviewStatusBadge(lifecycle: TaskDisplayLifecycle) {
-    val colors = LocalAssistantColors.current
-    val statusColor = when (lifecycle) {
-        TaskDisplayLifecycle.PAUSED -> colors.warningAmber
-        TaskDisplayLifecycle.FAILED -> colors.errorRed
-        TaskDisplayLifecycle.COMPLETED -> colors.accentGreen
-        TaskDisplayLifecycle.STOPPED -> colors.textSecondary
-        else -> colors.accentBlue
-    }
-    MaterialSurface(
-        modifier = Modifier
-            .align(Alignment.TopStart)
-            .padding(8.dp),
-        shape = RoundedCornerShape(999.dp),
-        color = colors.composerBackground.copy(alpha = 0.92f),
-        border = BorderStroke(1.dp, statusColor.copy(alpha = 0.8f)),
-    ) {
-        Text(
-            text = lifecycle.displayLabel(),
-            color = statusColor,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-        )
-    }
-}
-
 /**
  * Reserves the inline preview's measured space while its surface is owned by
  * [FullScreenLiveDisplayViewer]. The placeholder deliberately has no
@@ -448,7 +411,7 @@ internal fun LiveDisplayPreviewPlaceholder(
     val colors = LocalAssistantColors.current
     val previewAspectRatio = state.aspectRatio.takeIf { it.isFinite() && it > 0f }
         ?: DEFAULT_LIVE_DISPLAY_PREVIEW_ASPECT_RATIO
-    val shape = RoundedCornerShape(FULLSCREEN_DISPLAY_CORNER_RADIUS_DP.dp)
+    val shape = liveDisplayCornerShape()
     val previewContainerModifier = if (showCardChrome) {
         Modifier
             .background(colors.surfaceCard, shape)
@@ -472,10 +435,11 @@ internal fun LiveDisplayPreviewPlaceholder(
         MaterialSurface(
             modifier = Modifier
                 .width(previewWidth)
-                .height(previewHeight),
+                .height(previewHeight)
+                .clip(shape),
             shape = shape,
             color = if (showCardChrome) colors.surfaceCard else Color.Transparent,
-            shadowElevation = if (showCardChrome) 2.dp else 0.dp,
+            shadowElevation = if (showCardChrome) LIVE_DISPLAY_SHADOW_ELEVATION else 0.dp,
         ) {
             Box(modifier = Modifier.fillMaxSize())
         }
@@ -502,10 +466,10 @@ fun FullScreenLiveDisplayViewer(
     onEndTaskDisplay: (TaskDisplayUiRecord) -> Unit = {},
 ) {
     val colors = LocalAssistantColors.current
+    val viewerBackground = if (colors.isDark) colors.surfaceCard else colors.background
     val title = record.appLabel
         ?: state.appLabel
         ?: "Task display"
-    val status = record.lifecycle.displayLabel()
     val purpose = record.currentPurpose
         ?: state.purpose
         ?: state.status.displayLabel()
@@ -531,12 +495,12 @@ fun FullScreenLiveDisplayViewer(
     ) {
         MaterialSurface(
             modifier = Modifier.fillMaxSize(),
-            color = colors.background,
+            color = viewerBackground,
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(colors.background)
+                    .background(viewerBackground)
                     .statusBarsPadding(),
             ) {
                 Row(
@@ -575,12 +539,6 @@ fun FullScreenLiveDisplayViewer(
                             fontWeight = FontWeight.SemiBold,
                             maxLines = 1,
                         )
-                        Text(
-                            text = status,
-                            color = colors.textSecondary,
-                            fontSize = 12.sp,
-                            maxLines = 1,
-                        )
                     }
                 }
 
@@ -588,7 +546,7 @@ fun FullScreenLiveDisplayViewer(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth()
-                        .background(colors.background),
+                        .background(viewerBackground),
                     contentAlignment = Alignment.Center,
                 ) {
                     val aspectRatio = state.aspectRatio.takeIf { it.isFinite() && it > 0f }
@@ -609,7 +567,7 @@ fun FullScreenLiveDisplayViewer(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(colors.background)
+                        .background(viewerBackground)
                         .navigationBarsPadding(),
                 ) {
                     Column(
@@ -780,7 +738,7 @@ private fun FullScreenPreviewSurface(
     val latestOnSurfaceAvailable = rememberUpdatedState(onSurfaceAvailable)
     val latestOnSurfaceDestroyed = rememberUpdatedState(onSurfaceDestroyed)
     var textureView by remember { mutableStateOf<ReadOnlyPreviewTextureView?>(null) }
-    val phoneShape = RoundedCornerShape(FULLSCREEN_DISPLAY_CORNER_RADIUS_DP.dp)
+    val phoneShape = liveDisplayCornerShape()
     val colors = LocalAssistantColors.current
 
     val previewLifecycle = LocalLifecycleOwner.current.lifecycle
@@ -807,20 +765,10 @@ private fun FullScreenPreviewSurface(
         modifier = Modifier
             .width(width)
             .height(height)
-            // Keep the rendered display geometry unchanged while giving the
-            // viewer a clear, soft blue frame around the phone-shaped surface.
-            .shadow(
-                elevation = 20.dp,
-                shape = phoneShape,
-                clip = false,
-                ambientColor = colors.accentBlue.copy(alpha = 0.72f),
-                spotColor = colors.accentBlue.copy(alpha = 0.58f),
-            )
-            .border(BorderStroke(2.dp, colors.accentBlue.copy(alpha = 0.86f)), phoneShape)
             .clip(phoneShape),
         shape = phoneShape,
-        color = Color.Black,
-        shadowElevation = 0.dp,
+        color = colors.surfaceCard,
+        shadowElevation = LIVE_DISPLAY_SHADOW_ELEVATION,
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
             AndroidView(

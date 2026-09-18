@@ -26,9 +26,6 @@ import com.phonecontrol.assistant.domain.ObservationSize
 import com.phonecontrol.assistant.domain.ObservationSnapshot
 import com.phonecontrol.assistant.domain.PhoneAction
 import com.phonecontrol.assistant.domain.ReasoningEffort
-import com.phonecontrol.assistant.domain.ScrollAction
-import com.phonecontrol.assistant.domain.ScrollAmount
-import com.phonecontrol.assistant.domain.ScrollDirection
 import com.phonecontrol.assistant.domain.StaleObservationDiagnostics
 import com.phonecontrol.assistant.domain.StaleObservationReason
 import com.phonecontrol.assistant.domain.SwipeAction
@@ -668,25 +665,50 @@ class DevBridgeServer(
         return if (actionType == "open_app") DHD_OPEN_APP_TOOL else DHD_EXECUTE_TOOL
     }
 
-    private fun toolPurpose(toolName: String, json: JSONObject): String = when (toolName) {
-        DHD_OBSERVE_TOOL -> json.optString("purpose").trim().takeIf(String::isNotBlank)
-            ?: defaultDhdToolPurpose(toolName)
-        DHD_OPEN_APP_TOOL -> openingAppPurpose(json)
-        DHD_SET_APP_DISPLAY_LAYOUT_TOOL -> appDisplayLayoutPurpose(json)
-        DHD_EXECUTE_TOOL -> {
-            val action = json.optJSONObject("action")
-            if (action?.optString("type")?.equals("open_app", ignoreCase = true) == true) {
-                openingAppPurpose(json)
-            } else {
-                val purpose = action
-                    ?.optJSONObject("metadata")
-                    ?.optString("purpose")
-                    ?.trim()
-                purpose?.takeIf(String::isNotBlank) ?: defaultDhdToolPurpose(toolName)
+    private fun toolPurpose(toolName: String, json: JSONObject): String =
+        metadataPurpose(json) ?: when (toolName) {
+            DHD_OBSERVE_TOOL -> json.optString("purpose").trim().takeIf(String::isNotBlank)
+                ?: defaultDhdToolPurpose(toolName)
+            DHD_OPEN_APP_TOOL -> openingAppPurpose(json)
+            DHD_SET_APP_DISPLAY_LAYOUT_TOOL -> appDisplayLayoutPurpose(json)
+            DHD_EXECUTE_TOOL -> {
+                val action = json.optJSONObject("action")
+                if (action?.optString("type")?.equals("open_app", ignoreCase = true) == true) {
+                    openingAppPurpose(json)
+                } else {
+                    defaultDhdToolPurpose(toolName)
+                }
             }
+            "dhd_request_attention" -> defaultDhdToolPurpose(toolName)
+            else -> defaultDhdToolPurpose(toolName)
         }
-        "dhd_request_attention" -> defaultDhdToolPurpose(toolName)
-        else -> defaultDhdToolPurpose(toolName)
+
+    /** Read the user-visible purpose from each tool's metadata shape. */
+    private fun metadataPurpose(json: JSONObject): String? {
+        val directPurpose = json.optJSONObject("metadata")
+            ?.optString("purpose")
+            ?.trim()
+            ?.takeIf(String::isNotBlank)
+        if (directPurpose != null) return directPurpose
+
+        val actionPurpose = json.optJSONObject("action")
+            ?.optJSONObject("metadata")
+            ?.optString("purpose")
+            ?.trim()
+            ?.takeIf(String::isNotBlank)
+        if (actionPurpose != null) return actionPurpose
+
+        val actions = json.optJSONArray("actions")
+        for (index in 0 until (actions?.length() ?: 0)) {
+            val purpose = actions
+                ?.optJSONObject(index)
+                ?.optJSONObject("metadata")
+                ?.optString("purpose")
+                ?.trim()
+                ?.takeIf(String::isNotBlank)
+            if (purpose != null) return purpose
+        }
+        return null
     }
 
     private fun openingAppPurpose(json: JSONObject): String {
@@ -1858,13 +1880,16 @@ class DevBridgeServer(
         } else {
             parsedAction
         }
-        // This bridge endpoint is the public dhd_execute tool. Preserve that
-        // identity on the activity event so the live-display footer can use
-        // the same green accent as the conversation trace row.
+        // Preserve the bridge tool identity on the activity event so the live
+        // tool call and its lifecycle row can be rendered as one entry.
+        val activityToolName = json.optString("tool")
+            .trim()
+            .takeIf(String::isNotBlank)
+            ?: fallbackActionToolName(json)
         val result = coordinator.executeAction(
             action = action,
             observation = observation,
-            toolName = DHD_EXECUTE_TOOL,
+            toolName = activityToolName,
             targetDisplay = target?.session,
         )
         writeActionResult(writer, requestId, wireActionName(action), result)
@@ -1934,6 +1959,11 @@ class DevBridgeServer(
             }
 
             is ObservationCaptureResult.Succeeded -> {
+                val initialPointer = if (action is OpenAppAction) {
+                    coordinator.publishCalibrationPointerEvent(captured.snapshot)
+                } else {
+                    null
+                }
                 remember(captured.snapshot)
                 val response = JSONObject()
                     .put("type", "completed")
@@ -1944,6 +1974,14 @@ class DevBridgeServer(
                     .put("observation", snapshotJson(captured.snapshot))
                     .put("screenshotBase64", Base64.encodeToString(captured.screenshot, Base64.NO_WRAP))
                     .put("screenshotMimeType", "image/png")
+                initialPointer?.let { pointer ->
+                    response.put(
+                        "initialPointer",
+                        JSONObject()
+                            .put("x", pointer.x)
+                            .put("y", pointer.y),
+                    )
+                }
                 addBeforeDebug(
                     response,
                     observation,
@@ -2251,19 +2289,6 @@ class DevBridgeServer(
                 metadata = metadata,
             )
 
-            "scroll" -> {
-                val hasX = json.has("x")
-                val hasY = json.has("y")
-                require(hasX == hasY) { "Scroll x and y must be provided together." }
-                ScrollAction(
-                    direction = enumValue<ScrollDirection>(json.getString("direction")),
-                    amount = enumValue<ScrollAmount>(json.getString("amount")),
-                    metadata = metadata,
-                    x = if (hasX) json.getInt("x") else null,
-                    y = if (hasY) json.getInt("y") else null,
-                )
-            }
-
             "back" -> BackAction(metadata)
 
             "keypress" -> KeypressAction(
@@ -2274,7 +2299,7 @@ class DevBridgeServer(
             "wait" -> WaitAction(json.getLong("durationMs"), metadata)
 
             else -> throw IllegalArgumentException(
-                "Unsupported action type. Use open_app, tap, type, swipe, scroll, back, keypress, or wait.",
+                "Unsupported action type. Use open_app, tap, type, swipe, back, keypress, or wait.",
             )
         }
     }
@@ -2312,7 +2337,6 @@ class DevBridgeServer(
         is TapAction -> "tap"
         is TypeAction -> "type"
         is SwipeAction -> "swipe"
-        is ScrollAction -> "scroll"
         is BackAction -> "back"
         is KeypressAction -> "keypress"
         is WaitAction -> "wait"

@@ -17,7 +17,6 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 import com.phonecontrol.assistant.domain.ActivityEvent
 import com.phonecontrol.assistant.domain.ActivityEventKind
 import com.phonecontrol.assistant.domain.ActionType
-import com.phonecontrol.assistant.domain.userFacingActivityLabel
 import com.phonecontrol.assistant.execution.TaskDisplayRecord
 import com.phonecontrol.assistant.execution.TaskDisplayStatus
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -578,7 +577,7 @@ class ConversationStore(context: Context) {
         val runId = event.sessionId ?: return@synchronized
         val run = dao.findRun(runId) ?: return@synchronized
         val purpose = event.purpose
-            ?.let { userFacingActivityLabel(event.actionType, it, event.targetDescription) }
+            ?.trim()
             ?.take(MAX_PURPOSE_CHARS)
             ?.ifBlank { null }
         if (purpose != null && event.kind in PURPOSE_EVENT_KINDS) {

@@ -2,16 +2,14 @@ package com.phonecontrol.assistant.session
 
 import com.phonecontrol.assistant.domain.ActivityEvent
 import com.phonecontrol.assistant.domain.ActivityEventKind
+import com.phonecontrol.assistant.domain.ClickPhase
 import com.phonecontrol.assistant.domain.ObservationSnapshot
 import com.phonecontrol.assistant.domain.PhoneAction
 import com.phonecontrol.assistant.domain.ReasoningEffort
-import com.phonecontrol.assistant.domain.ScrollAction
 import com.phonecontrol.assistant.domain.SwipeAction
 import com.phonecontrol.assistant.domain.TapAction
 import com.phonecontrol.assistant.domain.TaskPointerEvent
 import com.phonecontrol.assistant.domain.StaleObservationDiagnostics
-import com.phonecontrol.assistant.domain.TASK_SCROLL_DURATION_MS
-import com.phonecontrol.assistant.domain.calculateTaskScrollGesture
 import com.phonecontrol.assistant.domain.userFacingActivityLabel
 import com.phonecontrol.assistant.data.ConversationStore
 import com.phonecontrol.assistant.data.RunStatus
@@ -33,6 +31,15 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlin.math.roundToInt
+import kotlin.random.Random
+
+private val CALIBRATION_ANCHORS = arrayOf(
+    0.18f to 0.16f,
+    0.82f to 0.16f,
+    0.18f to 0.84f,
+    0.82f to 0.84f,
+)
 
 sealed interface SessionState {
     data object Idle : SessionState
@@ -166,7 +173,7 @@ class SessionCoordinator(
     val events: StateFlow<List<ActivityEvent>> = _events.asStateFlow()
     val toolCalls: StateFlow<List<DhdToolCall>> = _toolCalls.asStateFlow()
 
-    /** Latest successful task-display gesture for the read-only live preview. */
+    /** Latest task-display pointer feedback for the read-only live preview. */
     val pointerEvent: StateFlow<TaskPointerEvent?> = _pointerEvent.asStateFlow()
 
     /** Stable owner key used by the phone bridge to choose the task display. */
@@ -820,6 +827,7 @@ class SessionCoordinator(
                 sessionId = running.sessionId,
                 actionType = action.type,
                 toolName = toolName,
+                purpose = action.metadata.purpose,
                 observationId = action.metadata.observationId,
                 targetDescription = action.metadata.targetDescription,
             )
@@ -836,13 +844,13 @@ class SessionCoordinator(
         setCurrentPurpose(displayPurpose)
         appendEvent(
             ActivityEventKind.ACTION_PROPOSED,
-            // Keep the provider's safe explanation as the expandable detail;
-            // the store derives the compact label from purpose + target.
+            // Keep the provider's metadata purpose as the activity label. The
+            // human-readable current-purpose status may still use displayPurpose.
             action.metadata.purpose,
             sessionId = running.sessionId,
             actionType = action.type,
             toolName = toolName,
-            purpose = displayPurpose,
+            purpose = action.metadata.purpose,
             observationId = action.metadata.observationId,
             targetDescription = action.metadata.targetDescription,
         )
@@ -865,7 +873,7 @@ class SessionCoordinator(
                     sessionId = running.sessionId,
                     actionType = action.type,
                     toolName = toolName,
-                    purpose = displayPurpose,
+                    purpose = action.metadata.purpose,
                     observationId = action.metadata.observationId,
                     targetDescription = action.metadata.targetDescription,
                 )
@@ -879,11 +887,63 @@ class SessionCoordinator(
             sessionId = running.sessionId,
             actionType = action.type,
             toolName = toolName,
-            purpose = displayPurpose,
+            purpose = action.metadata.purpose,
             observationId = action.metadata.observationId,
             targetDescription = action.metadata.targetDescription,
         )
-        val result = transport.executeForSession(targetSessionKey, action, observation)
+        val tapAction = action as? TapAction
+        val stillActiveBeforeDispatch = synchronized(lock) {
+            _state.value.sessionIdOrNull == running.sessionId && _state.value.isActive
+        }
+        if (!stillActiveBeforeDispatch) return ActionExecutionResult.SessionNotRunning
+
+        var clickPressPublished = false
+        val beforeInput = if (tapAction != null && observation != null) {
+            {
+                if (!clickPressPublished) {
+                    clickPressPublished = true
+                    publishPointerEvent(
+                        sessionId = running.sessionId,
+                        action = tapAction,
+                        observation = observation,
+                        clickPhase = ClickPhase.PRESSED,
+                    )
+                }
+            }
+        } else {
+            null
+        }
+        val onPointerMove = when {
+            tapAction != null && observation != null -> {
+                {
+                    publishPointerEvent(
+                        sessionId = running.sessionId,
+                        action = tapAction,
+                        observation = observation,
+                        clickPhase = ClickPhase.MOVING,
+                    )
+                }
+            }
+
+            action is SwipeAction && observation != null -> {
+                {
+                    publishPointerEvent(
+                        sessionId = running.sessionId,
+                        action = action,
+                        observation = observation,
+                    )
+                }
+            }
+
+            else -> null
+        }
+        val result = transport.executeForSession(
+            targetSessionKey,
+            action,
+            observation,
+            beforeInput,
+            onPointerMove,
+        )
         val stillActive = synchronized(lock) {
             _state.value.sessionIdOrNull == running.sessionId && _state.value.isActive
         }
@@ -893,30 +953,30 @@ class SessionCoordinator(
         } else {
             ActivityEventKind.ACTION_FAILED
         }
-        if (result is TransportResult.Succeeded) {
-            publishPointerEvent(running.sessionId, action, observation)
-        }
         appendEvent(
             eventKind,
             transportMessage(result),
             sessionId = running.sessionId,
             actionType = action.type,
             toolName = toolName,
-            purpose = displayPurpose,
+            purpose = action.metadata.purpose,
             observationId = action.metadata.observationId,
             targetDescription = action.metadata.targetDescription,
         )
         return ActionExecutionResult.TransportFinished(result)
     }
 
-    /** Publish visual feedback only after the display-scoped command succeeds. */
+    /** Publish visual feedback for a gesture or one phase of a click. */
     private fun publishPointerEvent(
         sessionId: String,
         action: PhoneAction,
         observation: ObservationSnapshot?,
+        clickPhase: ClickPhase = ClickPhase.PRESSED,
     ) = synchronized(lock) {
         val current = _state.value
-        if (current.sessionIdOrNull != sessionId || !current.isActive || observation == null) return@synchronized
+        if (current.sessionIdOrNull != sessionId || !current.isActive || observation == null) {
+            return@synchronized
+        }
         val sequence = (_pointerEvent.value?.sequence ?: 0L) + 1L
         val nextEvent = when (action) {
             is TapAction -> TaskPointerEvent.Click(
@@ -926,6 +986,7 @@ class SessionCoordinator(
                 y = action.y,
                 displayWidth = observation.width,
                 displayHeight = observation.height,
+                phase = clickPhase,
             )
 
             is SwipeAction -> TaskPointerEvent.Swipe(
@@ -940,32 +1001,36 @@ class SessionCoordinator(
                 displayHeight = observation.height,
             )
 
-            is ScrollAction -> calculateTaskScrollGesture(
-                width = observation.width,
-                height = observation.height,
-                direction = action.direction,
-                amount = action.amount,
-                centerX = action.x,
-                centerY = action.y,
-            ).let { gesture ->
-                TaskPointerEvent.Scroll(
-                    sequence = sequence,
-                    sessionId = sessionId,
-                    direction = action.direction,
-                    amount = action.amount,
-                    startX = gesture.startX,
-                    startY = gesture.startY,
-                    endX = gesture.endX,
-                    endY = gesture.endY,
-                    durationMs = TASK_SCROLL_DURATION_MS,
-                    displayWidth = observation.width,
-                    displayHeight = observation.height,
-                )
-            }
-
             else -> return@synchronized
         }
         _pointerEvent.value = nextEvent
+    }
+
+    /**
+     * Publish the initial calibration cursor for a freshly opened task
+     * display. This is presentation metadata only; it does not dispatch an
+     * input action or alter the observation.
+     */
+    fun publishCalibrationPointerEvent(
+        observation: ObservationSnapshot,
+    ): TaskPointerEvent.Calibration? = synchronized(lock) {
+        val current = _state.value
+        val sessionId = current.sessionIdOrNull ?: return@synchronized null
+        if (!current.isActive || observation.width <= 0 || observation.height <= 0) {
+            return@synchronized null
+        }
+
+        val (xRatio, yRatio) = CALIBRATION_ANCHORS[Random.nextInt(CALIBRATION_ANCHORS.size)]
+        val nextEvent = TaskPointerEvent.Calibration(
+            sequence = (_pointerEvent.value?.sequence ?: 0L) + 1L,
+            sessionId = sessionId,
+            x = (observation.width * xRatio).roundToInt().coerceIn(0, observation.width - 1),
+            y = (observation.height * yRatio).roundToInt().coerceIn(0, observation.height - 1),
+            displayWidth = observation.width,
+            displayHeight = observation.height,
+        )
+        _pointerEvent.value = nextEvent
+        nextEvent
     }
 
     fun close() {

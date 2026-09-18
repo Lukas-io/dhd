@@ -176,6 +176,36 @@ describe("DHD phone tool contract", () => {
     expect((tapped.structuredContent as Record<string, any>).screenshotMarker).not.toEqual(firstMarker);
   });
 
+  it("uses the Android-provided initial pointer and keeps it out of model output", () => {
+    const result = toMcpResult(
+      {
+        type: "completed",
+        ok: true,
+        initialPointer: { x: 0, y: 0 },
+        observation: {
+          id: "marker-obs-initial-pointer",
+          displayId: 93,
+          packageName: "com.example.app",
+          rotation: 0,
+          width: 1,
+          height: 1,
+        },
+        screenshotBase64: pngBase64,
+        screenshotMimeType: "image/png",
+      },
+      undefined,
+      { resetMarker: true, initialPointer: { x: 0, y: 0 } },
+    );
+
+    expect((result.structuredContent as Record<string, any>).screenshotMarker).toEqual({
+      kind: "calibration",
+      x: 0,
+      y: 0,
+      coordinateSpace: "display",
+    });
+    expect(result.structuredContent).not.toHaveProperty("initialPointer");
+  });
+
   it("returns compact before-tap evidence followed by the current post-action image", () => {
     const result = toMcpResult(
       {
@@ -382,7 +412,7 @@ describe("DHD phone tool contract", () => {
     const openAppMetadata = record(record(openApp.inputSchema).properties).metadata;
     expect(record(openAppMetadata).properties).not.toHaveProperty("observationId");
     expect(record(openAppMetadata).required).toEqual(["purpose", "targetDescription"]);
-    expect(actionTypes).toEqual(["tap", "type", "swipe", "scroll", "back", "keypress", "wait"]);
+    expect(actionTypes).toEqual(["tap", "type", "swipe", "back", "keypress", "wait"]);
     expect(actionTypes).not.toContain("open_app");
     expect(actionTypes).not.toContain("click_coordinate");
     const firstActionVariant = record(variants[0]);
@@ -418,6 +448,12 @@ describe("DHD phone tool contract", () => {
       type: "click_coordinate",
       x: 10,
       y: 20,
+      metadata
+    }).success).toBe(false);
+    expect(dhdExecuteActionSchema.safeParse({
+      type: "scroll",
+      direction: "down",
+      amount: "medium",
       metadata
     }).success).toBe(false);
   });
@@ -556,21 +592,22 @@ describe("DHD phone tool contract", () => {
     }).success).toBe(false);
   });
 
-  it("accepts an optional scroll gesture center in both execution surfaces", () => {
-    const scroll = {
-      type: "scroll" as const,
-      direction: "down" as const,
-      amount: "medium" as const,
-      x: 180,
-      y: 600,
+  it("accepts coordinate-scoped swipes in both execution surfaces", () => {
+    const swipe = {
+      type: "swipe" as const,
+      startX: 180,
+      startY: 600,
+      endX: 180,
+      endY: 200,
+      durationMs: 350,
       metadata
     };
 
-    expect(dhdExecuteActionSchema.safeParse(scroll).success).toBe(true);
+    expect(dhdExecuteActionSchema.safeParse(swipe).success).toBe(true);
     expect(dhdExecuteSequenceInputSchema.safeParse({
       observationId: "obs-1",
       actions: [{
-        ...scroll,
+        ...swipe,
         metadata: {
           purpose: metadata.purpose,
           targetDescription: metadata.targetDescription

@@ -89,7 +89,82 @@ class TimelineGroupingTest {
         )
     }
 
-    private fun activity(id: String, runId: String, timestampEpochMs: Long) =
+    @Test
+    fun `active trace keeps current action and four recent actions`() {
+        val activities = (1..8).map { index ->
+            activity(
+                id = "activity-$index",
+                runId = "run",
+                timestampEpochMs = index * 1_000L,
+                status = if (index == 8) "running" else "completed",
+            )
+        }
+
+        val trace = capActivityTrace(
+            activities = activities,
+            active = true,
+            currentActivityId = "activity-8",
+        )
+
+        assertEquals(
+            listOf("activity-4", "activity-5", "activity-6", "activity-7", "activity-8"),
+            trace.visibleActivities.map { it.id },
+        )
+        assertEquals(3, trace.earlierCount)
+        assertEquals("activity-8", trace.currentActivityId)
+        assertFalse(trace.hasSyntheticCurrent)
+    }
+
+    @Test
+    fun `active trace reserves a row for a tool before its activity arrives`() {
+        val activities = (1..8).map { index ->
+            activity(
+                id = "activity-$index",
+                runId = "run",
+                timestampEpochMs = index * 1_000L,
+            )
+        }
+
+        val trace = capActivityTrace(
+            activities = activities,
+            active = true,
+            hasCurrentTool = true,
+        )
+
+        assertEquals(
+            listOf("activity-5", "activity-6", "activity-7", "activity-8"),
+            trace.visibleActivities.map { it.id },
+        )
+        assertEquals(4, trace.earlierCount)
+        assertTrue(trace.hasSyntheticCurrent)
+    }
+
+    @Test
+    fun `completed trace keeps the five most recent actions`() {
+        val activities = (1..8).map { index ->
+            activity(
+                id = "activity-$index",
+                runId = "run",
+                timestampEpochMs = index * 1_000L,
+            )
+        }
+
+        val trace = capActivityTrace(activities, active = false)
+
+        assertEquals(
+            listOf("activity-4", "activity-5", "activity-6", "activity-7", "activity-8"),
+            trace.visibleActivities.map { it.id },
+        )
+        assertEquals(3, trace.earlierCount)
+        assertEquals("+37 earlier actions", earlierActionsLabel(37))
+    }
+
+    private fun activity(
+        id: String,
+        runId: String,
+        timestampEpochMs: Long,
+        status: String = "completed",
+    ) =
         TimelineItem.Activity(
             id = id,
             runId = runId,
@@ -97,7 +172,7 @@ class TimelineGroupingTest {
             targetDescription = null,
             toolName = "dhd_open_app",
             actionType = "OPEN_APP",
-            status = "completed",
+            status = status,
             message = "Opening the app",
             createdAtEpochMs = timestampEpochMs,
             timestampEpochMs = timestampEpochMs,

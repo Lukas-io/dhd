@@ -80,6 +80,7 @@ import com.phonecontrol.assistant.developer.TaskPreviewState
 import com.phonecontrol.assistant.developer.DeveloperConnectionState
 import com.phonecontrol.assistant.developer.DeveloperModeStatus
 import com.phonecontrol.assistant.domain.ReasoningEffort
+import com.phonecontrol.assistant.domain.TaskPointerEvent
 import com.phonecontrol.assistant.execution.TaskDisplaySession
 import com.phonecontrol.assistant.session.DhdToolCall
 import com.phonecontrol.assistant.session.DhdToolCallStatus
@@ -93,6 +94,7 @@ import com.phonecontrol.assistant.ui.MarkdownContent
 import com.phonecontrol.assistant.ui.ReasoningEffortButton
 import com.phonecontrol.assistant.ui.ReasoningEffortTrack
 import com.phonecontrol.assistant.ui.THINKING_WORDS
+import com.phonecontrol.assistant.ui.liveDisplayCornerShape
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlin.math.PI
@@ -780,6 +782,7 @@ private fun RecoveryActionButton(
 private fun FloatingVirtualDisplayCard(
     previewState: TaskPreviewState,
     taskDisplaySession: TaskDisplaySession?,
+    pointerEvent: TaskPointerEvent?,
     onHide: () -> Unit,
     onContinue: () -> Unit,
     onSurfaceAvailable: (TaskDisplaySession, AndroidSurface) -> Unit,
@@ -787,7 +790,7 @@ private fun FloatingVirtualDisplayCard(
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalAssistantColors.current
-    val cardShape = RoundedCornerShape(28.dp)
+    val cardShape = liveDisplayCornerShape()
 
     Column(
         modifier = modifier.fillMaxWidth(),
@@ -818,6 +821,7 @@ private fun FloatingVirtualDisplayCard(
                 OverlayVirtualDisplayPreview(
                     previewState = previewState,
                     taskDisplaySession = taskDisplaySession,
+                    pointerEvent = pointerEvent,
                     onHide = onHide,
                     onContinue = onContinue,
                     onSurfaceAvailable = onSurfaceAvailable,
@@ -836,6 +840,7 @@ fun OverlayPanel(
     resultMessage: StateFlow<String?>,
     developerStatus: StateFlow<DeveloperModeStatus>,
     companionConnected: StateFlow<Boolean>,
+    pointerEvent: StateFlow<TaskPointerEvent?>,
     onExpand: () -> Unit,
     onNewRequest: () -> Unit,
     onSubmit: (String) -> Unit,
@@ -868,6 +873,7 @@ fun OverlayPanel(
     val isOverlayHidden by overlayHidden.collectAsState()
     val currentDeveloperStatus by developerStatus.collectAsState()
     val isCompanionConnected by companionConnected.collectAsState()
+    val latestPointerEvent by pointerEvent.collectAsState()
     val active = state is SessionState.Running || state is SessionState.Paused
     val context = LocalContext.current
     val preferences = remember(context) {
@@ -1131,6 +1137,10 @@ fun OverlayPanel(
                 overlayHidden = isOverlayHidden,
                 hasDisplaySession = displaySession != null,
             )) {
+            val displayPointerEvent = latestPointerEvent?.takeIf { event ->
+                event.sessionId == state.sessionIdOrNull() ||
+                    event.sessionId == displaySession?.sessionKey
+            }
             Popup(
                 alignment = Alignment.BottomCenter,
                 offset = IntOffset(
@@ -1150,6 +1160,7 @@ fun OverlayPanel(
                 FloatingVirtualDisplayCard(
                     previewState = previewState,
                     taskDisplaySession = displaySession,
+                    pointerEvent = displayPointerEvent,
                     onHide = { previewVisible = false },
                     onContinue = onContinueInDhd,
                     onSurfaceAvailable = onTaskPreviewSurfaceAvailable,
@@ -1989,6 +2000,7 @@ private fun TextToolbarItem(
 private fun OverlayVirtualDisplayPreview(
     previewState: TaskPreviewState,
     taskDisplaySession: TaskDisplaySession?,
+    pointerEvent: TaskPointerEvent?,
     onHide: () -> Unit,
     onContinue: () -> Unit,
     onSurfaceAvailable: (TaskDisplaySession, AndroidSurface) -> Unit,
@@ -2020,7 +2032,9 @@ private fun OverlayVirtualDisplayPreview(
                     displaySession.geometry.height.toFloat(),
                 sessionKey = displaySession.sessionKey,
             )
-        }?.let { preview -> displaySession to preview }
+        }?.let { preview ->
+            displaySession to preview.copy(pointerEvent = pointerEvent)
+        }
     }
     val statusMessage = when (previewState) {
         TaskPreviewState.Detached -> "The virtual display will appear when a task opens one."
@@ -2057,7 +2071,7 @@ private fun OverlayVirtualDisplayPreview(
                     onSurfaceDestroyed(displaySession, surface, release)
                 },
                 onExpand = onContinue,
-                showCardChrome = false,
+                showCardChrome = true,
             )
         } else {
             Text(

@@ -6,7 +6,6 @@ enum class ActionType {
     TAP,
     TYPE,
     SWIPE,
-    SCROLL,
     BACK,
     KEYPRESS,
     WAIT,
@@ -17,19 +16,6 @@ enum class KeypressKey {
     HOME,
     ENTER,
     DELETE,
-}
-
-enum class ScrollDirection {
-    UP,
-    DOWN,
-    LEFT,
-    RIGHT,
-}
-
-enum class ScrollAmount {
-    SMALL,
-    MEDIUM,
-    LARGE,
 }
 
 /**
@@ -116,23 +102,6 @@ data class SwipeAction(
     }
 
     override val type: ActionType = ActionType.SWIPE
-}
-
-data class ScrollAction(
-    val direction: ScrollDirection,
-    val amount: ScrollAmount,
-    override val metadata: ActionMetadata,
-    /** Optional center of the scroll gesture in task-display pixels. */
-    val x: Int? = null,
-    val y: Int? = null,
-) : PhoneAction {
-    init {
-        require((x == null) == (y == null)) { "Scroll x and y must be provided together." }
-        require(x == null || x >= 0) { "Scroll x must be non-negative" }
-        require(y == null || y >= 0) { "Scroll y must be non-negative" }
-    }
-
-    override val type: ActionType = ActionType.SCROLL
 }
 
 data class BackAction(
@@ -249,10 +218,10 @@ fun userFacingActivityLabel(
             cleanPurpose.startsWith("Entering ", ignoreCase = true) -> cleanPurpose
             else -> "Entering text"
         }
-        ActionType.SWIPE, ActionType.SCROLL -> when {
-            target.isNotBlank() -> "Scrolling $target"
-            cleanPurpose.startsWith("Scrolling ", ignoreCase = true) -> cleanPurpose
-            else -> "Scrolling"
+        ActionType.SWIPE -> when {
+            target.isNotBlank() -> "Swiping $target"
+            cleanPurpose.startsWith("Swiping ", ignoreCase = true) -> cleanPurpose
+            else -> "Swiping"
         }
         ActionType.BACK -> "Going back"
         ActionType.KEYPRESS -> "Pressing ${cleanTarget.ifBlank { "the key" }}"
@@ -293,8 +262,7 @@ private fun String.cleanActivityText(): String {
         "type" to "Typing",
         "tap" to "Tapping",
         "click" to "Tapping",
-        "scroll" to "Scrolling",
-        "swipe" to "Scrolling",
+        "swipe" to "Swiping",
         "wait" to "Waiting",
         "press" to "Pressing",
     )[firstWord]

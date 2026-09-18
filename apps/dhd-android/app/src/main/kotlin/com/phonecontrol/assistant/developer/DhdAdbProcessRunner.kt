@@ -8,8 +8,19 @@ class DhdAdbProcessRunner(
     private val controller: DhdAdbController,
 ) : PhoneProcessRunner {
     override suspend fun run(command: List<String>): PhoneProcessResult {
+        return run(command, onStarted = null)
+    }
+
+    override suspend fun run(
+        command: List<String>,
+        onStarted: (() -> Unit)?,
+    ): PhoneProcessResult {
         require(command.isNotEmpty()) { "An ADB command must not be empty." }
         val binaryOutput = command.size == 2 && command[0] == "screencap" && command[1] == "-p"
-        return controller.execute(command, binaryOutput = binaryOutput)
+        return controller.execute(
+            command,
+            binaryOutput = binaryOutput,
+            onStarted = onStarted,
+        )
     }
 }

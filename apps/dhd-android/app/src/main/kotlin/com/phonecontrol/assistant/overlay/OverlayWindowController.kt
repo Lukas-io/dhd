@@ -380,6 +380,7 @@ class OverlayWindowController(
                         resultMessage = resultMessage,
                         developerStatus = developerStatus,
                         companionConnected = companionConnected,
+                        pointerEvent = coordinator.pointerEvent,
                         taskDisplaySession = taskDisplaySession,
                         onKeyboardVisibilityChanged = ::onKeyboardVisibilityChanged,
                         onTextFieldFocusChanged = ::onTextFieldFocusChanged,
