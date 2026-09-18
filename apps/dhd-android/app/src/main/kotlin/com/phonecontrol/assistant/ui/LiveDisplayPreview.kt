@@ -252,8 +252,6 @@ fun LiveDisplayPreview(
     onExpand: () -> Unit = {},
     onExpandBoundsChanged: (Rect?) -> Unit = {},
     showCardChrome: Boolean = true,
-    /** Agent lifecycle shown separately from the decoder's stream status. */
-    agentLifecycle: TaskDisplayLifecycle? = null,
 ) {
     val latestOnSurfaceAvailable = rememberUpdatedState(onSurfaceAvailable)
     val latestOnSurfaceDestroyed = rememberUpdatedState(onSurfaceDestroyed)
@@ -363,16 +361,7 @@ fun LiveDisplayPreview(
                     PreviewStatusOverlay(state = state)
                 }
 
-                if (state.status == LiveDisplayPreviewStatus.LIVE &&
-                    agentLifecycle != null &&
-                    agentLifecycle != TaskDisplayLifecycle.RUNNING
-                ) {
-                    RetainedPreviewStatusBadge(lifecycle = agentLifecycle)
-                }
-
-                if (state.status == LiveDisplayPreviewStatus.LIVE &&
-                    (agentLifecycle == null || agentLifecycle == TaskDisplayLifecycle.RUNNING)
-                ) {
+                if (state.status == LiveDisplayPreviewStatus.LIVE) {
                     TaskPointerOverlay(event = state.pointerEvent)
                 }
             }
@@ -406,34 +395,6 @@ fun LiveDisplayPreview(
                 )
             }
         }
-    }
-}
-
-@Composable
-private fun BoxScope.RetainedPreviewStatusBadge(lifecycle: TaskDisplayLifecycle) {
-    val colors = LocalAssistantColors.current
-    val statusColor = when (lifecycle) {
-        TaskDisplayLifecycle.PAUSED -> colors.warningAmber
-        TaskDisplayLifecycle.FAILED -> colors.errorRed
-        TaskDisplayLifecycle.COMPLETED -> colors.accentGreen
-        TaskDisplayLifecycle.STOPPED -> colors.textSecondary
-        else -> colors.accentBlue
-    }
-    MaterialSurface(
-        modifier = Modifier
-            .align(Alignment.TopStart)
-            .padding(8.dp),
-        shape = RoundedCornerShape(999.dp),
-        color = colors.composerBackground.copy(alpha = 0.92f),
-        border = BorderStroke(1.dp, statusColor.copy(alpha = 0.8f)),
-    ) {
-        Text(
-            text = lifecycle.displayLabel(),
-            color = statusColor,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-        )
     }
 }
 
@@ -509,7 +470,6 @@ fun FullScreenLiveDisplayViewer(
     val title = record.appLabel
         ?: state.appLabel
         ?: "Task display"
-    val status = record.lifecycle.displayLabel()
     val purpose = record.currentPurpose
         ?: state.purpose
         ?: state.status.displayLabel()
@@ -577,12 +537,6 @@ fun FullScreenLiveDisplayViewer(
                             color = colors.textPrimary,
                             fontSize = 16.sp,
                             fontWeight = FontWeight.SemiBold,
-                            maxLines = 1,
-                        )
-                        Text(
-                            text = status,
-                            color = colors.textSecondary,
-                            fontSize = 12.sp,
                             maxLines = 1,
                         )
                     }

@@ -1033,7 +1033,6 @@ private fun TaskGroupCard(
                 onSurfaceDestroyed = onPreviewSurfaceDestroyed,
                 onExpand = { taskPreviewState.sessionKey?.let(onOpenPreview) },
                 onExpandBoundsChanged = onPreviewExpandBoundsChanged,
-                agentLifecycle = state.toPreviewLifecycle(),
             )
         } else if (previewExpandedForGroup) {
             // Fullscreen owns the decoder surface. Keep this equal-sized slot
@@ -4726,18 +4725,6 @@ private fun LiveDisplayPreviewState.isExpanded(expandedSessionKey: String?): Boo
         (sessionKey == expandedSessionKey || runSessionKey == expandedSessionKey)
 
 private fun SessionState.isActive(): Boolean = this is SessionState.Running || this is SessionState.Paused
-
-private fun SessionState.toPreviewLifecycle(): TaskDisplayLifecycle? = when (this) {
-    is SessionState.Running -> if (attentionReason != null) {
-        TaskDisplayLifecycle.PAUSED
-    } else {
-        TaskDisplayLifecycle.RUNNING
-    }
-    is SessionState.Paused -> TaskDisplayLifecycle.PAUSED
-    is SessionState.Stopped -> TaskDisplayLifecycle.STOPPED
-    is SessionState.Completed -> TaskDisplayLifecycle.COMPLETED
-    SessionState.Idle -> null
-}
 
 private fun SessionState.sessionIdOrNullForUi(): String? = when (this) {
     SessionState.Idle -> null
