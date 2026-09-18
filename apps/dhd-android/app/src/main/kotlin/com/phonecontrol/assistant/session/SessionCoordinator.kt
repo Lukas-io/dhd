@@ -827,6 +827,7 @@ class SessionCoordinator(
                 sessionId = running.sessionId,
                 actionType = action.type,
                 toolName = toolName,
+                purpose = action.metadata.purpose,
                 observationId = action.metadata.observationId,
                 targetDescription = action.metadata.targetDescription,
             )
@@ -843,13 +844,13 @@ class SessionCoordinator(
         setCurrentPurpose(displayPurpose)
         appendEvent(
             ActivityEventKind.ACTION_PROPOSED,
-            // Keep the provider's safe explanation as the expandable detail;
-            // the store derives the compact label from purpose + target.
+            // Keep the provider's metadata purpose as the activity label. The
+            // human-readable current-purpose status may still use displayPurpose.
             action.metadata.purpose,
             sessionId = running.sessionId,
             actionType = action.type,
             toolName = toolName,
-            purpose = displayPurpose,
+            purpose = action.metadata.purpose,
             observationId = action.metadata.observationId,
             targetDescription = action.metadata.targetDescription,
         )
@@ -872,7 +873,7 @@ class SessionCoordinator(
                     sessionId = running.sessionId,
                     actionType = action.type,
                     toolName = toolName,
-                    purpose = displayPurpose,
+                    purpose = action.metadata.purpose,
                     observationId = action.metadata.observationId,
                     targetDescription = action.metadata.targetDescription,
                 )
@@ -886,7 +887,7 @@ class SessionCoordinator(
             sessionId = running.sessionId,
             actionType = action.type,
             toolName = toolName,
-            purpose = displayPurpose,
+            purpose = action.metadata.purpose,
             observationId = action.metadata.observationId,
             targetDescription = action.metadata.targetDescription,
         )
@@ -958,7 +959,7 @@ class SessionCoordinator(
             sessionId = running.sessionId,
             actionType = action.type,
             toolName = toolName,
-            purpose = displayPurpose,
+            purpose = action.metadata.purpose,
             observationId = action.metadata.observationId,
             targetDescription = action.metadata.targetDescription,
         )
