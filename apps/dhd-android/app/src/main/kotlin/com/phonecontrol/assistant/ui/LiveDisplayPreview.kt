@@ -12,7 +12,6 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -46,7 +45,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.geometry.Offset
@@ -230,6 +228,7 @@ const val DEFAULT_LIVE_DISPLAY_PREVIEW_ASPECT_RATIO = 9f / 16f
 
 private const val FULLSCREEN_DISPLAY_SCALE = 0.90f
 internal const val LIVE_DISPLAY_CORNER_RADIUS_DP = 12
+private val LIVE_DISPLAY_SHADOW_ELEVATION = 2.dp
 private val FULLSCREEN_PURPOSE_SLOT_HEIGHT = 48.dp
 
 internal fun liveDisplayCornerShape() = RoundedCornerShape(LIVE_DISPLAY_CORNER_RADIUS_DP.dp)
@@ -331,7 +330,7 @@ fun LiveDisplayPreview(
                 .clip(shape),
             shape = shape,
             color = if (showCardChrome) colors.surfaceCard else Color.Transparent,
-            shadowElevation = if (showCardChrome) 2.dp else 0.dp,
+            shadowElevation = if (showCardChrome) LIVE_DISPLAY_SHADOW_ELEVATION else 0.dp,
         ) {
             Box(modifier = Modifier.fillMaxSize()) {
                 AndroidView(
@@ -440,7 +439,7 @@ internal fun LiveDisplayPreviewPlaceholder(
                 .clip(shape),
             shape = shape,
             color = if (showCardChrome) colors.surfaceCard else Color.Transparent,
-            shadowElevation = if (showCardChrome) 2.dp else 0.dp,
+            shadowElevation = if (showCardChrome) LIVE_DISPLAY_SHADOW_ELEVATION else 0.dp,
         ) {
             Box(modifier = Modifier.fillMaxSize())
         }
@@ -467,6 +466,7 @@ fun FullScreenLiveDisplayViewer(
     onEndTaskDisplay: (TaskDisplayUiRecord) -> Unit = {},
 ) {
     val colors = LocalAssistantColors.current
+    val viewerBackground = if (colors.isDark) colors.surfaceCard else colors.background
     val title = record.appLabel
         ?: state.appLabel
         ?: "Task display"
@@ -495,12 +495,12 @@ fun FullScreenLiveDisplayViewer(
     ) {
         MaterialSurface(
             modifier = Modifier.fillMaxSize(),
-            color = colors.background,
+            color = viewerBackground,
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(colors.background)
+                    .background(viewerBackground)
                     .statusBarsPadding(),
             ) {
                 Row(
@@ -546,7 +546,7 @@ fun FullScreenLiveDisplayViewer(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth()
-                        .background(colors.background),
+                        .background(viewerBackground),
                     contentAlignment = Alignment.Center,
                 ) {
                     val aspectRatio = state.aspectRatio.takeIf { it.isFinite() && it > 0f }
@@ -567,7 +567,7 @@ fun FullScreenLiveDisplayViewer(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(colors.background)
+                        .background(viewerBackground)
                         .navigationBarsPadding(),
                 ) {
                     Column(
@@ -765,20 +765,10 @@ private fun FullScreenPreviewSurface(
         modifier = Modifier
             .width(width)
             .height(height)
-            // Keep the rendered display geometry unchanged while giving the
-            // viewer a clear, soft blue frame around the phone-shaped surface.
-            .shadow(
-                elevation = 20.dp,
-                shape = phoneShape,
-                clip = false,
-                ambientColor = colors.accentBlue.copy(alpha = 0.72f),
-                spotColor = colors.accentBlue.copy(alpha = 0.58f),
-            )
-            .border(BorderStroke(2.dp, colors.accentBlue.copy(alpha = 0.86f)), phoneShape)
             .clip(phoneShape),
         shape = phoneShape,
-        color = Color.Black,
-        shadowElevation = 0.dp,
+        color = colors.surfaceCard,
+        shadowElevation = LIVE_DISPLAY_SHADOW_ELEVATION,
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
             AndroidView(

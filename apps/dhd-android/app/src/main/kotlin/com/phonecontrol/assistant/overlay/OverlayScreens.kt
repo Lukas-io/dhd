@@ -2071,7 +2071,7 @@ private fun OverlayVirtualDisplayPreview(
                     onSurfaceDestroyed(displaySession, surface, release)
                 },
                 onExpand = onContinue,
-                showCardChrome = false,
+                showCardChrome = true,
             )
         } else {
             Text(
