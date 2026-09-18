@@ -99,6 +99,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.key
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -157,7 +158,8 @@ import com.phonecontrol.assistant.data.DHD_OBSERVE_TOOL
 import com.phonecontrol.assistant.data.DHD_OPEN_APP_TOOL
 import com.phonecontrol.assistant.data.TimelineItem
 import com.phonecontrol.assistant.domain.ReasoningEffort
-import com.phonecontrol.assistant.domain.userFacingActivityLabel
+import com.phonecontrol.assistant.session.DhdToolCall
+import com.phonecontrol.assistant.session.DhdToolCallStatus
 import com.phonecontrol.assistant.session.SessionCoordinator
 import com.phonecontrol.assistant.session.SessionState
 import com.phonecontrol.assistant.developer.DeveloperConnectionState
@@ -274,6 +276,7 @@ fun AssistantScreen(
 ) {
     val colors = LocalAssistantColors.current
     val state by coordinator.state.collectAsState()
+    val toolCalls by coordinator.toolCalls.collectAsState()
     val timeline by store.timeline(DHD_CONVERSATION_ID).collectAsState()
     val active = state.isActive()
     val canSteer = state is SessionState.Running
@@ -285,6 +288,9 @@ fun AssistantScreen(
     var composerEditText by rememberSaveable { mutableStateOf<String?>(null) }
     var showReasoningSelector by rememberSaveable { mutableStateOf(false) }
     val activeSessionId = state.sessionIdOrNullForUi()
+    val currentToolCall = toolCalls.lastOrNull {
+        it.sessionId == activeSessionId && it.status == DhdToolCallStatus.RUNNING
+    }
     LaunchedEffect(activeSessionId) {
         // A draft belongs to the run in which it was composed. Do not carry an
         // unsent steer into a newly started task or a rotated session.
@@ -458,6 +464,7 @@ fun AssistantScreen(
                         ConversationTimeline(
                             timeline = recentTimeline,
                             state = state,
+                            currentToolCall = currentToolCall,
                             developerStatus = developerStatus,
                             companionConnected = companionConnected,
                             onOpenSettings = onOpenSettings,
@@ -799,10 +806,70 @@ private fun TimelineItem.Activity.isDhdActionActivity(): Boolean =
         !toolName.equals("dhd_close_display", ignoreCase = true) &&
         !toolName.equals("close_display", ignoreCase = true)
 
+internal const val MAX_VISIBLE_TRACE_ACTIVITIES = 5
+
+internal data class ActivityTraceSlice(
+    val visibleActivities: List<TimelineItem.Activity>,
+    val earlierCount: Int,
+    val currentActivityId: String?,
+    val hasSyntheticCurrent: Boolean,
+)
+
+/** Keep the conversation trace compact without discarding the stored history. */
+internal fun capActivityTrace(
+    activities: List<TimelineItem.Activity>,
+    active: Boolean,
+    currentActivityId: String? = null,
+    hasCurrentTool: Boolean = false,
+): ActivityTraceSlice {
+    val persistedCurrentId = currentActivityId
+        ?.takeIf { id -> active && activities.any { it.id == id } }
+    val hasCurrent = persistedCurrentId != null || (active && hasCurrentTool)
+    val historyLimit = (MAX_VISIBLE_TRACE_ACTIVITIES - if (hasCurrent) 1 else 0)
+        .coerceAtLeast(0)
+    val recentActivities = activities
+        .filterNot { it.id == persistedCurrentId }
+        .takeLast(historyLimit)
+    val visibleIds = (recentActivities.map { it.id } + listOfNotNull(persistedCurrentId)).toSet()
+    val visibleActivities = activities.filter { it.id in visibleIds }
+
+    return ActivityTraceSlice(
+        visibleActivities = visibleActivities,
+        earlierCount = (activities.size - visibleActivities.size).coerceAtLeast(0),
+        currentActivityId = persistedCurrentId,
+        hasSyntheticCurrent = active && hasCurrentTool && persistedCurrentId == null,
+    )
+}
+
+internal fun earlierActionsLabel(count: Int): String {
+    val safeCount = count.coerceAtLeast(0)
+    return "+$safeCount earlier action${if (safeCount == 1) "" else "s"}"
+}
+
+private fun TimelineItem.Activity.isInFlight(): Boolean =
+    status.equals("proposed", ignoreCase = true) || status.equals("running", ignoreCase = true)
+
+private fun TimelineItem.Activity.matchesLiveTool(toolCall: DhdToolCall): Boolean {
+    val activityStatus = status.lowercase()
+    val sameTool = toolName?.equals(toolCall.toolName, ignoreCase = true) == true ||
+        (toolCall.toolName.equals(DHD_OPEN_APP_TOOL, ignoreCase = true) &&
+            toolName.equals(DHD_EXECUTE_TOOL, ignoreCase = true) &&
+            actionType.equals("OPEN_APP", ignoreCase = true))
+    return runId == toolCall.sessionId &&
+        sameTool &&
+        createdAtEpochMs >= toolCall.startedAtEpochMs &&
+        // The phone records ACTION_SUCCEEDED/ACTION_FAILED before the bridge
+        // finishes the outer live tool call. Treat that terminal row as the
+        // same call so the UI never renders a green persisted row alongside
+        // its cyan synthetic counterpart.
+        activityStatus in setOf("info", "proposed", "running", "completed", "failed", "attention")
+}
+
 @Composable
 private fun ConversationTimeline(
     timeline: List<TimelineItem>,
     state: SessionState,
+    currentToolCall: DhdToolCall? = null,
     developerStatus: DeveloperModeStatus,
     companionConnected: Boolean,
     onOpenSettings: () -> Unit,
@@ -864,6 +931,8 @@ private fun ConversationTimeline(
         groups.lastOrNull()?.activities?.size,
         groups.lastOrNull()?.steerMessages?.size,
         groups.lastOrNull()?.assistantMessages?.lastOrNull()?.text?.length,
+        currentToolCall?.id,
+        currentToolCall?.status,
         inlinePreviewVisible,
         previewExpandedInViewer,
     ) {
@@ -898,6 +967,7 @@ private fun ConversationTimeline(
                 TaskGroupCard(
                     group = group,
                     state = state,
+                    currentToolCall = currentToolCall,
                     developerStatus = developerStatus,
                     companionConnected = companionConnected,
                     onOpenSettings = onOpenSettings,
@@ -960,6 +1030,7 @@ private fun ConversationTimeline(
 private fun TaskGroupCard(
     group: TaskGroup,
     state: SessionState,
+    currentToolCall: DhdToolCall? = null,
     developerStatus: DeveloperModeStatus,
     companionConnected: Boolean,
     onOpenSettings: () -> Unit,
@@ -976,6 +1047,7 @@ private fun TaskGroupCard(
     active: Boolean,
 ) {
     var traceExpanded by rememberSaveable(group.id) { mutableStateOf(false) }
+    var earlierActionsExpanded by rememberSaveable(group.id) { mutableStateOf(false) }
 
     val terminalDurationMs = state.workedDurationMsOrNullForUi()
         ?.takeIf { state.sessionIdOrNullForUi()?.let(group.runIds::contains) == true }
@@ -988,6 +1060,25 @@ private fun TaskGroupCard(
             maxOf(1L, (end - start) / 1000L)
         }
     }
+    val liveToolCall = currentToolCall?.takeIf { toolCall ->
+        active && toolCall.sessionId in group.runIds
+    }
+    val liveActivity = liveToolCall?.let { toolCall ->
+        group.activities.asReversed().firstOrNull { it.matchesLiveTool(toolCall) }
+    }
+    val fallbackLiveActivity = if (liveToolCall == null && active) {
+        group.activities.asReversed().firstOrNull { it.isInFlight() }
+    } else {
+        null
+    }
+    val trace = capActivityTrace(
+        activities = group.activities,
+        active = active,
+        currentActivityId = liveActivity?.id ?: fallbackLiveActivity?.id,
+        hasCurrentTool = liveToolCall != null,
+    )
+    val visibleTraceIds = trace.visibleActivities.map { it.id }.toSet()
+    val earlierTraceActivities = group.activities.filterNot { it.id in visibleTraceIds }
 
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -1074,18 +1165,20 @@ private fun TaskGroupCard(
             }
         }
 
-        // While active: show in-flight tool steps directly under thinking indicator (clean, no boxed container)
-        if (active && group.activities.isNotEmpty()) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 4.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                group.activities.forEach { activity ->
-                    TraceStepRow(activity)
-                }
-            }
+        // While active: show the current tool and the latest four completed
+        // steps directly under the thinking indicator. Older work is summarized
+        // so a long-running task cannot push the conversation downward forever.
+        if (active && (trace.visibleActivities.isNotEmpty() || trace.hasSyntheticCurrent)) {
+            val syntheticCurrent = liveToolCall?.takeIf { trace.hasSyntheticCurrent }
+            AnimatedCollapsedTrace(
+                activities = trace.visibleActivities,
+                earlierActivities = earlierTraceActivities,
+                earlierCount = trace.earlierCount,
+                earlierExpanded = earlierActionsExpanded,
+                currentActivityId = trace.currentActivityId,
+                syntheticCurrent = syntheticCurrent,
+                onToggleEarlier = { earlierActionsExpanded = !earlierActionsExpanded },
+            )
         }
 
         // Completed runs with phone actions keep a collapsible trace. Direct
@@ -1679,6 +1772,135 @@ private fun MessageBubble(message: TimelineItem.Message) {
     }
 }
 
+private const val TRACE_NEW_ROW_HANDOFF_MS = 220L
+private const val TRACE_ROW_EXIT_MS = 180L
+
+private data class AnimatedTraceRow(
+    val activity: TimelineItem.Activity,
+    val visible: Boolean = true,
+)
+
+@Composable
+private fun AnimatedCollapsedTrace(
+    activities: List<TimelineItem.Activity>,
+    earlierActivities: List<TimelineItem.Activity>,
+    earlierCount: Int,
+    earlierExpanded: Boolean,
+    currentActivityId: String?,
+    syntheticCurrent: DhdToolCall?,
+    onToggleEarlier: () -> Unit,
+) {
+    var rows by remember { mutableStateOf(activities.map { AnimatedTraceRow(it) }) }
+    var displayedEarlierCount by remember { mutableStateOf(earlierCount) }
+    var displayedSyntheticCurrent by remember { mutableStateOf(syntheticCurrent) }
+    var syntheticVisible by remember { mutableStateOf(syntheticCurrent != null) }
+    val activityIds = activities.map { it.id }
+    val activityById = remember(activities) { activities.associateBy { it.id } }
+
+    LaunchedEffect(activityIds, syntheticCurrent?.id, earlierCount) {
+        val desiredIds = activityIds.toSet()
+        val previousRows = rows
+        val previousIds = previousRows.map { it.activity.id }.toSet()
+        val incomingRows = activities.filter { it.id !in previousIds }
+        val removedIds = previousRows
+            .filter { it.activity.id !in desiredIds }
+            .map { it.activity.id }
+            .toSet()
+        val previousSynthetic = displayedSyntheticCurrent
+        val syntheticAdded = syntheticCurrent != null && previousSynthetic?.id != syntheticCurrent.id
+        val syntheticRemoved = syntheticCurrent == null && previousSynthetic != null
+        val syntheticReplacedByPersisted = syntheticRemoved && previousSynthetic?.let { previous ->
+            activities.any { it.matchesLiveTool(previous) }
+        } == true
+
+        if (syntheticCurrent != null) {
+            displayedSyntheticCurrent = syntheticCurrent
+            syntheticVisible = true
+        }
+        if (syntheticReplacedByPersisted) {
+            // The persisted lifecycle row is the same tool call, not a new
+            // action. Swap it in place instead of running the add/remove
+            // handoff that is reserved for genuinely new calls.
+            displayedSyntheticCurrent = null
+            syntheticVisible = false
+        }
+        if (incomingRows.isNotEmpty()) {
+            rows = previousRows.map { it.copy(visible = true) } +
+                incomingRows.map { AnimatedTraceRow(it) }
+        }
+
+        // Let the new tool call arrive before the displaced row is moved into
+        // the earlier-actions bucket.
+        if ((incomingRows.isNotEmpty() || syntheticAdded) && !syntheticReplacedByPersisted) {
+            delay(TRACE_NEW_ROW_HANDOFF_MS)
+        }
+
+        if (removedIds.isNotEmpty()) {
+            rows = rows.map { row ->
+                if (row.activity.id in removedIds) row.copy(visible = false) else row
+            }
+        }
+        if (syntheticRemoved && !syntheticReplacedByPersisted) {
+            syntheticVisible = false
+        }
+        displayedEarlierCount = earlierCount
+
+        val syntheticNeedsExit = syntheticRemoved && !syntheticReplacedByPersisted
+        if (removedIds.isNotEmpty() || syntheticNeedsExit) {
+            delay(TRACE_ROW_EXIT_MS)
+            rows = rows.filter { it.activity.id in desiredIds }
+            if (syntheticNeedsExit) {
+                displayedSyntheticCurrent = null
+            }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        EarlierActionsRow(
+            count = displayedEarlierCount,
+            expanded = earlierExpanded,
+            onToggle = onToggleEarlier,
+        )
+        earlierActivities.forEach { activity ->
+            key("earlier-${activity.id}") {
+                AnimatedVisibility(
+                    visible = earlierExpanded,
+                    enter = fadeIn(tween(180)) + expandVertically(tween(220)),
+                    exit = fadeOut(tween(140)) + shrinkVertically(tween(200)),
+                ) {
+                    TraceStepRow(activity = activity)
+                }
+            }
+        }
+        rows.forEach { row ->
+            key(row.activity.id) {
+                AnimatedVisibility(
+                    visible = row.visible,
+                    enter = fadeIn(tween(180)) + expandVertically(tween(180)),
+                    exit = fadeOut(tween(160)) + shrinkVertically(tween(160)),
+                ) {
+                    TraceStepRow(
+                        activity = activityById[row.activity.id] ?: row.activity,
+                        isCurrent = row.activity.id == currentActivityId,
+                    )
+                }
+            }
+        }
+        AnimatedVisibility(
+            visible = syntheticVisible,
+            enter = fadeIn(tween(180)) + expandVertically(tween(180)),
+            exit = fadeOut(tween(160)) + shrinkVertically(tween(160)),
+        ) {
+            displayedSyntheticCurrent?.let { CurrentToolTraceRow(it) }
+        }
+    }
+}
+
 @Composable
 private fun WorkedTraceSection(
     durationSeconds: Long,
@@ -1731,11 +1953,11 @@ private fun WorkedTraceSection(
                             onDoubleTap = { onToggleExpand() },
                         )
                     }
-                    .padding(top = 8.dp, bottom = 4.dp),
+                .padding(top = 8.dp, bottom = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 activities.forEach { activity ->
-                    TraceStepRow(activity)
+                    TraceStepRow(activity = activity)
                 }
             }
         }
@@ -1743,20 +1965,147 @@ private fun WorkedTraceSection(
 }
 
 @Composable
-private fun TraceStepRow(activity: TimelineItem.Activity) {
+private fun EarlierActionsRow(
+    count: Int,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+) {
+    if (count <= 0) return
+    val colors = LocalAssistantColors.current
+    val label = if (expanded) "Hide earlier actions" else earlierActionsLabel(count)
+    val chevronRotation by animateFloatAsState(
+        targetValue = if (expanded) 180f else 0f,
+        animationSpec = tween(180),
+        label = "earlier_actions_chevron",
+    )
+    Row(
+        modifier = Modifier
+            .padding(start = 30.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(
+                role = Role.Button,
+                onClickLabel = if (expanded) "Collapse earlier actions" else "Show earlier actions",
+                onClick = onToggle,
+            )
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        AnimatedContent(
+            targetState = label,
+            transitionSpec = { fadeIn(tween(140)) togetherWith fadeOut(tween(100)) },
+            label = "earlier_actions_label",
+        ) { animatedLabel ->
+            Text(
+                text = animatedLabel,
+                fontSize = 12.5.sp,
+                color = colors.textSecondary.copy(alpha = 0.78f),
+            )
+        }
+        Icon(
+            painter = painterResource(R.drawable.ic_chevron_down),
+            contentDescription = null,
+            tint = colors.textSecondary.copy(alpha = 0.78f),
+            modifier = Modifier
+                .size(13.dp)
+                .graphicsLayer { rotationZ = chevronRotation },
+        )
+    }
+}
+
+@Composable
+private fun TraceStepRow(
+    activity: TimelineItem.Activity,
+    isCurrent: Boolean = false,
+) {
+    TraceStepRowContent(
+        toolName = activity.toolName,
+        label = activityLabel(activity),
+        status = activity.status,
+        isCurrent = isCurrent,
+    )
+}
+
+@Composable
+private fun CurrentToolTraceRow(toolCall: DhdToolCall) {
+    TraceStepRowContent(
+        toolName = toolCall.toolName,
+        label = toolCall.purpose,
+        status = "running",
+        isCurrent = true,
+    )
+}
+
+private data class ToolActivityShimmer(
+    val brush: Brush,
+    val pulseAlpha: Float,
+)
+
+@Composable
+private fun rememberToolActivityShimmer(
+    colors: AssistantColorScheme,
+    shimmerColor: Color,
+): ToolActivityShimmer {
+    val infiniteTransition = rememberInfiniteTransition(label = "tool_activity_shimmer")
+    val shimmerTranslate by infiniteTransition.animateFloat(
+        initialValue = -150f,
+        targetValue = 450f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1300, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "tool_activity_shimmer_translate",
+    )
+    val pulseAlpha by infiniteTransition.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 750, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "tool_activity_pulse_alpha",
+    )
+    return ToolActivityShimmer(
+        brush = Brush.linearGradient(
+            colors = listOf(
+                shimmerColor.copy(alpha = 0.35f),
+                shimmerColor,
+                colors.textPrimary,
+                shimmerColor,
+                shimmerColor.copy(alpha = 0.35f),
+            ),
+            start = Offset(shimmerTranslate, 0f),
+            end = Offset(shimmerTranslate + 160f, 0f),
+        ),
+        pulseAlpha = pulseAlpha,
+    )
+}
+
+@Composable
+private fun TraceStepRowContent(
+    toolName: String?,
+    label: String,
+    status: String,
+    isCurrent: Boolean,
+) {
     val colors = LocalAssistantColors.current
 
-    val status = activity.status.lowercase()
-    val statusColor = when (status) {
+    val normalizedStatus = status.lowercase()
+    val statusColor = when (normalizedStatus) {
         "completed" -> colors.accentGreen
         "failed" -> colors.errorRed
         "attention" -> colors.warningAmber
         else -> colors.textSecondary
     }
-    val iconColor = when (status) {
+    val iconColor = when (normalizedStatus) {
         "failed" -> colors.errorRed
         "attention" -> colors.warningAmber
-        else -> toolActivityColor(activity.toolName, colors, statusColor)
+        else -> toolActivityColor(toolName, colors, statusColor)
+    }
+    val shimmer = if (isCurrent) {
+        rememberToolActivityShimmer(colors, iconColor)
+    } else {
+        null
     }
 
     Row(
@@ -1769,19 +2118,31 @@ private fun TraceStepRow(activity: TimelineItem.Activity) {
     ) {
         Icon(
             painter = painterResource(R.drawable.ic_connected_nodes),
-            contentDescription = "${activity.toolName ?: "Tool"} call",
-            tint = iconColor,
+            contentDescription = "${toolName ?: "Tool"} call${if (isCurrent) " in progress" else ""}",
+            tint = shimmer?.let { iconColor.copy(alpha = it.pulseAlpha) } ?: iconColor,
             modifier = Modifier.size(18.dp),
         )
-        Text(
-            text = activityLabel(activity),
-            fontSize = 13.5.sp,
-            color = colors.textPrimary,
-            fontWeight = FontWeight.Normal,
-            modifier = Modifier.weight(1f),
-            maxLines = 4,
-            overflow = TextOverflow.Ellipsis,
-        )
+        if (shimmer != null) {
+            Text(
+                text = label,
+                fontSize = 13.5.sp,
+                style = TextStyle(brush = shimmer.brush),
+                fontWeight = FontWeight.Normal,
+                modifier = Modifier.weight(1f),
+                maxLines = 4,
+                overflow = TextOverflow.Ellipsis,
+            )
+        } else {
+            Text(
+                text = label,
+                fontSize = 13.5.sp,
+                color = colors.textPrimary,
+                fontWeight = FontWeight.Normal,
+                modifier = Modifier.weight(1f),
+                maxLines = 4,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
     }
 }
 
@@ -1797,7 +2158,7 @@ internal fun toolActivityColor(
     DHD_OBSERVE_TOOL, "dhd_observe_app" -> colors.accentBlue
     DHD_EXECUTE_TOOL, DHD_EXECUTE_SEQUENCE_TOOL -> colors.accentGreen
     DHD_BROWSE_APP_TOOL -> colors.accentPurple
-    DHD_OPEN_APP_TOOL -> colors.accentGold
+    DHD_OPEN_APP_TOOL -> colors.accentCyan
     DHD_FOREGROUND_APP_TOOL -> colors.accentOrange
     DHD_LIST_ALLOWED_APPS_TOOL -> colors.accentPink
     else -> fallback
@@ -1907,11 +2268,9 @@ private fun SteerMessageBubble(message: TimelineItem.Message) {
 
 
 
-private fun activityLabel(activity: TimelineItem.Activity): String = userFacingActivityLabel(
-    actionType = activity.actionType?.let { runCatching { com.phonecontrol.assistant.domain.ActionType.valueOf(it) }.getOrNull() },
-    purpose = activity.purpose,
-    targetDescription = activity.targetDescription,
-)
+private fun activityLabel(activity: TimelineItem.Activity): String = activity.purpose
+    .trim()
+    .ifBlank { "Working on the phone" }
 
 
 

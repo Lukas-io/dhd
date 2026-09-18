@@ -658,24 +658,40 @@ class DevBridgeServer(
         return if (actionType == "open_app") DHD_OPEN_APP_TOOL else DHD_EXECUTE_TOOL
     }
 
-    private fun toolPurpose(toolName: String, json: JSONObject): String = when (toolName) {
-        DHD_OBSERVE_TOOL -> json.optString("purpose").trim().takeIf(String::isNotBlank)
-            ?: defaultDhdToolPurpose(toolName)
-        DHD_OPEN_APP_TOOL -> openingAppPurpose(json)
-        DHD_EXECUTE_TOOL -> {
-            val action = json.optJSONObject("action")
-            if (action?.optString("type")?.equals("open_app", ignoreCase = true) == true) {
-                openingAppPurpose(json)
-            } else {
-                val purpose = action
-                    ?.optJSONObject("metadata")
-                    ?.optString("purpose")
-                    ?.trim()
-                purpose?.takeIf(String::isNotBlank) ?: defaultDhdToolPurpose(toolName)
-            }
+    private fun toolPurpose(toolName: String, json: JSONObject): String =
+        metadataPurpose(json) ?: when (toolName) {
+            DHD_OBSERVE_TOOL -> json.optString("purpose").trim().takeIf(String::isNotBlank)
+                ?: defaultDhdToolPurpose(toolName)
+            DHD_OPEN_APP_TOOL -> openingAppPurpose(json)
+            else -> defaultDhdToolPurpose(toolName)
         }
-        "dhd_request_attention" -> defaultDhdToolPurpose(toolName)
-        else -> defaultDhdToolPurpose(toolName)
+
+    /** Read the user-visible purpose from each tool's metadata shape. */
+    private fun metadataPurpose(json: JSONObject): String? {
+        val directPurpose = json.optJSONObject("metadata")
+            ?.optString("purpose")
+            ?.trim()
+            ?.takeIf(String::isNotBlank)
+        if (directPurpose != null) return directPurpose
+
+        val actionPurpose = json.optJSONObject("action")
+            ?.optJSONObject("metadata")
+            ?.optString("purpose")
+            ?.trim()
+            ?.takeIf(String::isNotBlank)
+        if (actionPurpose != null) return actionPurpose
+
+        val actions = json.optJSONArray("actions")
+        for (index in 0 until (actions?.length() ?: 0)) {
+            val purpose = actions
+                ?.optJSONObject(index)
+                ?.optJSONObject("metadata")
+                ?.optString("purpose")
+                ?.trim()
+                ?.takeIf(String::isNotBlank)
+            if (purpose != null) return purpose
+        }
+        return null
     }
 
     private fun openingAppPurpose(json: JSONObject): String {
@@ -1761,13 +1777,16 @@ class DevBridgeServer(
         } else {
             parsedAction
         }
-        // This bridge endpoint is the public dhd_execute tool. Preserve that
-        // identity on the activity event so the live-display footer can use
-        // the same green accent as the conversation trace row.
+        // Preserve the bridge tool identity on the activity event so the live
+        // tool call and its lifecycle row can be rendered as one entry.
+        val activityToolName = json.optString("tool")
+            .trim()
+            .takeIf(String::isNotBlank)
+            ?: fallbackActionToolName(json)
         val result = coordinator.executeAction(
             action = action,
             observation = observation,
-            toolName = DHD_EXECUTE_TOOL,
+            toolName = activityToolName,
             targetDisplay = target?.session,
         )
         writeActionResult(writer, requestId, wireActionName(action), result)
