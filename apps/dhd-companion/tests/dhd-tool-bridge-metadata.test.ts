@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 const bridge = vi.hoisted(() => ({
-  BLOCKING_BRIDGE_TIMEOUT_MS: 0,
+  BLOCKING_BRIDGE_TIMEOUT_MS: 45_000,
   requestBridge: vi.fn(async () => ({ type: "completed", ok: true }))
 }));
 
@@ -62,5 +62,26 @@ describe("DHD bridge tool metadata", () => {
       "dhd_execute_sequence",
       "dhd_request_attention"
     ]);
+
+    for (const tool of [
+      "dhd_get_foreground_app",
+      "dhd_observe",
+      "dhd_open_app",
+      "dhd_execute",
+      "dhd_execute_sequence",
+    ]) {
+      const call = bridge.requestBridge.mock.calls.find(([request]) => request.tool === tool);
+      expect(call?.[1]).toEqual({
+        timeoutMs: 45_000,
+        keepOpenAfterAccepted: true,
+      });
+    }
+    const attentionCall = bridge.requestBridge.mock.calls.find(
+      ([request]) => request.tool === "dhd_request_attention",
+    );
+    expect(attentionCall?.[1]).toEqual({
+      timeoutMs: 45_000,
+      keepOpenAfterAccepted: true,
+    });
   });
 });

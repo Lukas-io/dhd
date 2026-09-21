@@ -1,4 +1,5 @@
 import { describe, expect, it, afterEach, vi } from "vitest";
+import { Buffer } from "node:buffer";
 
 const createConnectionMock = vi.hoisted(() => vi.fn());
 
@@ -72,5 +73,50 @@ describe("phone assistant bridge configuration", () => {
     await vi.advanceTimersByTimeAsync(100);
     await rejection;
     expect(socket.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an accepted user-dependent request open without removing the initial timeout", async () => {
+    vi.useFakeTimers();
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const socket = {
+      destroy: vi.fn(),
+      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        listeners.set(event, handler);
+        return socket;
+      }),
+      once: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        listeners.set(event, handler);
+        return socket;
+      }),
+      setTimeout: vi.fn(),
+      write: vi.fn(),
+    };
+    createConnectionMock.mockReturnValue(socket);
+
+    const result = requestBridge(
+      { type: "execute_action", requestId: "request-phone-access" },
+      {
+        host: "127.0.0.1",
+        port: 8765,
+        timeoutMs: 100,
+        keepOpenAfterAccepted: true,
+      },
+    );
+    listeners.get("connect")?.();
+    listeners.get("data")?.(Buffer.from('{"type":"accepted"}\n'));
+
+    let settled = false;
+    void result.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(settled).toBe(false);
+    expect(socket.setTimeout).toHaveBeenCalledWith(100, expect.any(Function));
+    expect(socket.setTimeout).toHaveBeenCalledWith(0);
+
+    listeners.get("data")?.(Buffer.from('{"type":"completed","ok":true}\n'));
+    await expect(result).resolves.toMatchObject({ type: "completed", ok: true });
   });
 });

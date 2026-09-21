@@ -403,15 +403,13 @@ fun PhoneControlApp(
                             onAcknowledgeAttention = onAcknowledgeAttention,
                             onSteerRequest = onSteerRequest,
                             onOpenSettings = { navController.navigate(AppRoutes.SETTINGS) },
+                            onOpenPhoneAccess = { navController.navigate(AppRoutes.PAIRING) },
                             onOpenTaskDisplays = openTaskDisplays,
                             onStartFresh = {
                                 conversationStore.deleteConversation(DHD_CONVERSATION_ID)
                             },
                             developerStatus = developerStatus,
                             companionConnected = companionConnected,
-                            onOpenDeveloperOptions = {
-                                openDeveloperOptions(context)
-                            },
                             onOpenCompanion = { navController.navigate(AppRoutes.COMPANION) },
                             previewState = previewState,
                             onPreviewSurfaceAvailable = onPreviewSurfaceAvailable,

@@ -12,6 +12,7 @@ import com.phonecontrol.assistant.developer.PreviewSurfaceDispatcher
 import com.phonecontrol.assistant.developer.DhdVirtualDisplayManager
 import com.phonecontrol.assistant.overlay.OverlayVisibilityGate
 import com.phonecontrol.assistant.policy.PolicyEngine
+import com.phonecontrol.assistant.session.AssistantForegroundService
 import com.phonecontrol.assistant.session.SessionCoordinator
 import com.phonecontrol.assistant.execution.PhoneObservationProvider
 import com.phonecontrol.assistant.execution.TypedPhoneActionTransport
@@ -125,15 +126,21 @@ class PhoneControlApplication : Application() {
                 observationProvider = observationProvider,
                 processRunner = processRunner,
                 executionReadyProvider = { developerModeController.status.value.privilegedApiReady },
-                executionUnavailableMessageProvider = { developerModeController.status.value.message },
+                executionUnavailableMessageProvider = { developerModeController.status.value.executionUnavailableMessage },
                 enforceObservationFreshness = true,
                 taskDisplayBackend = taskDisplayBackend,
             ),
             conversationStore = conversationStore,
-            phoneActionsReadyProvider = { developerModeController.status.value.privilegedApiReady },
             fullAccessProvider = { appPermissionRepository.isFullAccessEnabled() },
             taskDisplayRequiredProvider = { true },
             taskDisplayBackend = taskDisplayBackend,
+            phoneAccessReadyProvider = { developerModeController.status.value.privilegedApiReady },
+            onPhoneAccessAttentionRequested = { reason, conversationId ->
+                AssistantForegroundService.showAttentionNotification(this, reason, conversationId)
+            },
+            onPhoneAccessAttentionResolved = {
+                AssistantForegroundService.removeAttentionNotification(this)
+            },
         )
         // The bridge accepts paired LAN connections for the development
         // companion. adb forwarding remains compatible because forwarded

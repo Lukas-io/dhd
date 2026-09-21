@@ -35,6 +35,11 @@ enum class DeveloperConnectionState {
     ERROR,
 }
 
+private const val PHONE_ACCESS_INTERRUPTED_MESSAGE =
+    "DHD is currently unable to use apps on your phone. This can happen after a restart or something totally out of your control. We'll show you the steps to fix it."
+private const val INITIAL_PHONE_CONNECTION_MESSAGE =
+    "DHD needs a one-time connection before it can use apps on your phone. We'll show you the steps."
+
 data class DeveloperModeStatus(
     val state: DeveloperConnectionState = DeveloperConnectionState.CHECKING,
     val paired: Boolean = false,
@@ -42,6 +47,76 @@ data class DeveloperModeStatus(
 ) {
     val privilegedApiReady: Boolean
         get() = state == DeveloperConnectionState.READY
+
+    /** True when the user still needs to complete the first phone connection. */
+    val needsInitialConnection: Boolean
+        get() = !paired && state in setOf(
+            DeveloperConnectionState.PAIRING_REQUIRED,
+            DeveloperConnectionState.ERROR,
+        )
+
+    /** True when a saved phone connection was interrupted and needs recovery. */
+    val phoneAccessInterrupted: Boolean
+        get() = paired && state in setOf(
+            DeveloperConnectionState.PAIRING_REQUIRED,
+            DeveloperConnectionState.WIRELESS_DEBUGGING_OFF,
+            DeveloperConnectionState.ERROR,
+        )
+
+    /** True when the current state needs a visible recovery action, not a spinner. */
+    val requiresUserAction: Boolean
+        get() = state in setOf(
+            DeveloperConnectionState.PAIRING_REQUIRED,
+            DeveloperConnectionState.PAIRING_SEARCHING,
+            DeveloperConnectionState.PAIRING_SERVICE_FOUND,
+            DeveloperConnectionState.WIRELESS_DEBUGGING_OFF,
+            DeveloperConnectionState.UNSUPPORTED,
+            DeveloperConnectionState.ERROR,
+        )
+
+    /** True when a saved pairing exists but DHD's local service must be restarted. */
+    val requiresMaintenanceRestart: Boolean
+        get() = phoneAccessInterrupted
+
+    /** Copy shown before sending a user to DHD's phone-access instructions. */
+    val recoveryTitle: String
+        get() = when {
+            needsInitialConnection -> "Connect your phone to DHD"
+            phoneAccessInterrupted -> "Phone access needed"
+            state == DeveloperConnectionState.PAIRING_SEARCHING -> "Connecting your phone"
+            state == DeveloperConnectionState.PAIRING_SERVICE_FOUND -> "Pairing code ready"
+            state == DeveloperConnectionState.CONNECTING -> "Connecting your phone"
+            state == DeveloperConnectionState.CHECKING -> "Checking phone access"
+            state == DeveloperConnectionState.UNSUPPORTED -> "DHD cannot use phone access"
+            else -> "Phone access needs attention"
+        }
+
+    /** Non-technical recovery context for banners, overlays, and tool errors. */
+    val recoveryDetail: String
+        get() = when {
+            needsInitialConnection -> INITIAL_PHONE_CONNECTION_MESSAGE
+            phoneAccessInterrupted -> PHONE_ACCESS_INTERRUPTED_MESSAGE
+            state == DeveloperConnectionState.PAIRING_SEARCHING ->
+                "Follow the connection steps in the DHD notification."
+            state == DeveloperConnectionState.PAIRING_SERVICE_FOUND ->
+                "Enter the six-digit code Android shows in the DHD notification."
+            state == DeveloperConnectionState.CONNECTING ->
+                "DHD is still connecting to your phone. Try again in a moment."
+            state == DeveloperConnectionState.CHECKING ->
+                "DHD is checking whether phone access is available."
+            state == DeveloperConnectionState.UNSUPPORTED ->
+                "DHD needs Android 11 or newer for phone access."
+            else -> message
+        }
+
+    /** Safe, actionable copy for a phone action rejected while access is unavailable. */
+    val executionUnavailableMessage: String
+        get() = when {
+            phoneAccessInterrupted -> PHONE_ACCESS_INTERRUPTED_MESSAGE
+            needsInitialConnection -> INITIAL_PHONE_CONNECTION_MESSAGE
+            !privilegedApiReady -> recoveryDetail
+            else -> message
+        }
 }
 
 /**
@@ -371,21 +446,38 @@ class DhdAdbController(context: Context) {
     private fun handleMaintenanceUnavailable(detail: String) {
         if (!started.get() || !isPaired()) return
         maintenanceMonitorJob?.cancel()
+        val keepActionableStatus = _status.value.state == DeveloperConnectionState.WIRELESS_DEBUGGING_OFF
         if (!maintenanceRecoveryPolicy.recordUnavailable()) {
             Log.w(TAG, "Maintenance unavailable once; deferring ADB bootstrap and scheduling a local re-check: $detail")
             publish(
-                DeveloperConnectionState.CONNECTING,
+                if (keepActionableStatus) {
+                    DeveloperConnectionState.WIRELESS_DEBUGGING_OFF
+                } else {
+                    DeveloperConnectionState.CONNECTING
+                },
                 paired = true,
-                message = "DHD maintenance check failed once. Rechecking locally before restarting it; pairing is saved.",
+                message = if (keepActionableStatus) {
+                    WIRELESS_DEBUGGING_REQUIRED_MESSAGE
+                } else {
+                    "DHD maintenance check failed once. Rechecking locally before restarting it; pairing is saved."
+                },
             )
             scheduleMaintenanceRetry()
             return
         }
         Log.w(TAG, "Maintenance unavailable endpointKnown=${endpoint != null}: $detail")
         publish(
-            DeveloperConnectionState.CONNECTING,
+            if (keepActionableStatus) {
+                DeveloperConnectionState.WIRELESS_DEBUGGING_OFF
+            } else {
+                DeveloperConnectionState.CONNECTING
+            },
             paired = true,
-            message = "$detail Reconnecting DHD's maintenance service. Pairing is already saved.",
+            message = if (keepActionableStatus) {
+                WIRELESS_DEBUGGING_REQUIRED_MESSAGE
+            } else {
+                "$detail Reconnecting DHD's maintenance service. Pairing is already saved."
+            },
         )
         scheduleMaintenanceRecovery()
     }
@@ -393,11 +485,18 @@ class DhdAdbController(context: Context) {
     private fun scheduleMaintenanceRecovery() {
         if (!started.get() || !isPaired()) return
         if (discoveryTimeoutJob?.isActive == true || !maintenanceRecoveryGate.compareAndSet(false, true)) return
+        val keepActionableStatus = _status.value.state == DeveloperConnectionState.WIRELESS_DEBUGGING_OFF && endpoint == null
         Log.i(TAG, "Starting maintenance recovery endpointKnown=${endpoint != null}")
         publish(
-            DeveloperConnectionState.CONNECTING,
+            if (keepActionableStatus) {
+                DeveloperConnectionState.WIRELESS_DEBUGGING_OFF
+            } else {
+                DeveloperConnectionState.CONNECTING
+            },
             paired = true,
-            message = if (endpoint != null) {
+            message = if (keepActionableStatus) {
+                WIRELESS_DEBUGGING_REQUIRED_MESSAGE
+            } else if (endpoint != null) {
                 "Checking DHD's local maintenance service before restarting it…"
             } else {
                 "Waiting for Wi-Fi/ADB to reconnect before checking DHD's maintenance service…"
@@ -454,10 +553,19 @@ class DhdAdbController(context: Context) {
         endpoint = null
         mdns.stop()
         Log.i(TAG, "Starting ADB connect-service discovery attempt ${maintenanceRetryAttempt + 1}.")
+        val keepActionableStatus = _status.value.state == DeveloperConnectionState.WIRELESS_DEBUGGING_OFF && isPaired()
         publish(
-            DeveloperConnectionState.CONNECTING,
+            if (keepActionableStatus) {
+                DeveloperConnectionState.WIRELESS_DEBUGGING_OFF
+            } else {
+                DeveloperConnectionState.CONNECTING
+            },
             paired = isPaired(),
-            message = "Waiting for Wi-Fi and Wireless Debugging's ADB service…",
+            message = if (keepActionableStatus) {
+                WIRELESS_DEBUGGING_REQUIRED_MESSAGE
+            } else {
+                "Waiting for Wi-Fi and Wireless Debugging's ADB service…"
+            },
         )
 
         val completed = AtomicBoolean(false)
@@ -468,9 +576,9 @@ class DhdAdbController(context: Context) {
                 connectDiscoveryGate.set(false)
                 Log.w(TAG, "ADB connect-service discovery timed out; Wi-Fi or Wireless Debugging may be unavailable temporarily.")
                 publish(
-                    DeveloperConnectionState.CONNECTING,
+                    DeveloperConnectionState.WIRELESS_DEBUGGING_OFF,
                     paired = isPaired(),
-                    message = "Waiting for Wi-Fi/Wireless Debugging's ADB service; DHD will keep retrying without restarting a healthy daemon.",
+                    message = WIRELESS_DEBUGGING_REQUIRED_MESSAGE,
                 )
                 scheduleMaintenanceRetry()
             }
@@ -495,9 +603,9 @@ class DhdAdbController(context: Context) {
                     connectDiscoveryGate.set(false)
                     Log.w(TAG, "ADB connect-service discovery failed: ${rootMessage(error)}")
                     publish(
-                        DeveloperConnectionState.ERROR,
+                        DeveloperConnectionState.WIRELESS_DEBUGGING_OFF,
                         paired = isPaired(),
-                        message = "Could not search for Wireless Debugging: ${rootMessage(error)}",
+                        message = WIRELESS_DEBUGGING_REQUIRED_MESSAGE,
                     )
                     scheduleMaintenanceRetry()
                 }
@@ -734,9 +842,11 @@ class DhdAdbController(context: Context) {
         const val PAIRING_SERVICE_FOUND_MESSAGE =
             "The Wireless Debugging pairing service was found. Enter the six-digit code shown by Android."
         const val PAIRING_REQUIRED_MESSAGE =
-            "Pair DHD once from Wireless debugging. After that, turn Wireless debugging on only when DHD needs a restart."
+            INITIAL_PHONE_CONNECTION_MESSAGE
         const val MAINTENANCE_RESTART_MESSAGE =
-            "DHD's maintenance service is not running. Turn on Wireless debugging in Developer options to restart it. Pairing is already saved."
+            PHONE_ACCESS_INTERRUPTED_MESSAGE
+        const val WIRELESS_DEBUGGING_REQUIRED_MESSAGE =
+            PHONE_ACCESS_INTERRUPTED_MESSAGE
         val PAIRING_CODE_REGEX = Regex("\\d{6}")
     }
 }

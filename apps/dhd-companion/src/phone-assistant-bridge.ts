@@ -3,8 +3,8 @@ import net from "node:net";
 export const DEFAULT_BRIDGE_HOST = "127.0.0.1";
 export const DEFAULT_BRIDGE_PORT = 8765;
 export const DEFAULT_BRIDGE_TIMEOUT_MS = 45_000;
-/** A zero timeout is reserved for tools that intentionally wait on the user. */
-export const BLOCKING_BRIDGE_TIMEOUT_MS = 0;
+/** Initial connection grace period for requests that may wait after acceptance. */
+export const BLOCKING_BRIDGE_TIMEOUT_MS = DEFAULT_BRIDGE_TIMEOUT_MS;
 export const MAX_BRIDGE_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 export interface BridgeMessage {
@@ -23,6 +23,8 @@ export interface BridgeRequest {
 
 export interface BridgeRequestOptions {
   timeoutMs?: number;
+  /** Keep waiting after the phone has accepted a user-dependent request. */
+  keepOpenAfterAccepted?: boolean;
   host?: string;
   port?: number;
   token?: string;
@@ -165,6 +167,20 @@ export function requestBridge(
         }
         // The phone sends an accepted progress line first. Resolve only on a
         // terminal response so callers can safely read the complete result.
+        // A request that has been accepted is now being processed by the
+        // phone. User-dependent operations may remain open until Wireless
+        // debugging is restored, but connection failures before acceptance
+        // still use the normal bounded timeout.
+        if (message.type === "accepted") {
+          if (options.keepOpenAfterAccepted) {
+            if (timeoutTimer) {
+              clearTimeout(timeoutTimer);
+              timeoutTimer = undefined;
+            }
+            socket.setTimeout(0);
+          }
+          continue;
+        }
         if (typeof message.type === "string" && TERMINAL_MESSAGE_TYPES.has(message.type)) {
           finish(undefined, message);
           return;

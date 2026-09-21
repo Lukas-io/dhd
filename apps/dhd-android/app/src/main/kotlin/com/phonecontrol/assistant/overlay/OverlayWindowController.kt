@@ -392,8 +392,7 @@ class OverlayWindowController(
                         onBubbleDragEnd = ::snapBubbleToNearestEdge,
                         onStop = ::stopSession,
                         onAcknowledgeAttention = ::acknowledgeAttention,
-                        onOpenSettings = { openDhdRoute(AppRoutes.SETTINGS) },
-                        onOpenDeveloperOptions = ::openDeveloperOptions,
+                        onOpenPhoneAccess = { openDhdRoute(AppRoutes.PAIRING) },
                         onOpenCompanion = { openDhdRoute(AppRoutes.COMPANION) },
                         onContinueInDhd = ::continueInDhd,
                         onCollapse = ::showBubble,
@@ -692,17 +691,6 @@ class OverlayWindowController(
                 putExtra(MainActivity.EXTRA_OPEN_ROUTE, route)
             },
         )
-    }
-
-    private fun openDeveloperOptions() {
-        runCatching {
-            appContext.startActivity(
-                android.content.Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS).apply {
-                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                    putExtra(":settings:fragment_args_key", "toggle_adb_wireless")
-                },
-            )
-        }
     }
 
     private fun continueInDhd() {

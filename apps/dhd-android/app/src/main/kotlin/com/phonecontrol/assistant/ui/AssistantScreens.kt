@@ -55,6 +55,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -262,11 +263,11 @@ fun AssistantScreen(
     onAcknowledgeAttention: () -> Boolean,
     onSteerRequest: (String) -> Boolean,
     onOpenSettings: () -> Unit,
+    onOpenPhoneAccess: () -> Unit,
     onOpenTaskDisplays: () -> Unit = {},
     onStartFresh: () -> Unit,
     developerStatus: DeveloperModeStatus,
     companionConnected: Boolean,
-    onOpenDeveloperOptions: () -> Unit,
     onOpenCompanion: () -> Unit,
     previewState: LiveDisplayPreviewState? = null,
     onPreviewSurfaceAvailable: (AndroidSurface) -> Unit = {},
@@ -279,6 +280,26 @@ fun AssistantScreen(
     val toolCalls by coordinator.toolCalls.collectAsState()
     val timeline by store.timeline(DHD_CONVERSATION_ID).collectAsState()
     val active = state.isActive()
+    val combinePhoneAndCompanionRecovery = shouldCombineRecoveryBanners(
+        state = state,
+        developerStatus = developerStatus,
+        companionConnected = companionConnected,
+    )
+    val showTopRecoveryBanner = shouldShowTopRecoveryBanner(
+        state = state,
+        developerStatus = developerStatus,
+        companionConnected = companionConnected,
+    )
+    val phoneRecoveryShownAtTop = showTopRecoveryBanner &&
+        (developerStatus.requiresUserAction || state.showsPhoneAccessRecovery())
+    val companionRecoveryShownAtTop = showTopRecoveryBanner && !companionConnected
+    val keyboardVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    val runningState = state as? SessionState.Running
+    val companionWaitSeconds = if (combinePhoneAndCompanionRecovery && runningState != null) {
+        rememberElapsedSeconds(runningState.startedAtEpochMs, runningState.elapsedBeforeStartMs)
+    } else {
+        null
+    }
     val canSteer = state is SessionState.Running
     var showStartFreshConfirmation by rememberSaveable { mutableStateOf(false) }
     var steerDraft by rememberSaveable { mutableStateOf("") }
@@ -429,6 +450,42 @@ fun AssistantScreen(
                     .navigationBarsPadding()
                     .imePadding(),
             ) {
+                if (showTopRecoveryBanner) {
+                    // Keep the island visually floating while giving it a
+                    // real layout slot. Conversation content is measured
+                    // below it instead of rendering underneath an overlay.
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp, start = 16.dp, end = 16.dp),
+                        contentAlignment = Alignment.TopCenter,
+                    ) {
+                        if (combinePhoneAndCompanionRecovery) {
+                            CombinedRecoveryCard(
+                                phoneStatus = developerStatus,
+                                companionWaitSeconds = companionWaitSeconds,
+                                onOpenPhoneAccess = onOpenPhoneAccess,
+                                onOpenCompanion = onOpenCompanion,
+                                compact = keyboardVisible,
+                                modifier = Modifier.widthIn(max = 520.dp),
+                            )
+                        } else if (phoneRecoveryShownAtTop) {
+                            DeveloperConnectionRecoveryCard(
+                                status = developerStatus,
+                                onOpenPhoneAccess = onOpenPhoneAccess,
+                                modifier = Modifier.widthIn(max = 520.dp),
+                            )
+                        } else {
+                            CompanionRecoveryCard(
+                                elapsedSeconds = null,
+                                onOpenCompanion = onOpenCompanion,
+                                modifier = Modifier.widthIn(max = 520.dp),
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                }
+
                 // Chat timeline stays strictly above composer area with soft fade at the bottom
                 Box(
                     modifier = Modifier
@@ -466,9 +523,10 @@ fun AssistantScreen(
                             state = state,
                             currentToolCall = currentToolCall,
                             developerStatus = developerStatus,
+                            phoneRecoveryShownAtTop = phoneRecoveryShownAtTop,
+                            companionRecoveryShownAtTop = companionRecoveryShownAtTop,
                             companionConnected = companionConnected,
-                            onOpenSettings = onOpenSettings,
-                            onOpenDeveloperOptions = onOpenDeveloperOptions,
+                            onOpenPhoneAccess = onOpenPhoneAccess,
                             onOpenCompanion = onOpenCompanion,
                             onStopSession = onStopSession,
                             onAcknowledgeAttention = onAcknowledgeAttention,
@@ -871,9 +929,10 @@ private fun ConversationTimeline(
     state: SessionState,
     currentToolCall: DhdToolCall? = null,
     developerStatus: DeveloperModeStatus,
+    phoneRecoveryShownAtTop: Boolean,
+    companionRecoveryShownAtTop: Boolean,
     companionConnected: Boolean,
-    onOpenSettings: () -> Unit,
-    onOpenDeveloperOptions: () -> Unit,
+    onOpenPhoneAccess: () -> Unit,
     onOpenCompanion: () -> Unit,
     onStopSession: () -> Unit,
     onAcknowledgeAttention: () -> Boolean,
@@ -969,9 +1028,10 @@ private fun ConversationTimeline(
                     state = state,
                     currentToolCall = currentToolCall,
                     developerStatus = developerStatus,
+                    phoneRecoveryShownAtTop = phoneRecoveryShownAtTop,
+                    companionRecoveryShownAtTop = companionRecoveryShownAtTop,
                     companionConnected = companionConnected,
-                    onOpenSettings = onOpenSettings,
-                    onOpenDeveloperOptions = onOpenDeveloperOptions,
+                    onOpenPhoneAccess = onOpenPhoneAccess,
                     onOpenCompanion = onOpenCompanion,
                     onStopSession = onStopSession,
                     onAcknowledgeAttention = onAcknowledgeAttention,
@@ -1032,9 +1092,10 @@ private fun TaskGroupCard(
     state: SessionState,
     currentToolCall: DhdToolCall? = null,
     developerStatus: DeveloperModeStatus,
+    phoneRecoveryShownAtTop: Boolean,
+    companionRecoveryShownAtTop: Boolean,
     companionConnected: Boolean,
-    onOpenSettings: () -> Unit,
-    onOpenDeveloperOptions: () -> Unit,
+    onOpenPhoneAccess: () -> Unit,
     onOpenCompanion: () -> Unit,
     onStopSession: () -> Unit,
     onAcknowledgeAttention: () -> Boolean,
@@ -1132,27 +1193,41 @@ private fun TaskGroupCard(
             LiveDisplayPreviewPlaceholder(state = taskPreviewState)
         }
 
-        // Keep the playful status for healthy work, but replace it with a
-        // concrete recovery card whenever the phone cannot make progress.
+        // Keep the playful status for healthy work. Phone-access recovery is
+        // rendered above the conversation so it does not jump underneath the
+        // user's newly submitted message.
         if (active) {
             when (state) {
-                is SessionState.Running -> RunningStatusIndicator(
-                    currentPurpose = state.currentPurpose,
-                    attentionReason = state.attentionReason,
-                    startedAtEpochMs = state.startedAtEpochMs,
-                    elapsedBeforeStartMs = state.elapsedBeforeStartMs,
-                    developerStatus = developerStatus,
-                    companionConnected = companionConnected,
-                    onOpenSettings = onOpenSettings,
-                    onOpenDeveloperOptions = onOpenDeveloperOptions,
-                    onOpenCompanion = onOpenCompanion,
-                    onStopSession = onStopSession,
-                    onAcknowledgeAttention = onAcknowledgeAttention,
-                )
-                is SessionState.Paused -> if (state.attentionReason != null) {
+                is SessionState.Running -> {
+                    RunningStatusIndicator(
+                        currentPurpose = state.currentPurpose,
+                        attentionReason = state.attentionReason,
+                        attentionActionLabel = state.attentionActionLabel,
+                        startedAtEpochMs = state.startedAtEpochMs,
+                        elapsedBeforeStartMs = state.elapsedBeforeStartMs,
+                        phoneAccessTitle = developerStatus.recoveryTitle,
+                        phoneAccessDetail = developerStatus.recoveryDetail,
+                        companionConnected = companionConnected,
+                        phoneAccessRecoveryShownAtTop = phoneRecoveryShownAtTop,
+                        companionRecoveryShownAtTop = companionRecoveryShownAtTop,
+                        onOpenPhoneAccess = onOpenPhoneAccess,
+                        onOpenCompanion = onOpenCompanion,
+                        onStopSession = onStopSession,
+                        onAcknowledgeAttention = onAcknowledgeAttention,
+                    )
+                }
+                is SessionState.Paused -> if (
+                    state.attentionReason != null &&
+                    !(phoneRecoveryShownAtTop &&
+                        state.attentionActionLabel.equals("View instructions", ignoreCase = true))
+                ) {
                     AttentionRecoveryCard(
                         reason = state.attentionReason,
+                        actionLabel = state.attentionActionLabel,
+                        phoneAccessTitle = developerStatus.recoveryTitle,
+                        phoneAccessDetail = developerStatus.recoveryDetail,
                         onAcknowledgeAttention = onAcknowledgeAttention,
+                        onOpenPhoneAccess = onOpenPhoneAccess,
                         onStopSession = onStopSession,
                     )
                 } else {
@@ -1204,44 +1279,37 @@ private fun TaskGroupCard(
 private fun RunningStatusIndicator(
     currentPurpose: String,
     attentionReason: String?,
+    attentionActionLabel: String?,
     startedAtEpochMs: Long,
     elapsedBeforeStartMs: Long,
-    developerStatus: DeveloperModeStatus,
+    phoneAccessTitle: String,
+    phoneAccessDetail: String,
     companionConnected: Boolean,
-    onOpenSettings: () -> Unit,
-    onOpenDeveloperOptions: () -> Unit,
+    phoneAccessRecoveryShownAtTop: Boolean,
+    companionRecoveryShownAtTop: Boolean,
+    onOpenPhoneAccess: () -> Unit,
     onOpenCompanion: () -> Unit,
     onStopSession: () -> Unit,
     onAcknowledgeAttention: () -> Boolean,
 ) {
     val elapsedSeconds = rememberElapsedSeconds(startedAtEpochMs, elapsedBeforeStartMs)
-    val developerConnectionNeedsAction = developerStatus.state in setOf(
-        DeveloperConnectionState.PAIRING_REQUIRED,
-        DeveloperConnectionState.PAIRING_SEARCHING,
-        DeveloperConnectionState.PAIRING_SERVICE_FOUND,
-        DeveloperConnectionState.WIRELESS_DEBUGGING_OFF,
-        DeveloperConnectionState.UNSUPPORTED,
-        DeveloperConnectionState.ERROR,
-    )
-
     // A pending attention request owns the next step. Keep Done visible even
     // if the companion or developer-status poll changes while the user is
     // completing a biometric/PIN prompt.
     if (currentPurpose.equals("Needs your attention", ignoreCase = true)) {
-        AttentionRecoveryCard(
-            reason = attentionReason,
-            onAcknowledgeAttention = onAcknowledgeAttention,
-            onStopSession = onStopSession,
-        )
-        return
-    }
-
-    if (developerConnectionNeedsAction) {
-        DeveloperConnectionRecoveryCard(
-            status = developerStatus,
-            onOpenSettings = onOpenSettings,
-            onOpenDeveloperOptions = onOpenDeveloperOptions,
-        )
+        val phoneAccessInstructionsAtTop = phoneAccessRecoveryShownAtTop &&
+            attentionActionLabel.equals("View instructions", ignoreCase = true)
+        if (!phoneAccessInstructionsAtTop) {
+            AttentionRecoveryCard(
+                reason = attentionReason,
+                actionLabel = attentionActionLabel,
+                phoneAccessTitle = phoneAccessTitle,
+                phoneAccessDetail = phoneAccessDetail,
+                onAcknowledgeAttention = onAcknowledgeAttention,
+                onOpenPhoneAccess = onOpenPhoneAccess,
+                onStopSession = onStopSession,
+            )
+        }
         return
     }
 
@@ -1250,10 +1318,12 @@ private fun RunningStatusIndicator(
     // of truth for this recovery card.
     val waitingForCompanion = !companionConnected
     if (waitingForCompanion) {
-        CompanionRecoveryCard(
-            elapsedSeconds = elapsedSeconds,
-            onOpenCompanion = onOpenCompanion,
-        )
+        if (!companionRecoveryShownAtTop) {
+            CompanionRecoveryCard(
+                elapsedSeconds = elapsedSeconds,
+                onOpenCompanion = onOpenCompanion,
+            )
+        }
         return
     }
 
@@ -1379,8 +1449,9 @@ private fun PausedStatusIndicator(currentPurpose: String) {
 
 @Composable
 private fun CompanionRecoveryCard(
-    elapsedSeconds: Long,
+    elapsedSeconds: Long?,
     onOpenCompanion: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val colors = LocalAssistantColors.current
     RecoveryCard(
@@ -1390,54 +1461,244 @@ private fun CompanionRecoveryCard(
         accent = colors.warningAmber,
         actionLabel = "View connection instructions",
         onAction = onOpenCompanion,
-        trailing = "Waiting ${elapsedSeconds}s",
+        modifier = modifier,
+        trailing = elapsedSeconds?.let { "Waiting ${it}s" },
     )
 }
 
 @Composable
 private fun DeveloperConnectionRecoveryCard(
     status: DeveloperModeStatus,
-    onOpenSettings: () -> Unit,
-    onOpenDeveloperOptions: () -> Unit,
+    onOpenPhoneAccess: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val colors = LocalAssistantColors.current
     RecoveryCard(
         icon = R.drawable.ic_shield,
-        title = when (status.state) {
-            DeveloperConnectionState.PAIRING_REQUIRED -> "Pair DHD once"
-            DeveloperConnectionState.PAIRING_SEARCHING -> "Searching for pairing service"
-            DeveloperConnectionState.PAIRING_SERVICE_FOUND -> "Pairing service found"
-            DeveloperConnectionState.WIRELESS_DEBUGGING_OFF -> "Wireless Debugging is off"
-            DeveloperConnectionState.UNSUPPORTED -> "Android version unsupported"
-            else -> "DHD phone connection unavailable"
-        },
-        detail = "DHD is paused before the next phone action. ${status.message}",
+        title = status.recoveryTitle,
+        detail = status.recoveryDetail,
         accent = colors.warningAmber,
-        actionLabel = "Open Developer options",
-        onAction = onOpenDeveloperOptions,
-        secondaryActionLabel = "DHD settings",
-        onSecondaryAction = onOpenSettings,
+        actionLabel = "View instructions",
+        onAction = onOpenPhoneAccess,
+        modifier = modifier,
     )
+}
+
+@Composable
+private fun CombinedRecoveryCard(
+    phoneStatus: DeveloperModeStatus,
+    companionWaitSeconds: Long?,
+    onOpenPhoneAccess: () -> Unit,
+    onOpenCompanion: () -> Unit,
+    compact: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalAssistantColors.current
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = colors.surfaceCard,
+        border = BorderStroke(1.dp, colors.borderColor),
+        shadowElevation = 0.dp,
+        tonalElevation = 0.dp,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = if (compact) 8.dp else 13.dp),
+            verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 12.dp),
+        ) {
+            CombinedRecoverySection(
+                icon = R.drawable.ic_shield,
+                title = phoneStatus.recoveryTitle,
+                detail = phoneStatus.recoveryDetail,
+                actionLabel = "View instructions",
+                onAction = onOpenPhoneAccess,
+                compact = compact,
+                compactActionLabel = "Instructions",
+            )
+            HorizontalDivider(color = colors.borderColor.copy(alpha = 0.8f))
+            CombinedRecoverySection(
+                icon = R.drawable.ic_laptop,
+                title = "Desktop companion not connected",
+                detail = "DHD is waiting for the desktop companion. Connect this phone on your local network.",
+                trailing = companionWaitSeconds?.let { "Waiting ${it}s" },
+                actionLabel = "View instructions",
+                onAction = onOpenCompanion,
+                compact = compact,
+                compactActionLabel = "Instructions",
+            )
+        }
+    }
+}
+
+@Composable
+private fun CombinedRecoverySection(
+    icon: Int,
+    title: String,
+    detail: String,
+    actionLabel: String,
+    onAction: () -> Unit,
+    trailing: String? = null,
+    compact: Boolean = false,
+    compactActionLabel: String = actionLabel,
+) {
+    val colors = LocalAssistantColors.current
+    if (compact) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 40.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                painter = painterResource(icon),
+                contentDescription = null,
+                tint = colors.warningAmber,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(Modifier.width(9.dp))
+            Text(
+                text = title,
+                color = colors.textPrimary,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(6.dp))
+            Button(
+                onClick = onAction,
+                colors = ButtonDefaults.buttonColors(containerColor = colors.warningAmber),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 9.dp, vertical = 5.dp),
+            ) {
+                Text(compactActionLabel, fontSize = 11.sp, maxLines = 1)
+            }
+        }
+    } else {
+        Column {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    painter = painterResource(icon),
+                    contentDescription = null,
+                    tint = colors.warningAmber,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(9.dp))
+                Text(
+                    text = title,
+                    color = colors.textPrimary,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                )
+                trailing?.let { Text(text = it, color = colors.textSecondary, fontSize = 11.sp) }
+            }
+            Text(
+                text = detail,
+                color = colors.textSecondary,
+                fontSize = 12.sp,
+                lineHeight = 17.sp,
+                modifier = Modifier.padding(start = 27.dp, top = 5.dp),
+            )
+            Button(
+                onClick = onAction,
+                colors = ButtonDefaults.buttonColors(containerColor = colors.warningAmber),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
+                modifier = Modifier.padding(start = 27.dp, top = 9.dp),
+            ) {
+                Text(actionLabel, fontSize = 12.sp)
+            }
+        }
+    }
 }
 
 @Composable
 private fun AttentionRecoveryCard(
     reason: String?,
+    actionLabel: String?,
+    phoneAccessTitle: String,
+    phoneAccessDetail: String,
     onAcknowledgeAttention: () -> Boolean,
+    onOpenPhoneAccess: (() -> Unit)? = null,
     onStopSession: () -> Unit,
 ) {
     val colors = LocalAssistantColors.current
+    val usesPhoneAccessInstructions = actionLabel.equals("View instructions", ignoreCase = true) &&
+        onOpenPhoneAccess != null
+    if (usesPhoneAccessInstructions) {
+        PhoneAccessPausedCard(
+            title = phoneAccessTitle,
+            detail = phoneAccessDetail,
+            onOpenPhoneAccess = onOpenPhoneAccess!!,
+        )
+        return
+    }
     RecoveryCard(
         icon = R.drawable.ic_info,
         title = "DHD needs your attention",
         detail = reason?.takeIf(String::isNotBlank)
             ?: "Review the phone and complete the requested step before continuing.",
         accent = colors.warningAmber,
-        actionLabel = "Done",
-        onAction = { onAcknowledgeAttention() },
+        actionLabel = actionLabel?.takeIf(String::isNotBlank) ?: "Done",
+        onAction = {
+            onAcknowledgeAttention()
+        },
         secondaryActionLabel = "Stop",
         onSecondaryAction = onStopSession,
     )
+}
+
+@Composable
+private fun PhoneAccessPausedCard(
+    title: String,
+    detail: String,
+    onOpenPhoneAccess: () -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = Color.Transparent,
+        border = BorderStroke(1.dp, colors.warningAmber.copy(alpha = 0.55f)),
+        shadowElevation = 0.dp,
+        tonalElevation = 0.dp,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_info),
+                    contentDescription = null,
+                    tint = colors.warningAmber,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(9.dp))
+                Text(
+                    text = title,
+                    color = colors.textPrimary,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            Text(
+                text = detail,
+                color = colors.textSecondary,
+                fontSize = 12.sp,
+                lineHeight = 17.sp,
+                modifier = Modifier.padding(start = 27.dp, top = 5.dp),
+            )
+            Button(
+                onClick = onOpenPhoneAccess,
+                colors = ButtonDefaults.buttonColors(containerColor = colors.warningAmber),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
+                modifier = Modifier.padding(start = 27.dp, top = 9.dp),
+            ) {
+                Text("View instructions", fontSize = 12.sp)
+            }
+        }
+    }
 }
 
 @Composable
@@ -1451,13 +1712,16 @@ private fun RecoveryCard(
     trailing: String? = null,
     secondaryActionLabel: String? = null,
     onSecondaryAction: (() -> Unit)? = null,
+    modifier: Modifier = Modifier,
 ) {
     val colors = LocalAssistantColors.current
     Surface(
         shape = RoundedCornerShape(16.dp),
         color = colors.surfaceCard,
         border = BorderStroke(1.dp, colors.borderColor),
-        modifier = Modifier.fillMaxWidth(),
+        shadowElevation = 0.dp,
+        tonalElevation = 0.dp,
+        modifier = modifier.fillMaxWidth(),
     ) {
         Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 13.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -2392,7 +2656,7 @@ private fun RequestComposer(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = 36.dp),
+                    .heightIn(min = if (isExpanded) 48.dp else 36.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 if (!isExpanded) {
@@ -3008,6 +3272,11 @@ fun SettingsScreen(
     val enabledCount = remember(permissions.enabledPackages()) { permissions.enabledPackages().size }
     var isAppearanceMenuOpen by remember { mutableStateOf(false) }
     var isReasoningMenuOpen by remember { mutableStateOf(false) }
+    val phoneAccessSettingVisible = developerStatus.state !in setOf(
+        DeveloperConnectionState.READY,
+        DeveloperConnectionState.CONNECTING,
+        DeveloperConnectionState.CHECKING,
+    )
 
     Scaffold(
         containerColor = colors.background,
@@ -3391,19 +3660,20 @@ fun SettingsScreen(
                             }
                         }
 
-                        HorizontalDivider(thickness = 2.dp, color = colors.cardDivider)
+                        if (phoneAccessSettingVisible) {
+                            HorizontalDivider(thickness = 2.dp, color = colors.cardDivider)
 
-                        // DHD local phone connection row
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(bottomStart = 20.dp, bottomEnd = 20.dp))
-                                .clickable(enabled = developerStatus.state != DeveloperConnectionState.UNSUPPORTED) {
-                                    onOpenPairing()
-                                }
-                                .padding(horizontal = 16.dp, vertical = 14.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
+                            // DHD local phone connection row
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(bottomStart = 20.dp, bottomEnd = 20.dp))
+                                    .clickable(enabled = developerStatus.state != DeveloperConnectionState.UNSUPPORTED) {
+                                        onOpenPairing()
+                                    }
+                                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
                             Icon(
                                 painter = painterResource(R.drawable.ic_terminal),
                                 contentDescription = "Wireless Debugging",
@@ -3425,19 +3695,28 @@ fun SettingsScreen(
                                 )
                                 Text(
                                     text = when (developerStatus.state) {
-                                        DeveloperConnectionState.READY -> "Maintenance service active; Wireless Debugging can be off"
+                                        DeveloperConnectionState.READY -> "Phone access is active"
                                         DeveloperConnectionState.CONNECTING,
-                                        DeveloperConnectionState.CHECKING -> "Connecting automatically…"
-                                        DeveloperConnectionState.PAIRING_REQUIRED -> "Pair DHD once"
+                                        DeveloperConnectionState.CHECKING -> "Connecting phone access automatically…"
+                                        DeveloperConnectionState.PAIRING_REQUIRED -> if (developerStatus.paired) {
+                                            "Phone access needed; view the steps to reconnect"
+                                        } else {
+                                            "Set up phone access once"
+                                        }
                                         DeveloperConnectionState.PAIRING_SEARCHING -> "Listening for the pairing service…"
                                         DeveloperConnectionState.PAIRING_SERVICE_FOUND -> "Check the DHD notification"
-                                        DeveloperConnectionState.WIRELESS_DEBUGGING_OFF -> developerStatus.message
-                                        DeveloperConnectionState.UNSUPPORTED -> "Android 11+ required"
-                                        DeveloperConnectionState.ERROR -> developerStatus.message
+                                        DeveloperConnectionState.WIRELESS_DEBUGGING_OFF -> "Phone access needed; view the steps to reconnect"
+                                        DeveloperConnectionState.UNSUPPORTED -> "DHD needs Android 11+ for phone access"
+                                        DeveloperConnectionState.ERROR -> if (developerStatus.paired) {
+                                            "Phone access needed; view the steps to reconnect"
+                                        } else {
+                                            "Set up phone access once"
+                                        }
                                     },
                                     fontSize = 12.sp,
                                     color = colors.textSecondary,
-                                    maxLines = 1,
+                                    maxLines = 2,
+                                    lineHeight = 17.sp,
                                     overflow = TextOverflow.Ellipsis,
                                 )
                             }
@@ -3446,20 +3725,24 @@ fun SettingsScreen(
                                     DeveloperConnectionState.READY -> "Active"
                                     DeveloperConnectionState.CONNECTING,
                                     DeveloperConnectionState.CHECKING -> "Connecting"
-                                    DeveloperConnectionState.PAIRING_REQUIRED -> "Needs pairing"
+                                    DeveloperConnectionState.PAIRING_REQUIRED -> if (developerStatus.paired) "View steps" else "Set up"
                                     DeveloperConnectionState.PAIRING_SEARCHING -> "Searching"
                                     DeveloperConnectionState.PAIRING_SERVICE_FOUND -> "Found"
-                                    DeveloperConnectionState.WIRELESS_DEBUGGING_OFF -> "Turn on"
+                                    DeveloperConnectionState.WIRELESS_DEBUGGING_OFF -> "View steps"
                                     DeveloperConnectionState.UNSUPPORTED -> "Unavailable"
-                                    DeveloperConnectionState.ERROR -> "Needs attention"
+                                    DeveloperConnectionState.ERROR -> if (developerStatus.paired) "View steps" else "Set up"
                                 },
                                 color = when (developerStatus.state) {
                                     DeveloperConnectionState.READY -> colors.accentGreen
                                     DeveloperConnectionState.PAIRING_SEARCHING,
                                     DeveloperConnectionState.PAIRING_SERVICE_FOUND,
                                     DeveloperConnectionState.CONNECTING,
-                                    DeveloperConnectionState.CHECKING,
-                                    DeveloperConnectionState.PAIRING_REQUIRED -> colors.accentBlue
+                                    DeveloperConnectionState.CHECKING -> colors.accentBlue
+                                    DeveloperConnectionState.PAIRING_REQUIRED -> if (developerStatus.paired) {
+                                        colors.warningAmber
+                                    } else {
+                                        colors.accentBlue
+                                    }
                                     DeveloperConnectionState.WIRELESS_DEBUGGING_OFF,
                                     DeveloperConnectionState.ERROR -> colors.warningAmber
                                     DeveloperConnectionState.UNSUPPORTED -> colors.textSecondary
@@ -3470,6 +3753,7 @@ fun SettingsScreen(
                                 overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier.padding(start = 8.dp),
                             )
+                            }
                         }
                     }
                 }
@@ -4214,6 +4498,16 @@ fun PairingScreen(
         notificationUnavailable = !onStartPairingNotification()
     }
 
+    val pairingInProgress = status.state in setOf(
+        DeveloperConnectionState.PAIRING_SEARCHING,
+        DeveloperConnectionState.PAIRING_SERVICE_FOUND,
+    )
+    val screenTitle = when {
+        status.state == DeveloperConnectionState.READY -> "Phone access"
+        status.paired -> "Reconnect phone"
+        else -> "Connect phone"
+    }
+
     LaunchedEffect(status.state, status.paired) {
         val needsPairing = !status.paired && status.state in setOf(
             DeveloperConnectionState.PAIRING_REQUIRED,
@@ -4235,7 +4529,7 @@ fun PairingScreen(
                     navigationIconContentColor = colors.textPrimary,
                     actionIconContentColor = colors.textPrimary,
                 ),
-                title = { Text("Pairing", fontWeight = FontWeight.SemiBold, fontSize = 17.sp) },
+                title = { Text(screenTitle, fontWeight = FontWeight.SemiBold, fontSize = 17.sp) },
                 navigationIcon = {
                     Surface(
                         shape = CircleShape,
@@ -4269,39 +4563,10 @@ fun PairingScreen(
             contentPadding = PaddingValues(top = 14.dp, bottom = 24.dp),
         ) {
             item {
-                Surface(
-                    shape = RoundedCornerShape(20.dp),
-                    color = colors.settingsCard,
-                    border = BorderStroke(1.dp, colors.borderColor),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 18.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Icon(
-                            painter = painterResource(R.drawable.ic_info),
-                            contentDescription = null,
-                            tint = colors.accentBlue,
-                            modifier = Modifier.size(24.dp),
-                        )
-                        Text(
-                            text = "A notification from DHD will help you complete the pairing.",
-                            color = colors.textPrimary,
-                            fontSize = 15.sp,
-                            lineHeight = 21.sp,
-                            fontWeight = FontWeight.Medium,
-                            modifier = Modifier.padding(start = 14.dp),
-                        )
-                    }
-                }
-            }
-
-            item {
                 PairingStatusCard(status = status)
             }
 
-            if (notificationUnavailable) {
+            if (notificationUnavailable && !status.paired) {
                 item {
                     Surface(
                         shape = RoundedCornerShape(16.dp),
@@ -4311,7 +4576,7 @@ fun PairingScreen(
                     ) {
                         Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
                             Text(
-                                text = "Allow DHD notifications so Android can show the pairing code field.",
+                                text = "DHD needs permission to show the pairing code from Android. Allow notifications, then try again.",
                                 color = colors.textSecondary,
                                 fontSize = 13.sp,
                                 lineHeight = 19.sp,
@@ -4339,25 +4604,48 @@ fun PairingScreen(
                 }
             }
 
-            item {
-                PairingInstruction(
-                    number = 1,
-                    text = "Enter Developer options → Wireless debugging. Tap “Pair device with pairing code”; Android will show a six-digit code.",
-                    actionLabel = "Developer options",
-                    onAction = onOpenDeveloperOptions,
-                )
-            }
-            item {
-                PairingInstruction(
-                    number = 2,
-                    text = "Enter the code in the DHD notification to complete the pairing.",
-                )
-            }
-            item {
-                PairingInstruction(
-                    number = 3,
-                    text = "Go back to DHD. Pairing will finish automatically.",
-                )
+            if (status.phoneAccessInterrupted) {
+                item {
+                    PairingInstruction(
+                        number = 1,
+                        text = "Turn on Wi-Fi and connect to a network.",
+                    )
+                }
+                item {
+                    PairingInstruction(
+                        number = 2,
+                        text = "Turn on Wireless debugging in Android Settings → Developer options.",
+                        actionLabel = "Open Android settings",
+                        onAction = onOpenDeveloperOptions,
+                    )
+                }
+                item {
+                    PairingInstruction(
+                        number = 3,
+                        text = "Return to DHD. We'll reconnect automatically.",
+                    )
+                }
+            } else if (!status.paired || pairingInProgress) {
+                item {
+                    PairingInstruction(
+                        number = 1,
+                        text = "Open Android Settings → Developer options → Wireless debugging. Choose Pair device with pairing code.",
+                        actionLabel = "Open Android settings",
+                        onAction = onOpenDeveloperOptions,
+                    )
+                }
+                item {
+                    PairingInstruction(
+                        number = 2,
+                        text = "Enter the six-digit code Android shows in the DHD notification.",
+                    )
+                }
+                item {
+                    PairingInstruction(
+                        number = 3,
+                        text = "Return to DHD. We'll finish connecting your phone automatically.",
+                    )
+                }
             }
         }
     }
@@ -4370,33 +4658,39 @@ private fun PairingStatusCard(status: DeveloperModeStatus) {
         DeveloperConnectionState.READY -> colors.accentGreen
         DeveloperConnectionState.PAIRING_SEARCHING,
         DeveloperConnectionState.PAIRING_SERVICE_FOUND,
-        DeveloperConnectionState.PAIRING_REQUIRED,
         DeveloperConnectionState.CONNECTING,
         DeveloperConnectionState.CHECKING -> colors.accentBlue
+        DeveloperConnectionState.PAIRING_REQUIRED -> if (status.paired) {
+            colors.warningAmber
+        } else {
+            colors.accentBlue
+        }
         DeveloperConnectionState.WIRELESS_DEBUGGING_OFF,
         DeveloperConnectionState.ERROR -> colors.warningAmber
         DeveloperConnectionState.UNSUPPORTED -> colors.textSecondary
     }
     val statusTitle = when (status.state) {
-        DeveloperConnectionState.READY -> "Active"
-        DeveloperConnectionState.PAIRING_SEARCHING -> "Searching for pairing service"
-        DeveloperConnectionState.PAIRING_SERVICE_FOUND -> "Pairing service found"
+        DeveloperConnectionState.READY -> "Phone access is active"
+        DeveloperConnectionState.PAIRING_SEARCHING -> "Connecting your phone"
+        DeveloperConnectionState.PAIRING_SERVICE_FOUND -> "Pairing code ready"
         DeveloperConnectionState.PAIRING_REQUIRED -> if (status.paired) {
-            "Maintenance service needs a restart"
+            "Phone access needed"
         } else {
-            "DHD needs pairing"
+            "Ready to connect your phone"
         }
-        DeveloperConnectionState.CONNECTING -> "Connecting"
-        DeveloperConnectionState.CHECKING -> "Checking connection"
-        DeveloperConnectionState.WIRELESS_DEBUGGING_OFF -> "Wireless Debugging is off"
-        DeveloperConnectionState.ERROR -> "Pairing needs attention"
-        DeveloperConnectionState.UNSUPPORTED -> "Android version unsupported"
+        DeveloperConnectionState.CONNECTING -> "Reconnecting to your phone"
+        DeveloperConnectionState.CHECKING -> "Checking phone access"
+        DeveloperConnectionState.WIRELESS_DEBUGGING_OFF -> "Phone access needed"
+        DeveloperConnectionState.ERROR -> status.recoveryTitle
+        DeveloperConnectionState.UNSUPPORTED -> status.recoveryTitle
     }
     val statusDetail = when (status.state) {
-        DeveloperConnectionState.READY -> "DHD can use phone controls. Wireless Debugging can be off."
-        DeveloperConnectionState.PAIRING_SEARCHING -> "DHD is listening for Android's pairing service."
-        DeveloperConnectionState.PAIRING_SERVICE_FOUND -> "Enter the code in the DHD notification."
-        else -> status.message
+        DeveloperConnectionState.READY -> "DHD can use phone controls."
+        DeveloperConnectionState.PAIRING_SEARCHING -> "Follow the connection steps in the DHD notification."
+        DeveloperConnectionState.PAIRING_SERVICE_FOUND -> "Enter the six-digit code shown by Android in the DHD notification."
+        DeveloperConnectionState.CONNECTING -> "DHD is reconnecting automatically."
+        DeveloperConnectionState.CHECKING -> "DHD is checking whether phone access is available."
+        else -> status.recoveryDetail
     }
 
     Surface(
@@ -4544,87 +4838,34 @@ fun CompanionInstructionsScreen(
             contentPadding = PaddingValues(top = 14.dp, bottom = 24.dp),
         ) {
             item {
-                SettingsSectionHeader("How to connect")
-                Surface(
-                    shape = RoundedCornerShape(20.dp),
-                    color = colors.settingsCard,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Column(
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 16.dp),
-                        verticalArrangement = Arrangement.spacedBy(16.dp),
-                    ) {
-                        CompanionInstructionStep(
-                            number = "1",
-                            title = "Start the desktop companion",
-                            detail = "Open DHD's desktop companion on your computer. Its local dashboard is usually available at localhost:8766.",
-                        )
-                        CompanionInstructionStep(
-                            number = "2",
-                            title = "Use the same local network",
-                            detail = "Keep the phone and computer on the same local network. Wi-Fi and Ethernet are fine if the network allows them to reach each other.",
-                        )
-                        CompanionInstructionStep(
-                            number = "3",
-                            title = "Select this phone",
-                            detail = "On the desktop companion, choose Refresh phones and select this phone from the phone list.",
-                        )
-                        CompanionInstructionStep(
-                            number = "4",
-                            title = "Approve the connection",
-                            detail = "Approve the request when it appears on this phone. No pairing code needs to be entered.",
-                        )
-                    }
-                }
-                SettingsSectionFooter("If the phone is not listed, check the local network and the computer's firewall, then use Refresh phones again.")
+                PairingInstruction(
+                    number = 1,
+                    text = "Open DHD's desktop companion on your computer. Its local dashboard is usually available at localhost:8766.",
+                )
             }
-        }
-    }
-
-}
-
-@Composable
-private fun CompanionInstructionStep(
-    number: String,
-    title: String,
-    detail: String,
-) {
-    val colors = LocalAssistantColors.current
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.Top,
-    ) {
-        Box(
-            modifier = Modifier
-                .size(28.dp)
-                .background(colors.accentBlue, CircleShape),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                text = number,
-                color = Color.White,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Bold,
-            )
-        }
-        Column(
-            modifier = Modifier
-                .weight(1f)
-                .padding(start = 12.dp),
-        ) {
-            Text(
-                text = title,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = colors.textPrimary,
-            )
-            Text(
-                text = detail,
-                fontSize = 12.sp,
-                lineHeight = 18.sp,
-                color = colors.textSecondary,
-                modifier = Modifier.padding(top = 3.dp),
-            )
+            item {
+                PairingInstruction(
+                    number = 2,
+                    text = "Keep your phone and computer on the same local network. Wi-Fi and Ethernet are fine if the network allows them to reach each other.",
+                )
+            }
+            item {
+                PairingInstruction(
+                    number = 3,
+                    text = "On the desktop companion, choose Refresh phones and select this phone from the phone list.",
+                )
+            }
+            item {
+                PairingInstruction(
+                    number = 4,
+                    text = "Approve the request when it appears on this phone. No pairing code needs to be entered.",
+                )
+            }
+            item {
+                SettingsSectionFooter(
+                    "If the phone is not listed, check the local network and the computer's firewall, then use Refresh phones again.",
+                )
+            }
         }
     }
 }
@@ -5076,6 +5317,29 @@ private fun LiveDisplayPreviewState.isExpanded(expandedSessionKey: String?): Boo
         (sessionKey == expandedSessionKey || runSessionKey == expandedSessionKey)
 
 private fun SessionState.isActive(): Boolean = this is SessionState.Running || this is SessionState.Paused
+
+internal fun shouldCombineRecoveryBanners(
+    state: SessionState,
+    developerStatus: DeveloperModeStatus,
+    companionConnected: Boolean,
+): Boolean =
+    (developerStatus.requiresUserAction || state.showsPhoneAccessRecovery()) && !companionConnected
+
+internal fun shouldShowTopRecoveryBanner(
+    state: SessionState,
+    developerStatus: DeveloperModeStatus,
+    companionConnected: Boolean,
+): Boolean = developerStatus.requiresUserAction ||
+    state.showsPhoneAccessRecovery() ||
+    !companionConnected
+
+private fun SessionState.showsPhoneAccessRecovery(): Boolean = when (this) {
+    is SessionState.Running -> currentPurpose.equals("Needs your attention", ignoreCase = true) &&
+        attentionActionLabel.equals("View instructions", ignoreCase = true)
+    is SessionState.Paused -> attentionReason != null &&
+        attentionActionLabel.equals("View instructions", ignoreCase = true)
+    else -> false
+}
 
 private fun SessionState.sessionIdOrNullForUi(): String? = when (this) {
     SessionState.Idle -> null

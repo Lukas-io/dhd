@@ -189,6 +189,21 @@ class OverlayVisibilityGateTest {
     }
 
     @Test
+    fun `overlay keeps phone access recovery visible after a task ends`() {
+        assertEquals(
+            OverlayRecoveryKind.DEVELOPER,
+            overlayRecoveryKind(
+                state = SessionState.Completed(
+                    sessionId = "completed-session",
+                    message = "Done",
+                ),
+                developerStatus = DeveloperModeStatus(DeveloperConnectionState.WIRELESS_DEBUGGING_OFF),
+                companionConnected = true,
+            ),
+        )
+    }
+
+    @Test
     fun `horizontal swipe places bubble on the matching display edge`() {
         val current = BubblePosition(x = 420, y = 600)
 

@@ -78,6 +78,7 @@ const WORKER_RESTART_DELAY_MS = 1_000;
 
 let connection: ConnectionConfig = initialConnection();
 let worker: ChildProcess | null = null;
+let workerConnection: ConnectionConfig | null = null;
 let processStatus: CompanionProcessStatus = "stopped";
 let bridgeStatus: BridgeStatus = "unknown";
 let phone: PhoneSnapshot | undefined;
@@ -500,6 +501,7 @@ function startWorker(): CompanionState {
   });
 
   worker = child;
+  workerConnection = { ...connection };
   child.on("message", (message) => {
     ingestCompanionToolCallEvent(message);
     ingestCompanionTokenUsageEvent(message);
@@ -508,6 +510,7 @@ function startWorker(): CompanionState {
   child.once("error", (error) => {
     if (worker !== child) return;
     worker = null;
+    workerConnection = null;
     processStatus = "error";
     lastError = error.message;
     appendLog(`Companion worker failed: ${error.message}`, { level: "error", source: "system" });
@@ -520,6 +523,7 @@ function startWorker(): CompanionState {
     // stale and must not overwrite the replacement's state.
     if (worker !== child) return;
     worker = null;
+    workerConnection = null;
     const expected = processStatus === "stopping";
     processStatus = expected || code === 0 ? "stopped" : "error";
     if (!expected && code !== 0) {
@@ -557,6 +561,7 @@ async function stopWorker(
   const child = worker;
   if (!child || child.killed) {
     worker = null;
+    workerConnection = null;
     processStatus = "stopped";
     const target = connection;
     await releaseCompanionPresence(target, checkToIgnore);
@@ -874,7 +879,10 @@ async function performConnectionCheck(options: { silent?: boolean } = {}): Promi
     lastAutomaticRediscoveryAt = 0;
     resetHeartbeatRetry();
     if (!options.silent || previousBridgeStatus !== "connected" || phoneChanged) {
-      appendLog(`Phone bridge check passed; phone session state: ${nextPhone.state}.`, { level: "system", source: "bridge" });
+      const requestAvailability = nextPhone.requestAvailable === undefined
+        ? ""
+        : `; request available: ${nextPhone.requestAvailable}`;
+      appendLog(`Phone bridge check passed; phone session state: ${nextPhone.state}${requestAvailability}.`, { level: "system", source: "bridge" });
     } else {
       publishState();
     }
@@ -923,20 +931,23 @@ async function applyPairedConnection(
     throw new Error("Connection settings changed while rediscovering the phone; keeping the newer settings.");
   }
 
-  if (sameConnection(connection, candidate)) {
+  const workerTargetMatchesCandidate = !worker || worker.killed ||
+    (workerConnection !== null && sameConnection(workerConnection, candidate));
+  if (sameConnection(connection, candidate) && workerTargetMatchesCandidate) {
     phone = phoneSnapshot(result);
     bridgeStatus = "connected";
     lastError = undefined;
     lastAutomaticRediscoveryAt = 0;
     resetHeartbeatRetry();
     appendLog(`Phone bridge reconnected; state: ${phone.state}.`, { level: "system", source: "bridge" });
+    if (dashboardActive && (!worker || worker.killed)) startWorker();
     return snapshot();
   }
 
   const wasRunning = Boolean(worker && !worker.killed);
   if (wasRunning) await stopWorker("phone pairing changed", bridgeCheckInFlight);
   if (expectedConnection && connection !== expectedConnection) {
-    if (wasRunning) startWorker();
+    if (dashboardActive || wasRunning) startWorker();
     throw new Error("Connection settings changed while rediscovering the phone; keeping the newer settings.");
   }
   connection = candidate;
@@ -947,7 +958,9 @@ async function applyPairedConnection(
   lastAutomaticRediscoveryAt = 0;
   resetHeartbeatRetry();
   appendLog(`Phone pairing ${logVerb}; the companion discovered the phone automatically.`, { level: "system", source: "bridge" });
-  if (wasRunning) startWorker();
+  // The active dashboard owns the worker lifecycle. Always start against the
+  // newly saved target, even if the old worker exited during rediscovery.
+  if (dashboardActive || wasRunning) startWorker();
   return snapshot();
 }
 

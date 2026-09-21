@@ -1635,6 +1635,14 @@ class DevBridgeServer(
             targetDescription = json.optString("targetDescription").trim().take(MAX_TEXT_CHARS).ifBlank { null },
             toolName = DHD_OBSERVE_TOOL,
         )
+        if (!coordinator.awaitPhoneAccessForTool()) {
+            write(
+                writer,
+                errorResponse(requestId, "Phone access is no longer available; DHD could not observe the phone.")
+                    .put("code", "DEVELOPER_MODE_UNAVAILABLE"),
+            )
+            return
+        }
         val requestedDisplayRef = optionalDisplayRef(json)
         val target = if (taskDisplayRequiredProvider() || requestedDisplayRef != null) {
             when (val resolution = resolveDisplayTarget(
@@ -1676,6 +1684,14 @@ class DevBridgeServer(
             purpose = "Checking foreground app",
             toolName = DHD_FOREGROUND_APP_TOOL,
         )
+        if (!coordinator.awaitPhoneAccessForTool()) {
+            write(
+                writer,
+                errorResponse(requestId, "Phone access is no longer available; DHD could not check the phone.")
+                    .put("code", "DEVELOPER_MODE_UNAVAILABLE"),
+            )
+            return
+        }
         val requestedDisplayRef = optionalDisplayRef(json)
         val target = if (taskDisplayRequiredProvider() || requestedDisplayRef != null) {
             when (val resolution = resolveDisplayTarget(
@@ -2037,6 +2053,28 @@ class DevBridgeServer(
                 status = SequenceStepResult.Status.FAILED,
                 message = "No active task display is available; the physical display was not touched.",
                 code = "TASK_DISPLAY_UNAVAILABLE",
+                outcome = "failed",
+                executed = false,
+            )
+            writeSequenceResult(
+                writer,
+                requestId,
+                SequenceExecutionResult(
+                    requestedSteps = request.actions.size,
+                    steps = listOf(failure),
+                    failure = failure,
+                ),
+            )
+            return
+        }
+        if (!coordinator.awaitPhoneAccessForTool()) {
+            val firstAction = request.actions.first()
+            val failure = SequenceStepResult(
+                index = 0,
+                action = wireActionName(firstAction),
+                status = SequenceStepResult.Status.FAILED,
+                message = "Phone access is no longer available; the sequence was not executed.",
+                code = "DEVELOPER_MODE_UNAVAILABLE",
                 outcome = "failed",
                 executed = false,
             )
@@ -2593,6 +2631,12 @@ class DevBridgeServer(
             return ObservationCaptureResult.Failed(
                 message = "No active task display is available; refusing to use the physical display.",
                 code = "TASK_DISPLAY_UNAVAILABLE",
+            )
+        }
+        if (!coordinator.awaitPhoneAccessForTool()) {
+            return ObservationCaptureResult.Failed(
+                message = "Phone access is no longer available; the observation was not captured.",
+                code = "DEVELOPER_MODE_UNAVAILABLE",
             )
         }
         var last: ObservationCaptureResult = ObservationCaptureResult.Failed("No capture attempted.")

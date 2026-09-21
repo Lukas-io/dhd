@@ -12,9 +12,11 @@ import com.phonecontrol.assistant.domain.TapAction
 import com.phonecontrol.assistant.domain.TaskPointerEvent
 import com.phonecontrol.assistant.policy.PolicyEngine
 import com.phonecontrol.assistant.execution.PhoneActionTransport
+import com.phonecontrol.assistant.execution.RejectionCode
 import com.phonecontrol.assistant.execution.TransportResult
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertFalse
@@ -101,6 +103,80 @@ class SessionCoordinatorTest {
         assertEquals(500, (pointer as TaskPointerEvent.Click).x)
         assertEquals(900, pointer.y)
         assertEquals(ClickPhase.PRESSED, pointer.phase)
+    }
+
+    @Test
+    @OptIn(ExperimentalCoroutinesApi::class)
+    fun `phone access loss pauses the tool until access returns`() = runTest {
+        var phoneAccessReady = false
+        var transportCalls = 0
+        var attentionNotifications = 0
+        var attentionResolved = 0
+        val transport = object : PhoneActionTransport {
+            override suspend fun execute(
+                action: PhoneAction,
+                observation: ObservationSnapshot?,
+            ): TransportResult = TransportResult.Succeeded("executed")
+
+            override suspend fun executeForSession(
+                sessionKey: String,
+                action: PhoneAction,
+                observation: ObservationSnapshot?,
+                beforeInput: (() -> Unit)?,
+                onPointerMove: (() -> Unit)?,
+            ): TransportResult {
+                transportCalls += 1
+                return if (transportCalls == 1) {
+                    TransportResult.Rejected(
+                        code = RejectionCode.DEVELOPER_MODE_UNAVAILABLE,
+                        message = "Phone access is unavailable.",
+                    )
+                } else {
+                    TransportResult.Succeeded("executed")
+                }
+            }
+        }
+        val coordinator = SessionCoordinator(
+            enabledPackagesProvider = { setOf("com.example.shop") },
+            policyEngine = PolicyEngine(),
+            transport = transport,
+            phoneAccessReadyProvider = { phoneAccessReady },
+            onPhoneAccessAttentionRequested = { _, _ -> attentionNotifications += 1 },
+            onPhoneAccessAttentionResolved = { attentionResolved += 1 },
+        )
+        coordinator.start("Buy dinner")
+
+        val result = async {
+            coordinator.executeAction(
+                TapAction(
+                    x = 500,
+                    y = 900,
+                    metadata = ActionMetadata(
+                        purpose = "Place order",
+                        observationId = observation.id,
+                        targetDescription = "Place order button",
+                    ),
+                ),
+                observation,
+            )
+        }
+
+        runCurrent()
+        assertFalse(result.isCompleted)
+        assertTrue(coordinator.attentionPending())
+        assertEquals("View instructions", (coordinator.state.value as SessionState.Running).attentionActionLabel)
+        assertEquals(1, attentionNotifications)
+
+        phoneAccessReady = true
+        advanceUntilIdle()
+
+        assertTrue(result.await() is ActionExecutionResult.TransportFinished)
+        assertEquals(2, transportCalls)
+        assertEquals(1, attentionResolved)
+        assertFalse(coordinator.attentionPending())
+        assertTrue(coordinator.events.value.any {
+            it.message.contains("Phone access was restored")
+        })
     }
 
     @Test
@@ -300,22 +376,13 @@ class SessionCoordinatorTest {
     }
 
     @Test
-    fun `desktop request stays queued until phone actions are ready`() {
-        var phoneActionsReady = false
-        val coordinator = coordinator { phoneActionsReady }
+    fun `desktop request remains visible while phone actions are unavailable`() {
+        val coordinator = coordinator()
         coordinator.start("Open Spotify")
 
-        assertNull(coordinator.pendingRequest())
-
-        phoneActionsReady = true
         val pending = coordinator.pendingRequest()
         assertNotNull(pending)
-
-        phoneActionsReady = false
-        assertNull(coordinator.claimRequest(pending!!.sessionId))
-
-        phoneActionsReady = true
-        assertEquals(pending, coordinator.claimRequest(pending.sessionId))
+        assertEquals(pending, coordinator.claimRequest(pending!!.sessionId))
     }
 
     @Test
@@ -497,7 +564,7 @@ class SessionCoordinatorTest {
         assertEquals("Step 3", coordinator.toolCalls.value.first().purpose)
     }
 
-    private fun coordinator(phoneActionsReady: () -> Boolean = { true }): SessionCoordinator = SessionCoordinator(
+    private fun coordinator(): SessionCoordinator = SessionCoordinator(
         enabledPackagesProvider = { setOf("com.example.shop") },
         policyEngine = PolicyEngine(),
         transport = object : PhoneActionTransport {
@@ -506,6 +573,5 @@ class SessionCoordinatorTest {
                 observation: ObservationSnapshot?,
             ): TransportResult = TransportResult.Succeeded("executed")
         },
-        phoneActionsReadyProvider = phoneActionsReady,
     )
 }

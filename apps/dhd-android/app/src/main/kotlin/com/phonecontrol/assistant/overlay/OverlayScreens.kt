@@ -77,7 +77,6 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import com.phonecontrol.assistant.developer.TaskPreviewState
-import com.phonecontrol.assistant.developer.DeveloperConnectionState
 import com.phonecontrol.assistant.developer.DeveloperModeStatus
 import com.phonecontrol.assistant.domain.ReasoningEffort
 import com.phonecontrol.assistant.domain.TaskPointerEvent
@@ -640,8 +639,7 @@ private fun FloatingRecoveryCard(
     onAcknowledgeAttention: () -> Boolean,
     onStop: () -> Unit,
     onOpenCompanion: () -> Unit,
-    onOpenSettings: () -> Unit,
-    onOpenDeveloperOptions: () -> Unit,
+    onOpenPhoneAccess: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalAssistantColors.current
@@ -656,14 +654,24 @@ private fun FloatingRecoveryCard(
 
     when (kind) {
         OverlayRecoveryKind.ATTENTION -> {
-            title = "DHD needs your attention"
-            detail = state.attentionReasonOrNull()
-                ?: "Review the phone and complete the requested step before continuing."
+            val attentionActionLabel = state.attentionActionLabelOrNull()
+            val phoneAccessRecovery = attentionActionLabel.equals("View instructions", ignoreCase = true)
+            title = if (phoneAccessRecovery) {
+                developerStatus.recoveryTitle
+            } else {
+                "DHD needs your attention"
+            }
+            detail = if (phoneAccessRecovery) {
+                developerStatus.recoveryDetail
+            } else {
+                state.attentionReasonOrNull()
+                    ?: "Review the phone and complete the requested step before continuing."
+            }
             icon = com.phonecontrol.assistant.R.drawable.ic_info
-            primaryLabel = "Done"
-            primaryAction = { onAcknowledgeAttention() }
-            secondaryLabel = "Stop"
-            secondaryAction = onStop
+            primaryLabel = if (phoneAccessRecovery) "View instructions" else attentionActionLabel ?: "Done"
+            primaryAction = if (phoneAccessRecovery) onOpenPhoneAccess else { { onAcknowledgeAttention() } }
+            secondaryLabel = if (phoneAccessRecovery) null else "Stop"
+            secondaryAction = if (phoneAccessRecovery) null else onStop
         }
 
         OverlayRecoveryKind.COMPANION -> {
@@ -677,20 +685,13 @@ private fun FloatingRecoveryCard(
         }
 
         OverlayRecoveryKind.DEVELOPER -> {
-            title = when (developerStatus.state) {
-                DeveloperConnectionState.PAIRING_REQUIRED -> "Pair DHD once"
-                DeveloperConnectionState.PAIRING_SEARCHING -> "Searching for pairing service"
-                DeveloperConnectionState.PAIRING_SERVICE_FOUND -> "Pairing service found"
-                DeveloperConnectionState.WIRELESS_DEBUGGING_OFF -> "Wireless Debugging is off"
-                DeveloperConnectionState.UNSUPPORTED -> "Android version unsupported"
-                else -> "DHD phone connection unavailable"
-            }
-            detail = "DHD is paused before the next phone action. ${developerStatus.message}"
+            title = developerStatus.recoveryTitle
+            detail = developerStatus.recoveryDetail
             icon = com.phonecontrol.assistant.R.drawable.ic_shield
-            primaryLabel = "Open Developer options"
-            primaryAction = onOpenDeveloperOptions
-            secondaryLabel = "DHD settings"
-            secondaryAction = onOpenSettings
+            primaryLabel = "View instructions"
+            primaryAction = onOpenPhoneAccess
+            secondaryLabel = null
+            secondaryAction = null
         }
     }
 
@@ -848,8 +849,7 @@ fun OverlayPanel(
     onBubbleDragEnd: () -> Unit,
     onStop: () -> Unit,
     onAcknowledgeAttention: () -> Boolean,
-    onOpenSettings: () -> Unit,
-    onOpenDeveloperOptions: () -> Unit,
+    onOpenPhoneAccess: () -> Unit,
     onOpenCompanion: () -> Unit,
     onContinueInDhd: () -> Unit,
     onCollapse: () -> Unit,
@@ -922,10 +922,17 @@ fun OverlayPanel(
         }
     }
 
+    val recoveryKind = overlayRecoveryKind(
+        state = state,
+        developerStatus = currentDeveloperStatus,
+        companionConnected = isCompanionConnected,
+    )
+    val hasRecovery = state.needsAttention() || recoveryKind != null
+
     // An explicit collapse request wins over the session state. The perimeter glow is separate.
     val effectiveMode = when {
         mode == OverlayPanelMode.BUBBLE -> OverlayPanelMode.BUBBLE
-        active && state.needsAttention() -> OverlayPanelMode.ATTENTION
+        active && hasRecovery -> OverlayPanelMode.ATTENTION
         active -> OverlayPanelMode.WORKING
         else -> mode
     }
@@ -943,8 +950,8 @@ fun OverlayPanel(
             onDrag = onDrag,
             onDragEnd = onBubbleDragEnd,
             running = state is SessionState.Running || state is SessionState.Paused,
-            attention = state.needsAttention(),
-            animated = state is SessionState.Running && !state.needsAttention(),
+            attention = hasRecovery,
+            animated = state is SessionState.Running && !hasRecovery,
         )
         return
     }
@@ -960,11 +967,6 @@ fun OverlayPanel(
 
     val resultText = result?.takeIf { it.isNotBlank() } ?: terminalMessage(state)
     val hasFloatingResult = effectiveMode == OverlayPanelMode.RESULT && resultText.isNotBlank()
-    val recoveryKind = overlayRecoveryKind(
-        state = state,
-        developerStatus = currentDeveloperStatus,
-        companionConnected = isCompanionConnected,
-    )
     val hasFloatingRecovery = recoveryKind != null && effectiveMode != OverlayPanelMode.BUBBLE
     // The composer geometry is independent from the optional cards above it.
     // Opening or closing a card must not change the parent padding/width that
@@ -1116,8 +1118,7 @@ fun OverlayPanel(
                         onAcknowledgeAttention = onAcknowledgeAttention,
                         onStop = onStop,
                         onOpenCompanion = onOpenCompanion,
-                        onOpenSettings = onOpenSettings,
-                        onOpenDeveloperOptions = onOpenDeveloperOptions,
+                        onOpenPhoneAccess = onOpenPhoneAccess,
                         modifier = Modifier
                             .width(cardWidth)
                             .onGloballyPositioned { recoveryCardHeightPx = it.size.height },
@@ -1198,7 +1199,7 @@ fun OverlayPanel(
                     val glowBase = if (colors.isDark) Color.White else Color(0xFF1E293B)
                     val glowAccent = if (colors.isDark) Color(0xFF93C5FD) else Color(0xFF3B82F6)
 
-                    val chromaticColors = if (state.needsAttention()) {
+                    val chromaticColors = if (hasRecovery) {
                         listOf(
                             colors.warningAmber,
                             Color(0xFFFBBF24),
@@ -1318,6 +1319,7 @@ fun OverlayPanel(
                         OverlayPanelMode.ATTENTION -> WorkingRow(
                             state = state,
                             calls = calls,
+                            recoveryKind = recoveryKind,
                             onStop = onStop,
                             onContinueInDhd = onContinueInDhd,
                             onCollapse = onCollapse,
@@ -2221,6 +2223,7 @@ private fun nextPreToolStatusIndex(previous: Int): Int {
 private fun WorkingRow(
     state: SessionState,
     calls: List<DhdToolCall>,
+    recoveryKind: OverlayRecoveryKind? = null,
     onStop: () -> Unit,
     onContinueInDhd: () -> Unit,
     onCollapse: () -> Unit,
@@ -2233,7 +2236,7 @@ private fun WorkingRow(
             !it.toolName.equals("close_display", ignoreCase = true)
     }
     val runningCall = sessionCalls.lastOrNull { it.status == DhdToolCallStatus.RUNNING }
-    val attention = state.needsAttention()
+    val attention = state.needsAttention() || recoveryKind != null
     val attentionReason = state.attentionReasonOrNull()
     val preToolStatus = rememberPreToolStatus(
         enabled = sessionCalls.isEmpty() && !attention && state is SessionState.Running,
@@ -2246,7 +2249,9 @@ private fun WorkingRow(
     }
 
     val activeTask = when {
-        attention -> attentionReason ?: "Needs your attention"
+        state.needsAttention() -> attentionReason ?: "Needs your attention"
+        recoveryKind == OverlayRecoveryKind.COMPANION -> "Desktop companion not connected"
+        recoveryKind == OverlayRecoveryKind.DEVELOPER -> "Phone access needed"
         else -> rawTask
     }
 
@@ -2280,8 +2285,11 @@ private fun WorkingRow(
                         )
                     }
                 .semantics {
-                    contentDescription =
+                    contentDescription = if (attention) {
+                        "DHD is waiting for recovery. Tap to continue in DHD, double tap to collapse."
+                    } else {
                         "DHD is working. Tap to continue in DHD, double tap to collapse."
+                    }
                 },
                 contentAlignment = Alignment.Center,
             ) {
@@ -2599,6 +2607,12 @@ private fun SessionState.attentionReasonOrNull(): String? = when (this) {
     else -> null
 }
 
+private fun SessionState.attentionActionLabelOrNull(): String? = when (this) {
+    is SessionState.Running -> attentionActionLabel?.takeIf { it.isNotBlank() }
+    is SessionState.Paused -> attentionActionLabel?.takeIf { it.isNotBlank() }
+    else -> null
+}
+
 private fun SessionState.needsAttention(): Boolean =
     currentPurposeOrNull()?.equals("Needs your attention", ignoreCase = true) == true
 
@@ -2607,18 +2621,12 @@ internal fun overlayRecoveryKind(
     developerStatus: DeveloperModeStatus,
     companionConnected: Boolean,
 ): OverlayRecoveryKind? {
-    if (state !is SessionState.Running && state !is SessionState.Paused) return null
     if (state.needsAttention()) return OverlayRecoveryKind.ATTENTION
 
-    val developerConnectionNeedsAction = developerStatus.state in setOf(
-        DeveloperConnectionState.PAIRING_REQUIRED,
-        DeveloperConnectionState.PAIRING_SEARCHING,
-        DeveloperConnectionState.PAIRING_SERVICE_FOUND,
-        DeveloperConnectionState.WIRELESS_DEBUGGING_OFF,
-        DeveloperConnectionState.UNSUPPORTED,
-        DeveloperConnectionState.ERROR,
-    )
+    val developerConnectionNeedsAction = developerStatus.requiresUserAction
     if (developerConnectionNeedsAction) return OverlayRecoveryKind.DEVELOPER
+
+    if (state !is SessionState.Running && state !is SessionState.Paused) return null
 
     // A Codex retry/release can leave the companion connected. Only show the
     // disconnected recovery overlay when the phone-side heartbeat lease is

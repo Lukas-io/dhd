@@ -33,6 +33,11 @@ import {
 
 export * from "./dhd-tool-contract.js";
 
+const PHONE_ACCESS_BRIDGE_OPTIONS = {
+  timeoutMs: BLOCKING_BRIDGE_TIMEOUT_MS,
+  keepOpenAfterAccepted: true,
+};
+
 const packageNameSchema = z
   .string()
   .min(1)
@@ -729,24 +734,30 @@ export async function invokeDhdTool(
     case "dhd_get_foreground_app":
       return safely(() => {
         const parsed = parseInput(schemas.dhdGetForegroundAppInputSchema, input);
-        return requestBridge({
-          type: "foreground_app",
-          tool: "dhd_get_foreground_app",
-          requestId: randomUUID(),
-          ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
-        });
+        return requestBridge(
+          {
+            type: "foreground_app",
+            tool: "dhd_get_foreground_app",
+            requestId: randomUUID(),
+            ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
+          },
+          PHONE_ACCESS_BRIDGE_OPTIONS,
+        );
       });
     case "dhd_observe":
       return safely(() => {
         const parsed = parseInput(schemas.dhdObserveInputSchema, input);
-        return requestBridge({
-          type: "observe",
-          tool: "dhd_observe",
-          requestId: randomUUID(),
-          ...(parsed.purpose ? { purpose: parsed.purpose } : {}),
-          ...(parsed.targetDescription ? { targetDescription: parsed.targetDescription } : {}),
-          ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
-        });
+        return requestBridge(
+          {
+            type: "observe",
+            tool: "dhd_observe",
+            requestId: randomUUID(),
+            ...(parsed.purpose ? { purpose: parsed.purpose } : {}),
+            ...(parsed.targetDescription ? { targetDescription: parsed.targetDescription } : {}),
+            ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
+          },
+          PHONE_ACCESS_BRIDGE_OPTIONS,
+        );
       }, undefined, options);
     case "dhd_open_app":
       let openedAction: Record<string, unknown> | undefined;
@@ -757,17 +768,20 @@ export async function invokeDhdTool(
           type: "open_app",
           packageName: parsed.packageName,
         };
-        const message = await requestBridge({
-          type: "execute_action",
-          tool: "dhd_open_app",
-          requestId: randomUUID(),
-          ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
-          action: {
-            type: "open_app",
-            packageName: parsed.packageName,
-            metadata: parsed.metadata
-          }
-        });
+        const message = await requestBridge(
+          {
+            type: "execute_action",
+            tool: "dhd_open_app",
+            requestId: randomUUID(),
+            ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
+            action: {
+              type: "open_app",
+              packageName: parsed.packageName,
+              metadata: parsed.metadata
+            }
+          },
+          PHONE_ACCESS_BRIDGE_OPTIONS,
+        );
         openedInitialPointer = initialPointerPoint(message);
         return message;
       }, () => ({
@@ -781,27 +795,33 @@ export async function invokeDhdTool(
         const parsed = parseInput(schemas.dhdExecuteInputSchema, input);
         const action = parsed.action;
         executedAction = action as unknown as Record<string, unknown>;
-        return requestBridge({
-          type: "execute_action",
-          tool: "dhd_execute",
-          requestId: randomUUID(),
-          ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
-          action,
-        });
+        return requestBridge(
+          {
+            type: "execute_action",
+            tool: "dhd_execute",
+            requestId: randomUUID(),
+            ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
+            action,
+          },
+          PHONE_ACCESS_BRIDGE_OPTIONS,
+        );
       }, () => ({ action: executedAction }), options);
     case "dhd_execute_sequence":
       let sequenceActions: readonly Record<string, unknown>[] | undefined;
       return safely(() => {
         const parsed = parseInput(schemas.dhdExecuteSequenceInputSchema, input);
         sequenceActions = parsed.actions as readonly Record<string, unknown>[];
-        return requestBridge({
-          type: "execute_sequence",
-          tool: "dhd_execute_sequence",
-          requestId: randomUUID(),
-          observationId: parsed.observationId,
-          ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
-          actions: parsed.actions
-        });
+        return requestBridge(
+          {
+            type: "execute_sequence",
+            tool: "dhd_execute_sequence",
+            requestId: randomUUID(),
+            observationId: parsed.observationId,
+            ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
+            actions: parsed.actions
+          },
+          PHONE_ACCESS_BRIDGE_OPTIONS,
+        );
       }, () => ({ sequenceActions }), options);
     case "dhd_request_attention":
       return safely(() => {
@@ -814,7 +834,7 @@ export async function invokeDhdTool(
             reason: parsed.reason,
             ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
           },
-          { timeoutMs: BLOCKING_BRIDGE_TIMEOUT_MS },
+          PHONE_ACCESS_BRIDGE_OPTIONS,
         );
       });
     default:
