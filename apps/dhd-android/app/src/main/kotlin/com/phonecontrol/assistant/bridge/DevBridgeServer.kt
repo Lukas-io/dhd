@@ -1080,7 +1080,6 @@ class DevBridgeServer(
                 coordinator.state.value.conversationIdOrNullForBridge(),
             )
         }
-        AssistantForegroundService.removeAttentionNotification(context)
         AssistantForegroundService.reconcileLifetime(context)
         write(
             writer,

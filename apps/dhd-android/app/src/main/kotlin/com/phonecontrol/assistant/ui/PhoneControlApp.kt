@@ -18,6 +18,7 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
@@ -34,12 +35,14 @@ import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
+import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.phonecontrol.assistant.PhoneControlApplication
 import com.phonecontrol.assistant.apps.InstalledAppsRepository
 import com.phonecontrol.assistant.data.DHD_CONVERSATION_ID
 import com.phonecontrol.assistant.domain.ReasoningEffort
 import com.phonecontrol.assistant.execution.TaskDisplayLayoutPreferences
+import com.phonecontrol.assistant.session.SessionState
 
 data class AssistantColorScheme(
     val isDark: Boolean,
@@ -188,6 +191,7 @@ fun PhoneControlApp(
     overlayEnabled: Boolean = false,
     overlayPermissionGranted: Boolean = false,
     onSetOverlayEnabled: (Boolean) -> Unit = {},
+    onNotificationVisibilityChanged: (mainConversationVisible: Boolean, attentionVisible: Boolean) -> Unit = { _, _ -> },
 ) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
@@ -264,6 +268,7 @@ fun PhoneControlApp(
 
     val application = context.applicationContext as PhoneControlApplication
     val coordinator = application.sessionCoordinator
+    val coordinatorState by coordinator.state.collectAsState()
     val conversationStore = application.conversationStore
     val showConversationExpiryPrompt by conversationStore.conversationExpiryPrompt.collectAsState()
     val permissions = application.appPermissionRepository
@@ -282,6 +287,20 @@ fun PhoneControlApp(
     }
 
     val navController = rememberNavController()
+    val currentBackStackEntry by navController.currentBackStackEntryAsState()
+    val currentRoute = currentBackStackEntry?.destination?.route
+    val mainConversationVisible = currentRoute == AppRoutes.MAIN
+    val attentionVisible = mainConversationVisible && when (val state = coordinatorState) {
+        is SessionState.Running -> !state.attentionReason.isNullOrBlank()
+        is SessionState.Paused -> !state.attentionReason.isNullOrBlank()
+        else -> false
+    }
+    LaunchedEffect(mainConversationVisible, attentionVisible) {
+        onNotificationVisibilityChanged(mainConversationVisible, attentionVisible)
+    }
+    DisposableEffect(Unit) {
+        onDispose { onNotificationVisibilityChanged(false, false) }
+    }
     val initialNavigationRoute = when (initialRoute) {
         AppRoutes.SETTINGS,
         AppRoutes.TASK_DISPLAYS,

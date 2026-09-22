@@ -70,7 +70,7 @@ class PolicyEngine(
                     if (action.packageName !in context.enabledPackages) {
                         return PolicyDecision.Denied(
                             DenialCode.APP_NOT_ALLOWED,
-                            "The app ${action.packageName} is not enabled for Phone Control.",
+                            "DHD isn't allowed to control the app ${action.packageName}. User should enable it in the settings.",
                         )
                     }
                 }
@@ -84,7 +84,7 @@ class PolicyEngine(
                     if (foregroundPackage !in context.enabledPackages) {
                         return PolicyDecision.Denied(
                             DenialCode.APP_NOT_ALLOWED,
-                            "The foreground app is not enabled for Phone Control.",
+                            "DHD isn't allowed to control the foreground app. User should enable it in the settings.",
                         )
                     }
                 }

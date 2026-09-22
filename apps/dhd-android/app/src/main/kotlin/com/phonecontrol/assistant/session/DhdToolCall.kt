@@ -20,7 +20,7 @@ enum class DhdToolCallStatus {
 
 fun defaultDhdToolPurpose(toolName: String): String = when (toolName) {
     "dhd_list_allowed_apps" -> "Checking which apps DHD can use"
-    "dhd_browse_app" -> "Finding the app to open"
+    "dhd_browse_app" -> "Browsing installed apps"
     "dhd_set_app_display_layout" -> "Adjusting the app's task-display layout"
     "dhd_get_foreground_app" -> "Checking which app is on screen"
     "dhd_observe" -> "Inspecting the current screen"

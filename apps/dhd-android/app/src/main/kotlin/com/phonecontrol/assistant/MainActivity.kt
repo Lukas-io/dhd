@@ -38,6 +38,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 private const val CONVERSATION_EXPIRY_CHECK_INTERVAL_MS = 1_000L
+private const val PERMISSION_SETUP_PREFERENCES = "dhd_permission_setup"
+private const val KEY_FIRST_RUN_PERMISSION_SETUP_PROMPTED = "first_run_permission_setup_prompted"
 
 class MainActivity : ComponentActivity() {
     private var pendingRequest: String? = null
@@ -47,11 +49,18 @@ class MainActivity : ComponentActivity() {
     private var overlayEnabled by mutableStateOf(false)
     private var overlayPermissionGranted by mutableStateOf(false)
     private var pendingOverlayEnable = false
+    private var firstRunPermissionSetupStarted = false
+    private var waitingForFirstRunNotificationPermission = false
     private var overlayActivityToken: OverlayVisibilityGate.Token? = null
     private var conversationExpiryMonitor: Job? = null
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
+        if (waitingForFirstRunNotificationPermission) {
+            waitingForFirstRunNotificationPermission = false
+            continueFirstRunPermissionSetup()
+            return@registerForActivityResult
+        }
         if (granted) {
             pendingRequest?.let {
                 launchSession(it, pendingConversationId, pendingReasoningEffort, pendingFastMode)
@@ -207,6 +216,9 @@ class MainActivity : ComponentActivity() {
                 onContinueSession = ::continueSession,
                 onAcknowledgeAttention = { app.sessionCoordinator.acknowledgeAttention() },
                 onSteerRequest = ::steerSession,
+                onNotificationVisibilityChanged = { mainConversationVisible, attentionVisible ->
+                    app.notificationVisibility.updateUi(mainConversationVisible, attentionVisible)
+                },
                 previewState = preview,
                 displayRecords = mappedRecords,
                 onPreviewSurfaceAvailable = { surface ->
@@ -238,6 +250,7 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         val app = application as? PhoneControlApplication
         app?.let {
+            it.notificationVisibility.setActivityVisible(true)
             // A conversation that aged out while the app was not visible is
             // expired immediately. The foreground monitor below handles the
             // separate case where the app stays open across the boundary.
@@ -268,9 +281,15 @@ class MainActivity : ComponentActivity() {
         refreshOverlayState()
     }
 
+    override fun onPostResume() {
+        super.onPostResume()
+        maybeStartFirstRunPermissionSetup()
+    }
+
     override fun onStop() {
         conversationExpiryMonitor?.cancel()
         conversationExpiryMonitor = null
+        (application as? PhoneControlApplication)?.notificationVisibility?.setActivityVisible(false)
         (application as? PhoneControlApplication)?.conversationStore?.dismissInactiveConversationPrompt()
         overlayActivityToken?.close()
         overlayActivityToken = null
@@ -294,11 +313,7 @@ class MainActivity : ComponentActivity() {
         fastMode: Boolean,
     ) {
         if (request.isBlank()) return
-        if (
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
-            PackageManager.PERMISSION_GRANTED
-        ) {
+        if (!hasNotificationPermission()) {
             pendingRequest = request
             pendingConversationId = conversationId
             pendingReasoningEffort = reasoningEffort
@@ -308,6 +323,53 @@ class MainActivity : ComponentActivity() {
             launchSession(request, conversationId, reasoningEffort, fastMode)
         }
     }
+
+    /**
+     * Ask for the permissions needed by the first-run DHD experience once.
+     * Notification permission is a runtime dialog; overlay access is granted
+     * from Android's dedicated settings screen, so the two steps are chained.
+     */
+    private fun maybeStartFirstRunPermissionSetup() {
+        if (firstRunPermissionSetupStarted) return
+
+        val preferences = getSharedPreferences(PERMISSION_SETUP_PREFERENCES, MODE_PRIVATE)
+        if (preferences.getBoolean(KEY_FIRST_RUN_PERMISSION_SETUP_PROMPTED, false)) {
+            firstRunPermissionSetupStarted = true
+            return
+        }
+
+        firstRunPermissionSetupStarted = true
+        preferences.edit().putBoolean(KEY_FIRST_RUN_PERMISSION_SETUP_PROMPTED, true).apply()
+
+        when (
+            nextFirstRunPermissionStep(
+                sdkInt = Build.VERSION.SDK_INT,
+                notificationGranted = hasNotificationPermission(),
+                overlayGranted = Settings.canDrawOverlays(this),
+            )
+        ) {
+            FirstRunPermissionStep.NOTIFICATIONS -> {
+                waitingForFirstRunNotificationPermission = true
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+            FirstRunPermissionStep.OVERLAY -> continueFirstRunPermissionSetup()
+            null -> Unit
+        }
+    }
+
+    private fun continueFirstRunPermissionSetup() {
+        if (Settings.canDrawOverlays(this)) return
+
+        // Keep the existing Settings toggle semantics: after the user grants
+        // access, the first-run flow enables the floating bubble automatically.
+        pendingOverlayEnable = true
+        openOverlayPermissionSettings()
+    }
+
+    private fun hasNotificationPermission(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
 
     private fun launchSession(
         request: String,
@@ -356,8 +418,7 @@ class MainActivity : ComponentActivity() {
             pendingOverlayEnable = false
             enableOverlay()
         } else if (overlayEnabled) {
-            ContextCompat.startForegroundService(
-                this,
+            startService(
                 Intent(this, AssistantForegroundService::class.java)
                     .setAction(AssistantForegroundService.ACTION_ENABLE_OVERLAY),
             )
@@ -378,23 +439,26 @@ class MainActivity : ComponentActivity() {
 
         if (!Settings.canDrawOverlays(this)) {
             pendingOverlayEnable = true
-            startActivity(
-                Intent(
-                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:$packageName"),
-                ),
-            )
+            openOverlayPermissionSettings()
             return
         }
         enableOverlay()
+    }
+
+    private fun openOverlayPermissionSettings() {
+        startActivity(
+            Intent(
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:$packageName"),
+            ),
+        )
     }
 
     private fun enableOverlay() {
         OverlayPreferences.setEnabled(this, true)
         overlayEnabled = true
         overlayPermissionGranted = true
-        ContextCompat.startForegroundService(
-            this,
+        startService(
             Intent(this, AssistantForegroundService::class.java)
                 .setAction(AssistantForegroundService.ACTION_ENABLE_OVERLAY),
         )

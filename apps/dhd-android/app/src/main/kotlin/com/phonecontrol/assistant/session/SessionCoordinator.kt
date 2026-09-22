@@ -50,6 +50,7 @@ sealed interface SessionState {
         val sessionId: String,
         val request: String,
         val currentPurpose: String,
+        val currentToolMetadataPurpose: String? = null,
         val startedAtEpochMs: Long,
         val conversationId: String? = null,
         val reasoningEffort: String = ReasoningEffort.default.codexValue,
@@ -65,6 +66,7 @@ sealed interface SessionState {
         val sessionId: String,
         val request: String,
         val currentPurpose: String,
+        val currentToolMetadataPurpose: String? = null,
         val startedAtEpochMs: Long,
         val conversationId: String? = null,
         val reasoningEffort: String = ReasoningEffort.default.codexValue,
@@ -253,7 +255,7 @@ class SessionCoordinator(
             startedAtEpochMs = now,
         )
         _toolCalls.value = (_toolCalls.value + call).takeLast(MAX_TOOL_CALLS)
-        setCurrentPurpose(safePurpose)
+        setCurrentPurpose(safePurpose, metadataPurpose = safePurpose)
         call.id
     }
 
@@ -300,7 +302,10 @@ class SessionCoordinator(
             text = safeText,
         )
         pendingSteers += steer
-        _state.value = running.copy(currentPurpose = "Steer queued")
+        _state.value = running.copy(
+            currentPurpose = "Steer queued",
+            currentToolMetadataPurpose = null,
+        )
         conversationStore?.setCurrentPurpose(running.sessionId, "Steer queued")
         taskDisplayBackend?.updatePurposeForRun(running.sessionId, "Steer queued")
         conversationStore?.recordSteer(steer.steerId, running.sessionId, safeText)
@@ -366,7 +371,10 @@ class SessionCoordinator(
         }
         if (claimedRequestSessionId == running.sessionId) return@synchronized null
         claimedRequestSessionId = running.sessionId
-        _state.value = running.copy(currentPurpose = "DHD is planning")
+        _state.value = running.copy(
+            currentPurpose = "DHD is planning",
+            currentToolMetadataPurpose = null,
+        )
         taskDisplayBackend?.updatePurposeForRun(running.sessionId, "DHD is planning")
         appendEvent(
             ActivityEventKind.SYSTEM,
@@ -387,7 +395,10 @@ class SessionCoordinator(
         claimedRequestSessionId = null
         if (_state.value is SessionState.Running) {
             val running = _state.value as SessionState.Running
-            _state.value = running.copy(currentPurpose = "Waiting for desktop Codex bridge")
+            _state.value = running.copy(
+                currentPurpose = "Waiting for desktop Codex bridge",
+                currentToolMetadataPurpose = null,
+            )
             taskDisplayBackend?.updatePurposeForRun(sessionId, "Waiting for desktop Codex bridge")
         }
         appendEvent(
@@ -405,6 +416,7 @@ class SessionCoordinator(
             sessionId = running.sessionId,
             request = running.request,
             currentPurpose = running.currentPurpose,
+            currentToolMetadataPurpose = running.currentToolMetadataPurpose,
             startedAtEpochMs = now,
             conversationId = running.conversationId,
             reasoningEffort = running.reasoningEffort,
@@ -429,6 +441,7 @@ class SessionCoordinator(
             sessionId = paused.sessionId,
             request = paused.request,
             currentPurpose = paused.currentPurpose,
+            currentToolMetadataPurpose = paused.currentToolMetadataPurpose,
             startedAtEpochMs = now,
             conversationId = paused.conversationId,
             reasoningEffort = paused.reasoningEffort,
@@ -664,11 +677,13 @@ class SessionCoordinator(
         val updated = when (current) {
             is SessionState.Running -> current.copy(
                 currentPurpose = "Needs your attention",
+                currentToolMetadataPurpose = null,
                 attentionReason = message,
                 attentionActionLabel = safeActionLabel,
             )
             is SessionState.Paused -> current.copy(
                 currentPurpose = "Needs your attention",
+                currentToolMetadataPurpose = null,
                 attentionReason = message,
                 attentionActionLabel = safeActionLabel,
             )
@@ -710,11 +725,13 @@ class SessionCoordinator(
         _state.value = when (current) {
             is SessionState.Running -> current.copy(
                 currentPurpose = "DHD is planning",
+                currentToolMetadataPurpose = null,
                 attentionReason = null,
                 attentionActionLabel = null,
             )
             is SessionState.Paused -> current.copy(
                 currentPurpose = "Paused",
+                currentToolMetadataPurpose = null,
                 attentionReason = null,
                 attentionActionLabel = null,
             )
@@ -808,12 +825,22 @@ class SessionCoordinator(
         pending.completion.complete(AttentionResolution.Cancelled)
     }
 
-    fun setCurrentPurpose(purpose: String): Boolean = synchronized(lock) {
+    fun setCurrentPurpose(purpose: String, metadataPurpose: String? = null): Boolean = synchronized(lock) {
         val displayPurpose = userFacingActivityLabel(actionType = null, purpose = purpose)
+        val safeMetadataPurpose = metadataPurpose
+            ?.trim()
+            ?.take(MAX_TEXT_CHARS)
+            ?.takeIf(String::isNotBlank)
         val current = _state.value
         val updated = when (current) {
-            is SessionState.Running -> current.copy(currentPurpose = displayPurpose)
-            is SessionState.Paused -> current.copy(currentPurpose = displayPurpose)
+            is SessionState.Running -> current.copy(
+                currentPurpose = displayPurpose,
+                currentToolMetadataPurpose = safeMetadataPurpose,
+            )
+            is SessionState.Paused -> current.copy(
+                currentPurpose = displayPurpose,
+                currentToolMetadataPurpose = safeMetadataPurpose,
+            )
             else -> return false
         }
         _state.value = updated
@@ -841,8 +868,14 @@ class SessionCoordinator(
             .ifBlank { return@synchronized false }
         val current = _state.value
         _state.value = when (current) {
-            is SessionState.Running -> current.copy(currentPurpose = safePurpose)
-            is SessionState.Paused -> current.copy(currentPurpose = safePurpose)
+            is SessionState.Running -> current.copy(
+                currentPurpose = safePurpose,
+                currentToolMetadataPurpose = safePurpose,
+            )
+            is SessionState.Paused -> current.copy(
+                currentPurpose = safePurpose,
+                currentToolMetadataPurpose = safePurpose,
+            )
             else -> current
         }
         conversationStore?.setCurrentPurpose(sessionId, safePurpose)
@@ -915,7 +948,7 @@ class SessionCoordinator(
             purpose = action.metadata.purpose,
             targetDescription = action.metadata.targetDescription,
         )
-        setCurrentPurpose(displayPurpose)
+        setCurrentPurpose(displayPurpose, metadataPurpose = action.metadata.purpose)
         appendEvent(
             ActivityEventKind.ACTION_PROPOSED,
             // Keep the provider's metadata purpose as the activity label. The

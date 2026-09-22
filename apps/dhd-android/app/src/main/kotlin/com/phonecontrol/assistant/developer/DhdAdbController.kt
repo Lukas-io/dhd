@@ -81,7 +81,7 @@ data class DeveloperModeStatus(
     /** Copy shown before sending a user to DHD's phone-access instructions. */
     val recoveryTitle: String
         get() = when {
-            needsInitialConnection -> "Connect your phone to DHD"
+            needsInitialConnection -> "Phone access needed"
             phoneAccessInterrupted -> "Phone access needed"
             state == DeveloperConnectionState.PAIRING_SEARCHING -> "Connecting your phone"
             state == DeveloperConnectionState.PAIRING_SERVICE_FOUND -> "Pairing code ready"

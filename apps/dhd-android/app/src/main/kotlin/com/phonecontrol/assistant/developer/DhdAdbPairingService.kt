@@ -30,7 +30,7 @@ class DhdAdbPairingService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var statusJob: Job? = null
     private var pairingActive = false
-    private var foregroundNotificationId = DhdAdbPairingNotification.SEARCHING_NOTIFICATION_ID
+    private var pairingServiceFound = false
 
     private val controller: DhdAdbController
         get() = (application as PhoneControlApplication).developerModeController
@@ -43,7 +43,6 @@ class DhdAdbPairingService : Service() {
         // user that DHD is listening for Android's pairing service.
         startForegroundCompat(
             DhdAdbPairingNotification.searchingNotification(this),
-            DhdAdbPairingNotification.SEARCHING_NOTIFICATION_ID,
         )
     }
 
@@ -51,11 +50,11 @@ class DhdAdbPairingService : Service() {
         when (intent?.action) {
             ACTION_START -> {
                 pairingActive = true
+                pairingServiceFound = false
                 observeController()
                 controller.preparePairing()
                 startForegroundCompat(
                     DhdAdbPairingNotification.searchingNotification(this),
-                    DhdAdbPairingNotification.SEARCHING_NOTIFICATION_ID,
                 )
             }
 
@@ -67,6 +66,7 @@ class DhdAdbPairingService : Service() {
                     ?.toString()
                     ?.trim()
                 if (code.isNullOrEmpty()) {
+                    pairingServiceFound = true
                     updateNotification(
                         DhdAdbPairingNotification.pairingServiceFoundNotification(
                             this,
@@ -106,7 +106,6 @@ class DhdAdbPairingService : Service() {
                     DeveloperConnectionState.READY -> {
                         DhdAdbPairingNotification.showResult(
                             this@DhdAdbPairingService,
-                            "DHD paired. Wireless Debugging can be turned off until DHD needs a restart.",
                         )
                         pairingActive = false
                         stopPairingService()
@@ -118,16 +117,21 @@ class DhdAdbPairingService : Service() {
 
                     DeveloperConnectionState.PAIRING_REQUIRED,
                     DeveloperConnectionState.PAIRING_SEARCHING,
-                    -> updateNotification(DhdAdbPairingNotification.searchingNotification(this@DhdAdbPairingService))
+                    -> {
+                        pairingServiceFound = false
+                        updateNotification(DhdAdbPairingNotification.searchingNotification(this@DhdAdbPairingService))
+                    }
 
                     DeveloperConnectionState.PAIRING_SERVICE_FOUND ->
                         promoteToFoundNotification()
 
-                    DeveloperConnectionState.WIRELESS_DEBUGGING_OFF ->
+                    DeveloperConnectionState.WIRELESS_DEBUGGING_OFF -> {
+                        pairingServiceFound = false
                         updateNotification(DhdAdbPairingNotification.searchingNotification(this@DhdAdbPairingService))
+                    }
 
                     DeveloperConnectionState.ERROR ->
-                        if (foregroundNotificationId == DhdAdbPairingNotification.FOUND_NOTIFICATION_ID) {
+                        if (pairingServiceFound) {
                             updateNotification(
                                 DhdAdbPairingNotification.pairingServiceFoundNotification(
                                     this@DhdAdbPairingService,
@@ -149,32 +153,32 @@ class DhdAdbPairingService : Service() {
 
     private fun updateNotification(notification: Notification) {
         NotificationManagerCompat.from(this).notify(
-            foregroundNotificationId,
+            DhdAdbPairingNotification.NOTIFICATION_ID,
             notification,
         )
     }
 
     private fun promoteToFoundNotification() {
+        val alertOnTransition = !pairingServiceFound
+        pairingServiceFound = true
         startForegroundCompat(
-            DhdAdbPairingNotification.pairingServiceFoundNotification(this),
-            DhdAdbPairingNotification.FOUND_NOTIFICATION_ID,
+            DhdAdbPairingNotification.pairingServiceFoundNotification(
+                context = this,
+                alertOnTransition = alertOnTransition,
+            ),
         )
     }
 
-    private fun startForegroundCompat(notification: Notification, notificationId: Int) {
+    private fun startForegroundCompat(notification: Notification) {
+        DhdAdbPairingNotification.cancelLegacyForegroundNotification(this)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
-                notificationId,
+                DhdAdbPairingNotification.NOTIFICATION_ID,
                 notification,
                 android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
             )
         } else {
-            startForeground(notificationId, notification)
-        }
-        val previousNotificationId = foregroundNotificationId
-        foregroundNotificationId = notificationId
-        if (previousNotificationId != notificationId) {
-            NotificationManagerCompat.from(this).cancel(previousNotificationId)
+            startForeground(DhdAdbPairingNotification.NOTIFICATION_ID, notification)
         }
     }
 
@@ -198,10 +202,10 @@ class DhdAdbPairingService : Service() {
 internal object DhdAdbPairingNotification {
     const val REMOTE_INPUT_RESULT_KEY = "dhd_adb_pairing_code"
     const val SEARCHING_NOTIFICATION_ID = 4207
-    const val FOUND_NOTIFICATION_ID = 4211
     const val NOTIFICATION_ID = SEARCHING_NOTIFICATION_ID
 
     private const val CHANNEL_ID = "dhd_adb_pairing"
+    private const val LEGACY_FOUND_NOTIFICATION_ID = 4211
     private const val RESULT_NOTIFICATION_ID = 4208
     private const val REQUEST_SUBMIT_CODE = 4209
     private const val REQUEST_OPEN_APP = 4210
@@ -260,6 +264,7 @@ internal object DhdAdbPairingNotification {
     fun pairingServiceFoundNotification(
         context: Context,
         message: String = DEFAULT_FOUND_MESSAGE,
+        alertOnTransition: Boolean = false,
     ): Notification {
         createChannel(context)
         val remoteInput = RemoteInput.Builder(REMOTE_INPUT_RESULT_KEY)
@@ -277,7 +282,9 @@ internal object DhdAdbPairingNotification {
             context = context,
             title = "Pairing service found",
             message = message,
+            alertOnUpdate = alertOnTransition,
         )
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
             .addAction(
                 NotificationCompat.Action.Builder(
                     android.R.drawable.ic_dialog_info,
@@ -296,20 +303,20 @@ internal object DhdAdbPairingNotification {
         return baseBuilder(
             context = context,
             title = "Pairing DHD with Wireless Debugging",
-            message = "Pairing with Wireless Debugging…",
+            message = null,
         )
             .setOngoing(true)
             .build()
     }
 
-    fun showResult(context: Context, message: String) {
+    fun showResult(context: Context) {
         createChannel(context)
         NotificationManagerCompat.from(context).notify(
             RESULT_NOTIFICATION_ID,
             baseBuilder(
                 context = context,
                 title = "DHD pairing complete",
-                message = message,
+                message = null,
             )
                 .setOngoing(false)
                 .setAutoCancel(true)
@@ -323,14 +330,18 @@ internal object DhdAdbPairingNotification {
 
     fun cancelAll(context: Context) {
         NotificationManagerCompat.from(context).apply {
-            cancel(SEARCHING_NOTIFICATION_ID)
-            cancel(FOUND_NOTIFICATION_ID)
+            cancel(NOTIFICATION_ID)
+            cancel(LEGACY_FOUND_NOTIFICATION_ID)
         }
+    }
+
+    fun cancelLegacyForegroundNotification(context: Context) {
+        NotificationManagerCompat.from(context).cancel(LEGACY_FOUND_NOTIFICATION_ID)
     }
 
     fun showSearching(context: Context) {
         NotificationManagerCompat.from(context).notify(
-            SEARCHING_NOTIFICATION_ID,
+            NOTIFICATION_ID,
             searchingNotification(context),
         )
     }
@@ -339,6 +350,7 @@ internal object DhdAdbPairingNotification {
         context: Context,
         title: String,
         message: String?,
+        alertOnUpdate: Boolean = false,
     ): NotificationCompat.Builder {
         val openAppIntent = PendingIntent.getActivity(
             context,
@@ -351,7 +363,7 @@ internal object DhdAdbPairingNotification {
             .setContentTitle(title)
             .setContentIntent(openAppIntent)
             .setOngoing(true)
-            .setOnlyAlertOnce(true)
+            .setOnlyAlertOnce(!alertOnUpdate)
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
             .also { builder ->
                 if (!message.isNullOrBlank()) {

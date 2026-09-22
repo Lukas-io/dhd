@@ -17,6 +17,7 @@ import com.phonecontrol.assistant.session.SessionCoordinator
 import com.phonecontrol.assistant.execution.PhoneObservationProvider
 import com.phonecontrol.assistant.execution.TypedPhoneActionTransport
 import com.phonecontrol.assistant.execution.TaskDisplaySession
+import com.phonecontrol.assistant.session.DhdNotificationVisibility
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -25,6 +26,7 @@ import kotlinx.coroutines.launch
 
 class PhoneControlApplication : Application() {
     private val previewScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    val notificationVisibility = DhdNotificationVisibility()
     lateinit var appPermissionRepository: AppPermissionRepository
         private set
     lateinit var developerModeController: DhdAdbController
