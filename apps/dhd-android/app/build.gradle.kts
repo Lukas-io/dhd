@@ -72,7 +72,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("io.github.vvb2060.ndk:boringssl:20250114")
     implementation("org.bouncycastle:bcpkix-jdk18on:1.80")
-    implementation("org.conscrypt:conscrypt-android:2.5.2")
+    implementation("org.conscrypt:conscrypt-android:2.6.0")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")

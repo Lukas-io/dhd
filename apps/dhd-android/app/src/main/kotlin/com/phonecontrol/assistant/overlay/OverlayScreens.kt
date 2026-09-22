@@ -21,6 +21,7 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -1185,102 +1186,11 @@ fun OverlayPanel(
                 contentAlignment = Alignment.Center,
             ) {
                 if (effectiveMode == OverlayPanelMode.COMPOSER || effectiveMode == OverlayPanelMode.RESULT) {
-                    val glowOrbitPhase by motionPhase(
-                        label = "composer-orbit-glow",
-                        duration = 3_400,
-                        enabled = true,
+                    ComposerPerimeterGlow(
+                        modifier = Modifier.matchParentSize(),
+                        hasRecovery = hasRecovery,
+                        capsule = bottomCapsuleShape == CircleShape,
                     )
-                    val glowBreathPhase by motionPhase(
-                        label = "composer-ambient-glow",
-                        duration = 4_500,
-                        enabled = true,
-                    )
-                    val breath = 0.88f + 0.12f * sin(glowBreathPhase)
-                    val glowBase = if (colors.isDark) Color.White else Color(0xFF1E293B)
-                    val glowAccent = if (colors.isDark) Color(0xFF93C5FD) else Color(0xFF3B82F6)
-
-                    val chromaticColors = if (hasRecovery) {
-                        listOf(
-                            colors.warningAmber,
-                            Color(0xFFFBBF24),
-                            colors.warningAmber,
-                            Color(0xFFFBBF24),
-                            colors.warningAmber,
-                            Color(0xFFFBBF24),
-                        )
-                    } else {
-                        listOf(
-                            Color(0xFF10B981), // Emerald Green
-                            Color(0xFF06B6D4), // Cyan
-                            Color(0xFF3B82F6), // Electric Blue
-                            Color(0xFF8B5CF6), // Purple
-                            Color(0xFFEF4444), // Coral Red
-                            Color(0xFFF59E0B), // Amber Gold
-                        )
-                    }
-
-                    val shift = (glowOrbitPhase / (2 * PI.toFloat())) % 1f
-                    val stops = List(17) { i ->
-                        val frac = i.toFloat() / 16f
-                        val sampleFrac = ((frac - shift) % 1f + 1f) % 1f
-                        val scaled = sampleFrac * 6f
-                        val idx = scaled.toInt() % 6
-                        val nextIdx = (idx + 1) % 6
-                        val blend = scaled - scaled.toInt()
-                        val c1 = chromaticColors[idx]
-                        val c2 = chromaticColors[nextIdx]
-                        val baseRed = c1.red + (c2.red - c1.red) * blend
-                        val baseGreen = c1.green + (c2.green - c1.green) * blend
-                        val baseBlue = c1.blue + (c2.blue - c1.blue) * blend
-                        val distFromHead = abs(((sampleFrac) % 1f + 1.5f) % 1f - 0.5f)
-                        val pulse = (1f - distFromHead * 2f).coerceIn(0f, 1f).pow(2.2f) * 0.40f
-                        val r = (baseRed + pulse).coerceAtMost(1f)
-                        val g = (baseGreen + pulse).coerceAtMost(1f)
-                        val b = (baseBlue + pulse).coerceAtMost(1f)
-                        frac to Color(r, g, b)
-                    }
-
-                    Canvas(Modifier.matchParentSize()) {
-                        val baseCornerPx = if (bottomCapsuleShape == CircleShape) {
-                            size.height / 2f
-                        } else {
-                            with(density) { 28.dp.toPx() }
-                        }
-                        val sweepBrush = Brush.sweepGradient(
-                            *stops.toTypedArray(),
-                            center = Offset(size.width / 2f, size.height / 2f),
-                        )
-
-                        // 1. Keep only a whisper of the ambient light. The
-                        // composer should read as part of the app, not as a
-                        // separate neon surface.
-                        val outerSpread = with(density) { 5.dp.toPx() }
-                        drawRoundRect(
-                            brush = Brush.radialGradient(
-                                colors = listOf(
-                                    glowAccent.copy(alpha = 0.018f * breath),
-                                    glowBase.copy(alpha = 0.008f * breath),
-                                    Color.Transparent,
-                                ),
-                                center = Offset(size.width / 2f, size.height / 2f),
-                                radius = (size.width / 2f) + outerSpread,
-                            ),
-                            topLeft = Offset(-outerSpread, -outerSpread),
-                            size = Size(size.width + outerSpread * 2f, size.height + outerSpread * 2f),
-                            cornerRadius = CornerRadius(baseCornerPx + outerSpread),
-                        )
-
-                        // 2. Chromatic accent kept tight to the composer edge.
-                        val rimSpread = 0f
-                        drawRoundRect(
-                            brush = sweepBrush,
-                            topLeft = Offset(-rimSpread, -rimSpread),
-                            size = Size(size.width + rimSpread * 2f, size.height + rimSpread * 2f),
-                            cornerRadius = CornerRadius(baseCornerPx + rimSpread),
-                            style = Stroke(with(density) { 6.dp.toPx() }),
-                            alpha = 0.48f * breath,
-                        )
-                    }
                 }
 
                 Surface(
@@ -1401,6 +1311,180 @@ private fun PanelHeader(
             label = "Minimize assistant",
             glyph = "down",
             onClick = onCollapse,
+        )
+    }
+}
+
+@Composable
+internal fun DhdBubblePreview(modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .size(56.dp)
+            .semantics { contentDescription = "DHD floating bubble" },
+        contentAlignment = Alignment.Center,
+    ) {
+        DhdIdentity(
+            modifier = Modifier.fillMaxSize(),
+            working = false,
+            attention = false,
+            animated = true,
+        )
+    }
+}
+
+@Composable
+internal fun DhdComposerPreview(
+    modifier: Modifier = Modifier,
+    onCollapse: () -> Unit,
+    onSwipeCollapse: (swipedLeft: Boolean) -> Unit,
+    onShowPreview: () -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    val density = LocalDensity.current
+    val collapseThreshold = with(density) { 48.dp.toPx() }
+    Box(
+        modifier = modifier
+            // Keep swipe-to-collapse at the container level so it can coexist
+            // with the logo's tap and long-press gestures without a full-card
+            // clickable indication covering the composer.
+            .pointerInput(onCollapse) {
+                var totalDrag = 0f
+                detectHorizontalDragGestures(
+                    onDragStart = { totalDrag = 0f },
+                    onHorizontalDrag = { change, dragAmount ->
+                        totalDrag += dragAmount
+                        change.consume()
+                    },
+                    onDragEnd = {
+                        if (kotlin.math.abs(totalDrag) >= collapseThreshold) {
+                            onSwipeCollapse(totalDrag < 0f)
+                        }
+                    },
+                    onDragCancel = { totalDrag = 0f },
+                )
+            }
+            .semantics {
+                contentDescription = "Swipe left to dock the bubble on the left or right to dock it on the right. Long press the DHD logo to show or hide the virtual display preview."
+            },
+    ) {
+        ComposerPerimeterGlow(
+            modifier = Modifier.matchParentSize(),
+            hasRecovery = false,
+            capsule = true,
+        )
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            shape = CircleShape,
+            color = colors.composerBackground.copy(alpha = if (colors.isDark) 0.98f else 0.97f),
+            border = BorderStroke(
+                width = 0.8.dp,
+                color = colors.borderColor.copy(alpha = if (colors.isDark) 0.9f else 0.95f),
+            ),
+        ) {
+            Composer(
+                onSubmit = {},
+                onContinueInDhd = {},
+                onCollapse = onCollapse,
+                onShowPreview = onShowPreview,
+                onTextFieldFocusChanged = {},
+                onComposerTapped = {},
+                fastMode = false,
+                onSetFastMode = {},
+                reasoningEffort = ReasoningEffort.default,
+                visibleReasoningEfforts = ReasoningEffort.entries,
+                onSelectReasoningEffort = {},
+                previewReadOnly = true,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ComposerPerimeterGlow(
+    modifier: Modifier,
+    hasRecovery: Boolean,
+    capsule: Boolean,
+) {
+    val colors = LocalAssistantColors.current
+    val density = LocalDensity.current
+    val glowOrbitPhase by motionPhase(
+        label = "composer-orbit-glow",
+        duration = 3_400,
+        enabled = true,
+    )
+    val glowBreathPhase by motionPhase(
+        label = "composer-ambient-glow",
+        duration = 4_500,
+        enabled = true,
+    )
+    val breath = 0.88f + 0.12f * sin(glowBreathPhase)
+    val glowBase = if (colors.isDark) Color.White else Color(0xFF1E293B)
+    val glowAccent = if (colors.isDark) Color(0xFF93C5FD) else Color(0xFF3B82F6)
+    val chromaticColors = if (hasRecovery) {
+        listOf(
+            colors.warningAmber,
+            Color(0xFFFBBF24),
+            colors.warningAmber,
+            Color(0xFFFBBF24),
+            colors.warningAmber,
+            Color(0xFFFBBF24),
+        )
+    } else {
+        listOf(
+            Color(0xFF10B981),
+            Color(0xFF06B6D4),
+            Color(0xFF3B82F6),
+            Color(0xFF8B5CF6),
+            Color(0xFFEF4444),
+            Color(0xFFF59E0B),
+        )
+    }
+    val shift = (glowOrbitPhase / (2 * PI.toFloat())) % 1f
+    val stops = List(17) { index ->
+        val fraction = index.toFloat() / 16f
+        val sampleFraction = ((fraction - shift) % 1f + 1f) % 1f
+        val scaled = sampleFraction * 6f
+        val colorIndex = scaled.toInt() % 6
+        val nextIndex = (colorIndex + 1) % 6
+        val blend = scaled - scaled.toInt()
+        val first = chromaticColors[colorIndex]
+        val second = chromaticColors[nextIndex]
+        val distanceFromHead = abs(((sampleFraction % 1f) + 1.5f) % 1f - 0.5f)
+        val pulse = (1f - distanceFromHead * 2f).coerceIn(0f, 1f).pow(2.2f) * 0.40f
+        val red = (first.red + (second.red - first.red) * blend + pulse).coerceAtMost(1f)
+        val green = (first.green + (second.green - first.green) * blend + pulse).coerceAtMost(1f)
+        val blue = (first.blue + (second.blue - first.blue) * blend + pulse).coerceAtMost(1f)
+        fraction to Color(red, green, blue)
+    }
+
+    Canvas(modifier) {
+        val baseCornerPx = if (capsule) size.height / 2f else with(density) { 28.dp.toPx() }
+        val sweepBrush = Brush.sweepGradient(
+            *stops.toTypedArray(),
+            center = Offset(size.width / 2f, size.height / 2f),
+        )
+        val outerSpread = with(density) { 5.dp.toPx() }
+        drawRoundRect(
+            brush = Brush.radialGradient(
+                colors = listOf(
+                    glowAccent.copy(alpha = 0.018f * breath),
+                    glowBase.copy(alpha = 0.008f * breath),
+                    Color.Transparent,
+                ),
+                center = Offset(size.width / 2f, size.height / 2f),
+                radius = (size.width / 2f) + outerSpread,
+            ),
+            topLeft = Offset(-outerSpread, -outerSpread),
+            size = Size(size.width + outerSpread * 2f, size.height + outerSpread * 2f),
+            cornerRadius = CornerRadius(baseCornerPx + outerSpread),
+        )
+        drawRoundRect(
+            brush = sweepBrush,
+            topLeft = Offset.Zero,
+            size = Size(size.width, size.height),
+            cornerRadius = CornerRadius(baseCornerPx),
+            style = Stroke(with(density) { 6.dp.toPx() }),
+            alpha = 0.48f * breath,
         )
     }
 }
@@ -1558,6 +1642,7 @@ private fun Composer(
     visibleReasoningEfforts: List<ReasoningEffort>,
     onSelectReasoningEffort: (ReasoningEffort) -> Unit,
     hint: String = "Ask DHD",
+    previewReadOnly: Boolean = false,
 ) {
     val colors = LocalAssistantColors.current
     var draft by rememberSaveable { mutableStateOf("") }
@@ -1679,6 +1764,7 @@ private fun Composer(
                 ),
                 minLines = 1,
                 maxLines = if (keyboardVisible) 4 else 1,
+                readOnly = previewReadOnly,
                 keyboardOptions = KeyboardOptions(
                     capitalization = KeyboardCapitalization.Sentences,
                     keyboardType = KeyboardType.Text,

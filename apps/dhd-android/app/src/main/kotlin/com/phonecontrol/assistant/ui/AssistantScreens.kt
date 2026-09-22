@@ -61,9 +61,11 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.text.KeyboardActions
@@ -122,6 +124,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.SubcomposeLayout
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalContext
@@ -138,6 +141,8 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.sp
@@ -308,6 +313,7 @@ fun AssistantScreen(
     var steerDraftFastMode by rememberSaveable { mutableStateOf<Boolean?>(null) }
     var composerEditText by rememberSaveable { mutableStateOf<String?>(null) }
     var showReasoningSelector by rememberSaveable { mutableStateOf(false) }
+    var topRecoverySlotHeightPx by remember { mutableStateOf(0) }
     val activeSessionId = state.sessionIdOrNullForUi()
     val currentToolCall = toolCalls.lastOrNull {
         it.sessionId == activeSessionId && it.status == DhdToolCallStatus.RUNNING
@@ -454,36 +460,44 @@ fun AssistantScreen(
                     // Keep the island visually floating while giving it a
                     // real layout slot. Conversation content is measured
                     // below it instead of rendering underneath an overlay.
-                    Box(
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(top = 8.dp, start = 16.dp, end = 16.dp),
-                        contentAlignment = Alignment.TopCenter,
+                            .onGloballyPositioned { topRecoverySlotHeightPx = it.size.height },
                     ) {
-                        if (combinePhoneAndCompanionRecovery) {
-                            CombinedRecoveryCard(
-                                phoneStatus = developerStatus,
-                                companionWaitSeconds = companionWaitSeconds,
-                                onOpenPhoneAccess = onOpenPhoneAccess,
-                                onOpenCompanion = onOpenCompanion,
-                                compact = keyboardVisible,
-                                modifier = Modifier.widthIn(max = 520.dp),
-                            )
-                        } else if (phoneRecoveryShownAtTop) {
-                            DeveloperConnectionRecoveryCard(
-                                status = developerStatus,
-                                onOpenPhoneAccess = onOpenPhoneAccess,
-                                modifier = Modifier.widthIn(max = 520.dp),
-                            )
-                        } else {
-                            CompanionRecoveryCard(
-                                elapsedSeconds = null,
-                                onOpenCompanion = onOpenCompanion,
-                                modifier = Modifier.widthIn(max = 520.dp),
-                            )
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 8.dp, start = 16.dp, end = 16.dp),
+                            contentAlignment = Alignment.TopCenter,
+                        ) {
+                            if (combinePhoneAndCompanionRecovery) {
+                                CombinedRecoveryCard(
+                                    phoneStatus = developerStatus,
+                                    companionWaitSeconds = companionWaitSeconds,
+                                    onOpenPhoneAccess = onOpenPhoneAccess,
+                                    onOpenCompanion = onOpenCompanion,
+                                    compact = keyboardVisible || recentTimeline.isEmpty(),
+                                    modifier = Modifier.widthIn(max = 520.dp),
+                                )
+                            } else if (phoneRecoveryShownAtTop) {
+                                DeveloperConnectionRecoveryCard(
+                                    status = developerStatus,
+                                    onOpenPhoneAccess = onOpenPhoneAccess,
+                                    compact = recentTimeline.isEmpty(),
+                                    modifier = Modifier.widthIn(max = 520.dp),
+                                )
+                            } else {
+                                CompanionRecoveryCard(
+                                    elapsedSeconds = null,
+                                    onOpenCompanion = onOpenCompanion,
+                                    compact = recentTimeline.isEmpty(),
+                                    modifier = Modifier.widthIn(max = 520.dp),
+                                )
+                            }
                         }
+                        Spacer(Modifier.height(8.dp))
                     }
-                    Spacer(Modifier.height(8.dp))
                 }
 
                 // Chat timeline stays strictly above composer area with soft fade at the bottom
@@ -508,6 +522,7 @@ fun AssistantScreen(
                     if (recentTimeline.isEmpty()) {
                         EmptyChat(
                             modifier = Modifier.fillMaxSize(),
+                            topReservedSpacePx = if (showTopRecoveryBanner) topRecoverySlotHeightPx else 0,
                             onSelectPrompt = {
                                 prompt -> onRunRequest(
                                     prompt,
@@ -677,45 +692,109 @@ fun AssistantScreen(
 @Composable
 private fun EmptyChat(
     modifier: Modifier = Modifier,
+    topReservedSpacePx: Int = 0,
     onSelectPrompt: (String) -> Unit = {},
 ) {
-    val colors = LocalAssistantColors.current
-    Box(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(horizontal = 24.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
-            Text(
-                text = "What can I do on your phone?",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold,
-                color = colors.textPrimary,
+    SubcomposeLayout(
+        modifier = modifier.padding(horizontal = 24.dp),
+    ) { constraints ->
+        val layoutWidth = constraints.maxWidth
+        val hasBoundedHeight = constraints.maxHeight != Constraints.Infinity
+        val layoutHeight = if (hasBoundedHeight) constraints.maxHeight else 0
+        val content = subcompose("centered-content") {
+            EmptyChatContent(
+                modifier = Modifier.widthIn(max = 480.dp),
+                onSelectPrompt = onSelectPrompt,
             )
-            Text(
-                text = "Ask DHD to operate apps on your device.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = colors.textSecondary,
-                lineHeight = 20.sp,
-            )
-            Spacer(Modifier.height(8.dp))
-            Column(
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                PromptSuggestionChip(
-                    text = "Call my Mom",
-                    onClick = { onSelectPrompt("Call my Mom") },
-                )
-                PromptSuggestionChip(
-                    text = "Play me \"Jesus be the name\" on Spotify",
-                    onClick = { onSelectPrompt("Play me \"Jesus be the name\" on Spotify") },
+        }.single().measure(
+            constraints.copy(
+                minWidth = 0,
+                minHeight = 0,
+                maxHeight = Constraints.Infinity,
+            ),
+        )
+
+        if (!hasBoundedHeight) {
+            layout(layoutWidth, content.height) {
+                content.placeRelative(
+                    x = ((layoutWidth - content.width) / 2).coerceAtLeast(0),
+                    y = 0,
                 )
             }
+        } else if (content.height <= layoutHeight) {
+            val reserved = topReservedSpacePx.coerceAtMost(layoutHeight)
+            val idealTop = ((reserved + layoutHeight) / 2f - reserved - content.height / 2f)
+                .roundToInt()
+            val top = idealTop.coerceIn(0, (layoutHeight - content.height).coerceAtLeast(0))
+            layout(layoutWidth, layoutHeight) {
+                content.placeRelative(
+                    x = ((layoutWidth - content.width) / 2).coerceAtLeast(0),
+                    y = top,
+                )
+            }
+        } else {
+            val scrollableContent = subcompose("scrollable-content") {
+                EmptyChatContent(
+                    modifier = Modifier
+                        .widthIn(max = 480.dp)
+                        .verticalScroll(rememberScrollState()),
+                    onSelectPrompt = onSelectPrompt,
+                )
+            }.single().measure(
+                constraints.copy(minWidth = 0, minHeight = 0),
+            )
+            val height = if (hasBoundedHeight) layoutHeight else scrollableContent.height
+            layout(layoutWidth, height) {
+                scrollableContent.placeRelative(
+                    x = ((layoutWidth - scrollableContent.width) / 2).coerceAtLeast(0),
+                    y = 0,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun EmptyChatContent(
+    modifier: Modifier = Modifier,
+    onSelectPrompt: (String) -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        Text(
+            text = "What can I do on your phone?",
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.SemiBold,
+            color = colors.textPrimary,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Text(
+            text = "Ask DHD to operate apps on your device.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = colors.textSecondary,
+            lineHeight = 20.sp,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(8.dp))
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            PromptSuggestionChip(
+                text = "Call my Mom",
+                onClick = { onSelectPrompt("Call my Mom") },
+            )
+            PromptSuggestionChip(
+                text = "Play me \"Jesus be the name\" on Spotify",
+                onClick = { onSelectPrompt("Play me \"Jesus be the name\" on Spotify") },
+            )
         }
     }
 }
@@ -1451,9 +1530,22 @@ private fun PausedStatusIndicator(currentPurpose: String) {
 private fun CompanionRecoveryCard(
     elapsedSeconds: Long?,
     onOpenCompanion: () -> Unit,
+    compact: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalAssistantColors.current
+    if (compact) {
+        CompactRecoveryStatusCard(
+            icon = R.drawable.ic_laptop,
+            title = "Desktop companion not connected",
+            detail = "DHD is waiting for the desktop companion.",
+            accent = colors.warningAmber,
+            actionLabel = "Instructions",
+            onAction = onOpenCompanion,
+            modifier = modifier,
+        )
+        return
+    }
     RecoveryCard(
         icon = R.drawable.ic_laptop,
         title = "Desktop companion not connected",
@@ -1470,9 +1562,22 @@ private fun CompanionRecoveryCard(
 private fun DeveloperConnectionRecoveryCard(
     status: DeveloperModeStatus,
     onOpenPhoneAccess: () -> Unit,
+    compact: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalAssistantColors.current
+    if (compact) {
+        CompactRecoveryStatusCard(
+            icon = R.drawable.ic_shield,
+            title = status.recoveryTitle,
+            detail = status.recoveryDetail,
+            accent = colors.warningAmber,
+            actionLabel = "Instructions",
+            onAction = onOpenPhoneAccess,
+            modifier = modifier,
+        )
+        return
+    }
     RecoveryCard(
         icon = R.drawable.ic_shield,
         title = status.recoveryTitle,
@@ -1482,6 +1587,72 @@ private fun DeveloperConnectionRecoveryCard(
         onAction = onOpenPhoneAccess,
         modifier = modifier,
     )
+}
+
+@Composable
+private fun CompactRecoveryStatusCard(
+    icon: Int,
+    title: String,
+    detail: String,
+    accent: Color,
+    actionLabel: String,
+    onAction: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalAssistantColors.current
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = colors.surfaceCard,
+        border = BorderStroke(1.dp, colors.borderColor),
+        shadowElevation = 0.dp,
+        tonalElevation = 0.dp,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 44.dp)
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                painter = painterResource(icon),
+                contentDescription = null,
+                tint = accent,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(Modifier.width(8.dp))
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text(
+                    text = title,
+                    color = colors.textPrimary,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = detail,
+                    color = colors.textSecondary,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Spacer(Modifier.width(6.dp))
+            Button(
+                onClick = onAction,
+                colors = ButtonDefaults.buttonColors(containerColor = colors.warningAmber),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 9.dp, vertical = 5.dp),
+            ) {
+                Text(actionLabel, fontSize = 11.sp, maxLines = 1)
+            }
+        }
+    }
 }
 
 @Composable
@@ -1508,7 +1679,7 @@ private fun CombinedRecoveryCard(
         ) {
             CombinedRecoverySection(
                 icon = R.drawable.ic_shield,
-                title = phoneStatus.recoveryTitle,
+                title = if (compact) "Phone access needed" else phoneStatus.recoveryTitle,
                 detail = phoneStatus.recoveryDetail,
                 actionLabel = "View instructions",
                 onAction = onOpenPhoneAccess,
@@ -1518,7 +1689,7 @@ private fun CombinedRecoveryCard(
             HorizontalDivider(color = colors.borderColor.copy(alpha = 0.8f))
             CombinedRecoverySection(
                 icon = R.drawable.ic_laptop,
-                title = "Desktop companion not connected",
+                title = if (compact) "Companion not connected" else "Desktop companion not connected",
                 detail = "DHD is waiting for the desktop companion. Connect this phone on your local network.",
                 trailing = companionWaitSeconds?.let { "Waiting ${it}s" },
                 actionLabel = "View instructions",
@@ -3261,6 +3432,7 @@ fun SettingsScreen(
     onOpenPairing: () -> Unit,
     onOpenApprovedApps: () -> Unit,
     onOpenCompanion: () -> Unit,
+    onOpenPermissionSetup: () -> Unit,
     overlayEnabled: Boolean,
     overlayPermissionGranted: Boolean,
     onSetOverlayEnabled: (Boolean) -> Unit,
@@ -3555,11 +3727,51 @@ fun SettingsScreen(
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Column {
-                        // Display-over-other-apps overlay
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
+                                .clickable { onOpenPermissionSetup() }
+                                .padding(horizontal = 16.dp, vertical = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_info),
+                                contentDescription = "Permission guide",
+                                tint = colors.textPrimary,
+                                modifier = Modifier.size(22.dp),
+                            )
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(start = 14.dp),
+                            ) {
+                                Text(
+                                    text = "Permission guide",
+                                    fontWeight = FontWeight.Medium,
+                                    color = colors.textPrimary,
+                                    fontSize = 15.sp,
+                                )
+                                Text(
+                                    text = "Notifications and floating DHD button",
+                                    fontSize = 12.sp,
+                                    color = colors.textSecondary,
+                                )
+                            }
+                            Icon(
+                                painter = painterResource(R.drawable.ic_chevron_right),
+                                contentDescription = "Open permission guide",
+                                tint = colors.textSecondary,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+
+                        HorizontalDivider(thickness = 2.dp, color = colors.cardDivider)
+
+                        // Display-over-other-apps overlay
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
                                 .clickable { onSetOverlayEnabled(!overlayEnabled) }
                                 .padding(horizontal = 16.dp, vertical = 14.dp),
                             verticalAlignment = Alignment.CenterVertically,
@@ -4840,25 +5052,25 @@ fun CompanionInstructionsScreen(
             item {
                 PairingInstruction(
                     number = 1,
-                    text = "Open DHD's desktop companion on your computer. Its local dashboard is usually available at localhost:8766.",
+                    text = "Open DHD Companion on your computer and go to Connection.",
                 )
             }
             item {
                 PairingInstruction(
                     number = 2,
-                    text = "Keep your phone and computer on the same local network. Wi-Fi and Ethernet are fine if the network allows them to reach each other.",
+                    text = "Keep your phone and computer on the same Wi-Fi network.",
                 )
             }
             item {
                 PairingInstruction(
                     number = 3,
-                    text = "On the desktop companion, choose Refresh phones and select this phone from the phone list.",
+                    text = "On the computer, tap Find my phone, then tap Connect next to this phone.",
                 )
             }
             item {
                 PairingInstruction(
                     number = 4,
-                    text = "Approve the request when it appears on this phone. No pairing code needs to be entered.",
+                    text = "When this phone asks, tap Approve. You're connected—there's no code to enter.",
                 )
             }
             item {

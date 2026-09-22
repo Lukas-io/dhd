@@ -1,15 +1,14 @@
 package com.phonecontrol.assistant
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
 import org.junit.Test
 
 class PermissionSetupTest {
     @Test
-    fun requestsNotificationsBeforeOverlay() {
+    fun asksForNotificationsBeforeOverlayAccess() {
         assertEquals(
-            FirstRunPermissionStep.NOTIFICATIONS,
-            nextFirstRunPermissionStep(
+            PermissionSetupStep.NOTIFICATIONS,
+            nextPermissionSetupStep(
                 sdkInt = 35,
                 notificationGranted = false,
                 overlayGranted = false,
@@ -18,30 +17,31 @@ class PermissionSetupTest {
     }
 
     @Test
-    fun requestsOverlayAfterNotificationDecision() {
+    fun proceedsToOverlayAfterTheNotificationPromptIsHandled() {
         assertEquals(
-            FirstRunPermissionStep.OVERLAY,
-            nextFirstRunPermissionStep(
+            PermissionSetupStep.OVERLAY,
+            nextPermissionSetupStep(
                 sdkInt = 35,
                 notificationGranted = true,
                 overlayGranted = false,
             ),
         )
         assertEquals(
-            FirstRunPermissionStep.NOTIFICATIONS,
-            nextFirstRunPermissionStep(
+            PermissionSetupStep.OVERLAY,
+            nextPermissionSetupStep(
                 sdkInt = 35,
                 notificationGranted = false,
-                overlayGranted = true,
+                overlayGranted = false,
+                notificationStepHandled = true,
             ),
         )
     }
 
     @Test
-    fun skipsNotificationRuntimePermissionBeforeAndroid13() {
+    fun skipsNotificationPermissionBeforeAndroid13() {
         assertEquals(
-            FirstRunPermissionStep.OVERLAY,
-            nextFirstRunPermissionStep(
+            PermissionSetupStep.OVERLAY,
+            nextPermissionSetupStep(
                 sdkInt = 32,
                 notificationGranted = false,
                 overlayGranted = false,
@@ -51,11 +51,53 @@ class PermissionSetupTest {
 
     @Test
     fun completesWhenBothPermissionsAreGranted() {
-        assertNull(
-            nextFirstRunPermissionStep(
+        assertEquals(
+            PermissionSetupStep.COMPLETE,
+            nextPermissionSetupStep(
                 sdkInt = 35,
                 notificationGranted = true,
                 overlayGranted = true,
+            ),
+        )
+    }
+
+    @Test
+    fun resumesAnIncompleteFirstRunAtItsOutstandingStep() {
+        assertEquals(
+            PermissionSetupStep.OVERLAY,
+            firstRunPermissionSetupStep(
+                onboardingCompleted = false,
+                sdkInt = 35,
+                notificationGranted = false,
+                overlayGranted = false,
+                notificationStepHandled = true,
+            ),
+        )
+    }
+
+    @Test
+    fun doesNotShowFirstRunSetupAgainAfterItIsCompleted() {
+        assertEquals(
+            null,
+            firstRunPermissionSetupStep(
+                onboardingCompleted = true,
+                sdkInt = 35,
+                notificationGranted = false,
+                overlayGranted = false,
+            ),
+        )
+    }
+
+    @Test
+    fun returnsNoOutstandingStepWhenAllRequiredPermissionsAreHandled() {
+        assertEquals(
+            null,
+            firstRunPermissionSetupStep(
+                onboardingCompleted = false,
+                sdkInt = 35,
+                notificationGranted = false,
+                overlayGranted = true,
+                notificationStepHandled = true,
             ),
         )
     }

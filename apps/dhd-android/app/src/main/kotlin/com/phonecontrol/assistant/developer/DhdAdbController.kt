@@ -97,7 +97,7 @@ data class DeveloperModeStatus(
             needsInitialConnection -> INITIAL_PHONE_CONNECTION_MESSAGE
             phoneAccessInterrupted -> PHONE_ACCESS_INTERRUPTED_MESSAGE
             state == DeveloperConnectionState.PAIRING_SEARCHING ->
-                "Follow the connection steps in the DHD notification."
+                "Follow these steps to enable DHD to use apps."
             state == DeveloperConnectionState.PAIRING_SERVICE_FOUND ->
                 "Enter the six-digit code Android shows in the DHD notification."
             state == DeveloperConnectionState.CONNECTING ->

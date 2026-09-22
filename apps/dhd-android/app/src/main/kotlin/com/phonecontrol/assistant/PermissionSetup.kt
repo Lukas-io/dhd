@@ -1,17 +1,35 @@
 package com.phonecontrol.assistant
 
-/** The order in which first-run system permissions are requested. */
-internal enum class FirstRunPermissionStep {
+/** The ordered, user-facing permission steps in DHD's first-run setup. */
+enum class PermissionSetupStep {
     NOTIFICATIONS,
     OVERLAY,
+    COMPLETE,
 }
 
-internal fun nextFirstRunPermissionStep(
+internal fun nextPermissionSetupStep(
     sdkInt: Int,
     notificationGranted: Boolean,
     overlayGranted: Boolean,
-): FirstRunPermissionStep? = when {
-    sdkInt >= 33 && !notificationGranted -> FirstRunPermissionStep.NOTIFICATIONS
-    !overlayGranted -> FirstRunPermissionStep.OVERLAY
-    else -> null
+    notificationStepHandled: Boolean = false,
+): PermissionSetupStep = when {
+    sdkInt >= 33 && !notificationGranted && !notificationStepHandled -> PermissionSetupStep.NOTIFICATIONS
+    !overlayGranted -> PermissionSetupStep.OVERLAY
+    else -> PermissionSetupStep.COMPLETE
+}
+
+internal fun firstRunPermissionSetupStep(
+    onboardingCompleted: Boolean,
+    sdkInt: Int,
+    notificationGranted: Boolean,
+    overlayGranted: Boolean,
+    notificationStepHandled: Boolean = false,
+): PermissionSetupStep? {
+    if (onboardingCompleted) return null
+    return nextPermissionSetupStep(
+        sdkInt = sdkInt,
+        notificationGranted = notificationGranted,
+        overlayGranted = overlayGranted,
+        notificationStepHandled = notificationStepHandled,
+    ).takeUnless { it == PermissionSetupStep.COMPLETE }
 }

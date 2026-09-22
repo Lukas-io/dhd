@@ -1,5 +1,6 @@
 package com.phonecontrol.assistant.developer
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -42,7 +43,7 @@ class DeveloperModeStatusTest {
         assertFalse(unpaired.requiresMaintenanceRestart)
         assertTrue(paired.phoneAccessInterrupted)
         assertTrue(unpaired.needsInitialConnection)
-        assertTrue(unpaired.recoveryTitle.contains("Connect your phone"))
+        assertEquals("Phone access needed", unpaired.recoveryTitle)
         assertTrue(unpaired.recoveryDetail.contains("one-time connection"))
     }
 }

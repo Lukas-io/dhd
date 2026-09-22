@@ -39,7 +39,11 @@ import kotlinx.coroutines.launch
 
 private const val CONVERSATION_EXPIRY_CHECK_INTERVAL_MS = 1_000L
 private const val PERMISSION_SETUP_PREFERENCES = "dhd_permission_setup"
-private const val KEY_FIRST_RUN_PERMISSION_SETUP_PROMPTED = "first_run_permission_setup_prompted"
+private const val KEY_FIRST_RUN_PERMISSION_ONBOARDING_COMPLETED = "first_run_permission_onboarding_completed"
+private const val KEY_NOTIFICATION_SETUP_STEP_HANDLED = "notification_setup_step_handled"
+private const val STATE_PERMISSION_SETUP_STEP = "permission_setup_step"
+private const val STATE_NOTIFICATION_SETUP_HANDLED = "notification_setup_step_handled"
+private const val STATE_PENDING_OVERLAY_ENABLE = "pending_overlay_enable"
 
 class MainActivity : ComponentActivity() {
     private var pendingRequest: String? = null
@@ -48,17 +52,18 @@ class MainActivity : ComponentActivity() {
     private var pendingFastMode: Boolean = false
     private var overlayEnabled by mutableStateOf(false)
     private var overlayPermissionGranted by mutableStateOf(false)
+    private var permissionSetupStep by mutableStateOf<PermissionSetupStep?>(null)
     private var pendingOverlayEnable = false
-    private var firstRunPermissionSetupStarted = false
-    private var waitingForFirstRunNotificationPermission = false
+    private var notificationSetupStepHandled = false
     private var overlayActivityToken: OverlayVisibilityGate.Token? = null
     private var conversationExpiryMonitor: Job? = null
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
-        if (waitingForFirstRunNotificationPermission) {
-            waitingForFirstRunNotificationPermission = false
-            continueFirstRunPermissionSetup()
+        if (permissionSetupStep == PermissionSetupStep.NOTIFICATIONS) {
+            notificationSetupStepHandled = true
+            persistNotificationSetupStepHandled()
+            updatePermissionSetupStep()
             return@registerForActivityResult
         }
         if (granted) {
@@ -74,8 +79,20 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        permissionSetupStep = savedInstanceState
+            ?.getString(STATE_PERMISSION_SETUP_STEP)
+            ?.let { savedStep -> PermissionSetupStep.entries.firstOrNull { it.name == savedStep } }
+            ?.takeUnless { it == PermissionSetupStep.COMPLETE }
+        val permissionPreferences = getSharedPreferences(PERMISSION_SETUP_PREFERENCES, MODE_PRIVATE)
+        notificationSetupStepHandled = savedInstanceState
+            ?.getBoolean(STATE_NOTIFICATION_SETUP_HANDLED)
+            ?: permissionPreferences.getBoolean(KEY_NOTIFICATION_SETUP_STEP_HANDLED, false)
+        pendingOverlayEnable = savedInstanceState
+            ?.getBoolean(STATE_PENDING_OVERLAY_ENABLE)
+            ?: false
         enableEdgeToEdge()
         refreshOverlayState()
+        maybeStartFirstRunPermissionSetup()
         val initialConversationId = intent.getStringExtra(EXTRA_CONVERSATION_ID)
         val app = application as PhoneControlApplication
         val appPackageManager = packageManager
@@ -242,6 +259,12 @@ class MainActivity : ComponentActivity() {
                 overlayEnabled = overlayEnabled,
                 overlayPermissionGranted = overlayPermissionGranted,
                 onSetOverlayEnabled = ::handleOverlayToggle,
+                permissionSetupStep = permissionSetupStep,
+                notificationsAllowed = hasNotificationPermission(),
+                onPermissionSetupPrimaryAction = ::handlePermissionSetupPrimaryAction,
+                onShowOverlayPermissionSetup = ::showOverlayPermissionSetup,
+                onPermissionSetupBack = ::navigateBackInPermissionSetup,
+                onOpenPermissionSetup = ::openPermissionSetup,
             )
         }
     }
@@ -279,10 +302,6 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         refreshOverlayState()
-    }
-
-    override fun onPostResume() {
-        super.onPostResume()
         maybeStartFirstRunPermissionSetup()
     }
 
@@ -306,6 +325,13 @@ class MainActivity : ComponentActivity() {
         refreshOverlayState()
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString(STATE_PERMISSION_SETUP_STEP, permissionSetupStep?.name)
+        outState.putBoolean(STATE_NOTIFICATION_SETUP_HANDLED, notificationSetupStepHandled)
+        outState.putBoolean(STATE_PENDING_OVERLAY_ENABLE, pendingOverlayEnable)
+        super.onSaveInstanceState(outState)
+    }
+
     private fun startSession(
         request: String,
         conversationId: String?,
@@ -324,46 +350,116 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * Ask for the permissions needed by the first-run DHD experience once.
-     * Notification permission is a runtime dialog; overlay access is granted
-     * from Android's dedicated settings screen, so the two steps are chained.
-     */
+    /** Show the in-app explanation before asking Android for either permission. */
     private fun maybeStartFirstRunPermissionSetup() {
-        if (firstRunPermissionSetupStarted) return
-
         val preferences = getSharedPreferences(PERMISSION_SETUP_PREFERENCES, MODE_PRIVATE)
-        if (preferences.getBoolean(KEY_FIRST_RUN_PERMISSION_SETUP_PROMPTED, false)) {
-            firstRunPermissionSetupStarted = true
+        if (permissionSetupStep != null || preferences.getBoolean(KEY_FIRST_RUN_PERMISSION_ONBOARDING_COMPLETED, false)) {
             return
         }
 
-        firstRunPermissionSetupStarted = true
-        preferences.edit().putBoolean(KEY_FIRST_RUN_PERMISSION_SETUP_PROMPTED, true).apply()
+        notificationSetupStepHandled = preferences.getBoolean(
+            KEY_NOTIFICATION_SETUP_STEP_HANDLED,
+            notificationSetupStepHandled,
+        )
+        val nextStep = firstRunPermissionSetupStep(
+            onboardingCompleted = false,
+            sdkInt = Build.VERSION.SDK_INT,
+            notificationGranted = hasNotificationPermission(),
+            overlayGranted = Settings.canDrawOverlays(this),
+            notificationStepHandled = notificationSetupStepHandled,
+        )
+        if (nextStep == null) {
+            markFirstRunPermissionSetupCompleted()
+        } else {
+            permissionSetupStep = nextStep
+        }
+    }
 
-        when (
-            nextFirstRunPermissionStep(
-                sdkInt = Build.VERSION.SDK_INT,
-                notificationGranted = hasNotificationPermission(),
-                overlayGranted = Settings.canDrawOverlays(this),
-            )
-        ) {
-            FirstRunPermissionStep.NOTIFICATIONS -> {
-                waitingForFirstRunNotificationPermission = true
-                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    private fun openPermissionSetup() {
+        notificationSetupStepHandled = false
+        persistNotificationSetupStepHandled()
+        permissionSetupStep = currentPermissionSetupStep()
+            .takeUnless { it == PermissionSetupStep.COMPLETE }
+    }
+
+    private fun handlePermissionSetupPrimaryAction() {
+        when (permissionSetupStep) {
+            PermissionSetupStep.NOTIFICATIONS -> {
+                if (hasNotificationPermission()) {
+                    notificationSetupStepHandled = true
+                    persistNotificationSetupStepHandled()
+                    updatePermissionSetupStep()
+                } else {
+                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
             }
-            FirstRunPermissionStep.OVERLAY -> continueFirstRunPermissionSetup()
+            PermissionSetupStep.OVERLAY -> {
+                if (Settings.canDrawOverlays(this)) {
+                    dismissPermissionSetup()
+                } else {
+                    pendingOverlayEnable = true
+                    openOverlayPermissionSettings()
+                }
+            }
+            PermissionSetupStep.COMPLETE -> dismissPermissionSetup()
             null -> Unit
         }
     }
 
-    private fun continueFirstRunPermissionSetup() {
-        if (Settings.canDrawOverlays(this)) return
+    private fun showOverlayPermissionSetup() {
+        if (permissionSetupStep != PermissionSetupStep.NOTIFICATIONS) return
+        permissionSetupStep = PermissionSetupStep.OVERLAY
+    }
 
-        // Keep the existing Settings toggle semantics: after the user grants
-        // access, the first-run flow enables the floating bubble automatically.
-        pendingOverlayEnable = true
-        openOverlayPermissionSettings()
+    private fun navigateBackInPermissionSetup() {
+        when (permissionSetupStep) {
+            PermissionSetupStep.OVERLAY -> permissionSetupStep = PermissionSetupStep.NOTIFICATIONS
+            PermissionSetupStep.NOTIFICATIONS,
+            PermissionSetupStep.COMPLETE,
+            -> finish()
+            null -> Unit
+        }
+    }
+
+    private fun dismissPermissionSetup() {
+        pendingOverlayEnable = false
+        if (currentPermissionSetupStep() == PermissionSetupStep.COMPLETE) {
+            markFirstRunPermissionSetupCompleted()
+        }
+        permissionSetupStep = null
+    }
+
+    private fun currentPermissionSetupStep(): PermissionSetupStep = nextPermissionSetupStep(
+        sdkInt = Build.VERSION.SDK_INT,
+        notificationGranted = hasNotificationPermission(),
+        overlayGranted = Settings.canDrawOverlays(this),
+        notificationStepHandled = notificationSetupStepHandled,
+    )
+
+    private fun updatePermissionSetupStep() {
+        val nextStep = currentPermissionSetupStep()
+        if (nextStep == PermissionSetupStep.COMPLETE) {
+            markFirstRunPermissionSetupCompleted()
+            permissionSetupStep = null
+        } else {
+            permissionSetupStep = nextStep
+        }
+    }
+
+    private fun persistNotificationSetupStepHandled() {
+        getSharedPreferences(PERMISSION_SETUP_PREFERENCES, MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_NOTIFICATION_SETUP_STEP_HANDLED, notificationSetupStepHandled)
+            .apply()
+    }
+
+    private fun markFirstRunPermissionSetupCompleted() {
+        getSharedPreferences(PERMISSION_SETUP_PREFERENCES, MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_FIRST_RUN_PERMISSION_ONBOARDING_COMPLETED, true)
+            .remove(KEY_NOTIFICATION_SETUP_STEP_HANDLED)
+            .apply()
+        notificationSetupStepHandled = false
     }
 
     private fun hasNotificationPermission(): Boolean =
@@ -414,9 +510,12 @@ class MainActivity : ComponentActivity() {
         val granted = Settings.canDrawOverlays(this)
         overlayPermissionGranted = granted
         overlayEnabled = granted && OverlayPreferences.isEnabled(this)
-        if (pendingOverlayEnable && granted) {
+        if (pendingOverlayEnable) {
             pendingOverlayEnable = false
-            enableOverlay()
+            if (granted) {
+                enableOverlay()
+                dismissPermissionSetup()
+            }
         } else if (overlayEnabled) {
             startService(
                 Intent(this, AssistantForegroundService::class.java)
@@ -438,8 +537,9 @@ class MainActivity : ComponentActivity() {
         }
 
         if (!Settings.canDrawOverlays(this)) {
-            pendingOverlayEnable = true
-            openOverlayPermissionSettings()
+            notificationSetupStepHandled = true
+            persistNotificationSetupStepHandled()
+            permissionSetupStep = PermissionSetupStep.OVERLAY
             return
         }
         enableOverlay()

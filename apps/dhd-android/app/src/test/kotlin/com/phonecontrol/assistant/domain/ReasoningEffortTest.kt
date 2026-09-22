@@ -6,6 +6,11 @@ import org.junit.Test
 
 class ReasoningEffortTest {
     @Test
+    fun `high is the default effort`() {
+        assertEquals(ReasoningEffort.HIGH, ReasoningEffort.default)
+    }
+
+    @Test
     fun `efforts stay ordered from light to max`() {
         assertEquals(
             listOf("low", "medium", "high", "xhigh", "max"),

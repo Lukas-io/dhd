@@ -10,6 +10,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
@@ -37,6 +38,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import com.phonecontrol.assistant.PermissionSetupStep
 import com.phonecontrol.assistant.PhoneControlApplication
 import com.phonecontrol.assistant.apps.InstalledAppsRepository
 import com.phonecontrol.assistant.data.DHD_CONVERSATION_ID
@@ -164,6 +166,7 @@ object AppRoutes {
     const val PAIRING = "pairing"
     const val APPROVED_APPS = "approved_apps"
     const val COMPANION = "companion"
+    const val PERMISSION_SETUP = "permission_setup"
 }
 
 @Composable
@@ -191,6 +194,12 @@ fun PhoneControlApp(
     overlayEnabled: Boolean = false,
     overlayPermissionGranted: Boolean = false,
     onSetOverlayEnabled: (Boolean) -> Unit = {},
+    permissionSetupStep: PermissionSetupStep? = null,
+    notificationsAllowed: Boolean = true,
+    onPermissionSetupPrimaryAction: () -> Unit = {},
+    onShowOverlayPermissionSetup: () -> Unit = {},
+    onPermissionSetupBack: () -> Unit = {},
+    onOpenPermissionSetup: () -> Unit = {},
     onNotificationVisibilityChanged: (mainConversationVisible: Boolean, attentionVisible: Boolean) -> Unit = { _, _ -> },
 ) {
     val context = LocalContext.current
@@ -289,7 +298,7 @@ fun PhoneControlApp(
     val navController = rememberNavController()
     val currentBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = currentBackStackEntry?.destination?.route
-    val mainConversationVisible = currentRoute == AppRoutes.MAIN
+    val mainConversationVisible = permissionSetupStep == null && currentRoute == AppRoutes.MAIN
     val attentionVisible = mainConversationVisible && when (val state = coordinatorState) {
         is SessionState.Running -> !state.attentionReason.isNullOrBlank()
         is SessionState.Paused -> !state.attentionReason.isNullOrBlank()
@@ -307,6 +316,7 @@ fun PhoneControlApp(
         AppRoutes.PAIRING,
         AppRoutes.APPROVED_APPS,
         AppRoutes.COMPANION,
+        AppRoutes.PERMISSION_SETUP,
         -> initialRoute
         else -> null
     }
@@ -390,6 +400,17 @@ fun PhoneControlApp(
                 modifier = Modifier.fillMaxSize(),
                 color = assistantColors.background,
             ) {
+                BackHandler(enabled = permissionSetupStep != null) {
+                    onPermissionSetupBack()
+                }
+                if (permissionSetupStep != null) {
+                    PermissionOnboardingScreen(
+                        step = permissionSetupStep,
+                        onPrimaryAction = onPermissionSetupPrimaryAction,
+                        onShowOverlayStep = onShowOverlayPermissionSetup,
+                        onBack = onPermissionSetupBack,
+                    )
+                } else {
                 NavHost(
                     navController = navController,
                     startDestination = AppRoutes.MAIN,
@@ -455,6 +476,9 @@ fun PhoneControlApp(
                             overlayEnabled = overlayEnabled,
                             overlayPermissionGranted = overlayPermissionGranted,
                             onSetOverlayEnabled = onSetOverlayEnabled,
+                            onOpenPermissionSetup = {
+                                onOpenPermissionSetup()
+                            },
                             onBack = { navController.popBackStack() },
                         )
                     }
@@ -497,6 +521,15 @@ fun PhoneControlApp(
                                 onBack = { navController.popBackStack() },
                             )
                         }
+                    }
+
+                    composable(AppRoutes.PERMISSION_SETUP) {
+                        PermissionOnboardingScreen(
+                            step = permissionSetupStep ?: PermissionSetupStep.COMPLETE,
+                            onPrimaryAction = onPermissionSetupPrimaryAction,
+                            onShowOverlayStep = onShowOverlayPermissionSetup,
+                            onBack = onPermissionSetupBack,
+                        )
                     }
 
                     composable(AppRoutes.APPROVED_APPS) {
@@ -563,6 +596,7 @@ fun PhoneControlApp(
                         onKeep = { conversationStore.keepInactiveConversation() },
                         onClear = { conversationStore.expireInactiveConversation() },
                     )
+                }
                 }
             }
         }

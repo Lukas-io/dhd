@@ -16,7 +16,7 @@ enum class ReasoningEffort(
     MAX("max", "Max", "max");
 
     companion object {
-        val default: ReasoningEffort = MAX
+        val default: ReasoningEffort = HIGH
 
         fun fromStorage(value: String?): ReasoningEffort =
             entries.firstOrNull { it.storageValue == value?.trim()?.lowercase() } ?: default
