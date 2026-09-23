@@ -43,7 +43,6 @@ import com.phonecontrol.assistant.PhoneControlApplication
 import com.phonecontrol.assistant.apps.InstalledAppsRepository
 import com.phonecontrol.assistant.data.DHD_CONVERSATION_ID
 import com.phonecontrol.assistant.domain.ReasoningEffort
-import com.phonecontrol.assistant.execution.TaskDisplayLayoutPreferences
 import com.phonecontrol.assistant.session.SessionState
 
 data class AssistantColorScheme(
@@ -65,6 +64,7 @@ data class AssistantColorScheme(
     val accentGold: Color,
     val accentOrange: Color,
     val accentPink: Color,
+    val accentMagenta: Color,
     val errorRed: Color,
     val warningAmber: Color,
     val sendButtonActiveBg: Color,
@@ -93,6 +93,7 @@ val DarkAssistantColors = AssistantColorScheme(
     accentGold = Color(0xFFFACC15),
     accentOrange = Color(0xFFFB923C),
     accentPink = Color(0xFFF472B6),
+    accentMagenta = Color(0xFFD946EF),
     errorRed = Color(0xFFEF4444),
     warningAmber = Color(0xFFF59E0B),
     sendButtonActiveBg = Color(0xFF2C67C5), // App blue
@@ -121,6 +122,7 @@ val LightAssistantColors = AssistantColorScheme(
     accentGold = Color(0xFFA16207),
     accentOrange = Color(0xFFC2410C),
     accentPink = Color(0xFFBE185D),
+    accentMagenta = Color(0xFFA21CAF),
     errorRed = Color(0xFFDC2626),
     warningAmber = Color(0xFFD97706),
     sendButtonActiveBg = Color(0xFF2C67C5), // App blue
@@ -286,15 +288,6 @@ fun PhoneControlApp(
     val companionConnected by application.devBridgeServer.companionConnected.collectAsState()
     val pendingCompanionPairing by application.devBridgeServer.pendingCompanionPairing.collectAsState()
     val apps = remember { InstalledAppsRepository(context).listLaunchableUserApps() }
-    val taskDisplayLayoutPreferences = remember { TaskDisplayLayoutPreferences(context) }
-    var fullSizeLayoutPackages by remember {
-        mutableStateOf(taskDisplayLayoutPreferences.fullSizeLayoutPackages())
-    }
-    val setFullSizeLayout: (String, Boolean) -> Unit = { packageName, enabled ->
-        taskDisplayLayoutPreferences.setFullSizeLayoutEnabled(packageName, enabled)
-        fullSizeLayoutPackages = taskDisplayLayoutPreferences.fullSizeLayoutPackages()
-    }
-
     val navController = rememberNavController()
     val currentBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = currentBackStackEntry?.destination?.route
@@ -500,10 +493,6 @@ fun PhoneControlApp(
                                 navController.popBackStack()
                             },
                             onEnd = onEndTaskDisplay,
-                            fullSizeLayoutForPackage = { packageName ->
-                                packageName in fullSizeLayoutPackages
-                            },
-                            onSetFullSizeLayout = setFullSizeLayout,
                             onBack = { navController.popBackStack() },
                         )
                     }
@@ -570,10 +559,6 @@ fun PhoneControlApp(
                             viewerSessionKey = record.sessionKey
                         },
                         onEnd = onEndTaskDisplay,
-                        fullSizeLayoutForPackage = { packageName ->
-                            packageName in fullSizeLayoutPackages
-                        },
-                        onSetFullSizeLayout = setFullSizeLayout,
                         onBack = { taskDisplaysSheetVisible = false },
                     )
                 }
