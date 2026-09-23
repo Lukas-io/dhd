@@ -199,6 +199,9 @@ interface ConversationDao {
 
     @Query("DELETE FROM task_displays WHERE sessionKey = :sessionKey")
     fun deleteTaskDisplay(sessionKey: String)
+
+    @Query("DELETE FROM task_displays")
+    fun deleteAllTaskDisplays()
 }
 
 @Database(
@@ -695,6 +698,10 @@ class ConversationStore(context: Context) {
         dao.deleteTaskDisplay(sessionKey)
     }
 
+    fun deleteAllTaskDisplays() = synchronized(lock) {
+        dao.deleteAllTaskDisplays()
+    }
+
     fun bindCodexThread(conversationId: String, codexThreadId: String) = synchronized(lock) {
         val conversation = dao.findConversation(canonicalConversationId(conversationId)) ?: return@synchronized
         dao.updateConversation(conversation.copy(codexThreadId = codexThreadId, updatedAtEpochMs = System.currentTimeMillis()))
@@ -716,7 +723,6 @@ class ConversationStore(context: Context) {
 
     fun deleteConversation(conversationId: String): Boolean = synchronized(lock) {
         val canonicalId = canonicalConversationId(conversationId)
-        if (dao.findConversation(canonicalId) == null) return@synchronized false
         clearConversationRows(canonicalId)
         if (canonicalId == DHD_CONVERSATION_ID) {
             _conversationExpiryPrompt.value = false

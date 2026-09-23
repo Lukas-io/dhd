@@ -1044,6 +1044,77 @@ class DhdTaskDisplayBackend(
         return TaskDisplayCloseResult.Closed(closed)
     }
 
+    override suspend fun closeAllTaskDisplays(clearRecords: Boolean) {
+        val now = nowEpochMs()
+        val allKeys = mutableSetOf<String>()
+        stateLock.withLock {
+            allKeys.addAll(sessions.keys)
+        }
+        synchronized(recordsLock) {
+            allKeys.addAll(_displayRecords.value.map { it.sessionKey })
+        }
+
+        allKeys.forEach { key ->
+            cancelledKeys.add(key)
+            nativeManager.cancel(key)
+        }
+
+        stateLock.withLock {
+            sessions.values.forEach { bound ->
+                val sessionKey = bound.taskSession.sessionKey
+                previewStateJobs.remove(sessionKey)?.cancel()
+                liveHandles.remove(sessionKey)?.handle?.close()
+                publishPreviewStateLocked(
+                    sessionKey,
+                    TaskPreviewState.Ended(
+                        session = bound.taskSession,
+                        message = "The virtual display ended.",
+                    ),
+                )
+            }
+            sessions.clear()
+            _activeSession.value = null
+            _previewState.value = TaskPreviewState.Detached
+        }
+
+        synchronized(bindingsLock) {
+            runBindings.clear()
+        }
+
+        allKeys.forEach { key ->
+            expiryJobs.remove(key)?.cancel()
+        }
+
+        if (clearRecords) {
+            synchronized(recordsLock) {
+                _displayRecords.value = emptyList()
+            }
+            conversationStore?.deleteAllTaskDisplays()
+        } else {
+            val updatedRecords = synchronized(recordsLock) {
+                _displayRecords.value.map { record ->
+                    if (record.status != TaskDisplayStatus.ENDED && record.status != TaskDisplayStatus.EXPIRED) {
+                        record.copy(
+                            status = TaskDisplayStatus.ENDED,
+                            terminalAtEpochMs = record.terminalAtEpochMs ?: now,
+                            expiresAtEpochMs = now,
+                            lastPurpose = record.lastPurpose.ifBlank { "Display ended" },
+                        )
+                    } else {
+                        record
+                    }
+                }.also {
+                    _displayRecords.value = sortRecords(it)
+                }
+            }
+            updatedRecords.forEach { record ->
+                conversationStore?.upsertTaskDisplay(record)
+            }
+        }
+
+        runCatching { nativeManager.closeAll() }
+    }
+
     /** Serialize preview attach/detach without applying the action tombstone. */
     private suspend fun <T> withDisplayLease(
         session: TaskDisplaySession,

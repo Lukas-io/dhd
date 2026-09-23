@@ -52,6 +52,23 @@ class SessionCoordinatorTest {
     }
 
     @Test
+    fun `reset returns state to idle and clears session data`() {
+        val coordinator = coordinator()
+
+        assertTrue(coordinator.start("Find a restaurant"))
+        coordinator.enqueueSteer("Scroll down")
+        assertTrue(coordinator.stop())
+        assertTrue(coordinator.state.value is SessionState.Stopped)
+
+        assertTrue(coordinator.reset())
+        assertTrue(coordinator.state.value is SessionState.Idle)
+        assertTrue(coordinator.events.value.isEmpty())
+        assertTrue(coordinator.toolCalls.value.isEmpty())
+        assertNull(coordinator.pendingSteer())
+        assertNull(coordinator.activeSessionId())
+    }
+
+    @Test
     fun `stopped run can continue in the same conversation with its settings`() {
         val coordinator = coordinator()
 

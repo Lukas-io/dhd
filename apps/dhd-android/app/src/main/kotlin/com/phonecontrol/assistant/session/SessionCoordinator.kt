@@ -533,6 +533,32 @@ class SessionCoordinator(
     }
 
     /**
+     * Terminate any active or stopped session and reset coordinator state to Idle.
+     * Clears all steer instructions, tool calls, pointer events, and timeline events.
+     */
+    fun reset(): Boolean = synchronized(lock) {
+        val current = _state.value
+        val sessionId = current.sessionIdOrNull
+        cancelPendingAttentionLocked()
+        completedAttentions.clear()
+        sessionJob?.cancel()
+        sessionJob = null
+        if (sessionId != null) {
+            transport.cancelSessionForRun(sessionId)
+            clearSteers(sessionId)
+            conversationStore?.completeRun(sessionId, RunStatus.STOPPED)
+        }
+        pendingSteers.clear()
+        claimedSteers.clear()
+        claimedRequestSessionId = null
+        _pointerEvent.value = null
+        _toolCalls.value = emptyList()
+        _events.value = emptyList()
+        _state.value = SessionState.Idle
+        true
+    }
+
+    /**
      * End a run after a provider/bridge failure. This is intentionally distinct
      * from releaseRequest: a failed Codex turn must not be picked up and
      * replayed indefinitely by the polling companion.

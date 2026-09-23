@@ -231,6 +231,7 @@ class MainActivity : ComponentActivity() {
                 onRunRequest = ::startSession,
                 onStopSession = ::stopSession,
                 onContinueSession = ::continueSession,
+                onStartFresh = ::startFresh,
                 onAcknowledgeAttention = { app.sessionCoordinator.acknowledgeAttention() },
                 onSteerRequest = ::steerSession,
                 onNotificationVisibilityChanged = { mainConversationVisible, attentionVisible ->
@@ -490,6 +491,15 @@ class MainActivity : ComponentActivity() {
         startService(
             Intent(this, AssistantForegroundService::class.java)
                 .setAction(AssistantForegroundService.ACTION_STOP_USER),
+        )
+    }
+
+    private fun startFresh() {
+        val app = application as PhoneControlApplication
+        app.startFresh()
+        startService(
+            Intent(this, AssistantForegroundService::class.java)
+                .setAction(AssistantForegroundService.ACTION_START_FRESH),
         )
     }
 

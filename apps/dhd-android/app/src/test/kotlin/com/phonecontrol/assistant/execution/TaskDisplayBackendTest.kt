@@ -143,4 +143,20 @@ class TaskDisplayBackendTest {
         assertNotNull(failed.expiresAtEpochMs)
         assertTrue(failed.status.isTerminal)
     }
+
+    @Test
+    fun `default closeAllTaskDisplays runs without throwing`() = kotlinx.coroutines.test.runTest {
+        val backend = object : TaskDisplayBackend {
+            override val displayRecords = kotlinx.coroutines.flow.MutableStateFlow<List<TaskDisplayRecord>>(emptyList())
+            override suspend fun create(sessionKey: String, packageName: String, spec: TaskDisplaySpec) = throw UnsupportedOperationException()
+            override suspend fun current(sessionKey: String) = null
+            override suspend fun capture(session: TaskDisplaySession) = throw UnsupportedOperationException()
+            override suspend fun attachLiveSurface(session: TaskDisplaySession, surface: android.view.Surface) = Unit
+            override suspend fun detachLiveSurface(session: TaskDisplaySession, surface: android.view.Surface) = Unit
+            override fun cancel(sessionKey: String) = Unit
+            override suspend fun close(session: TaskDisplaySession) = Unit
+            override suspend fun close(sessionKey: String) = Unit
+        }
+        backend.closeAllTaskDisplays()
+    }
 }

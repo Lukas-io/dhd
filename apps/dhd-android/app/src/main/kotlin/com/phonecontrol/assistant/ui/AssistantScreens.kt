@@ -634,7 +634,7 @@ fun AssistantScreen(
                                 }
                             },
                             onStop = onStopSession,
-                            canContinue = state is SessionState.Stopped,
+                            canContinue = state is SessionState.Stopped && recentTimeline.isNotEmpty(),
                             onContinue = onContinueSession,
                         )
                     }
@@ -675,6 +675,12 @@ fun AssistantScreen(
                 TextButton(
                     onClick = {
                         showStartFreshConfirmation = false
+                        steerDraft = ""
+                        steerDraftSessionId = null
+                        steerDraftReasoningEffort = null
+                        steerDraftFastMode = null
+                        composerEditText = null
+                        coordinator.reset()
                         onStartFresh()
                     },
                 ) {

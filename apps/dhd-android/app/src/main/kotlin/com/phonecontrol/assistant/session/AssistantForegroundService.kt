@@ -125,6 +125,17 @@ class AssistantForegroundService : Service() {
             }
             ACTION_STOP -> stopSession("Stopped from the notification.", startId)
             ACTION_STOP_USER -> stopSession("Stopped by the user.", startId)
+            ACTION_START_FRESH -> {
+                coordinator.reset()
+                removeAttentionNotification(this)
+                removeCompletionNotification(this)
+                if (!overlayEnabledAndPermitted()) {
+                    stopForegroundIfNeeded()
+                    stopSelfResult(startId)
+                } else {
+                    syncForegroundNotification(coordinator.state.value)
+                }
+            }
 
             ACTION_START, null -> {
                 if (overlayEnabledAndPermitted()) {
@@ -257,6 +268,7 @@ class AssistantForegroundService : Service() {
         const val ACTION_CONTINUE = "com.phonecontrol.assistant.action.CONTINUE"
         const val ACTION_STOP = "com.phonecontrol.assistant.action.STOP"
         const val ACTION_STOP_USER = "com.phonecontrol.assistant.action.STOP_USER"
+        const val ACTION_START_FRESH = "com.phonecontrol.assistant.action.START_FRESH"
         const val EXTRA_REQUEST = "com.phonecontrol.assistant.extra.REQUEST"
         const val EXTRA_CONVERSATION_ID = "com.phonecontrol.assistant.extra.CONVERSATION_ID"
         const val EXTRA_REASONING_EFFORT = "com.phonecontrol.assistant.extra.REASONING_EFFORT"
@@ -340,6 +352,11 @@ class AssistantForegroundService : Service() {
         fun removeAttentionNotification(context: Context) {
             context.getSystemService(NotificationManager::class.java)
                 .cancel(ATTENTION_NOTIFICATION_ID)
+        }
+
+        fun removeCompletionNotification(context: Context) {
+            context.getSystemService(NotificationManager::class.java)
+                .cancel(COMPLETION_NOTIFICATION_ID)
         }
 
         private fun createNotificationChannels(context: Context) {

@@ -176,6 +176,7 @@ fun PhoneControlApp(
     onRunRequest: (String, String?, String?, Boolean) -> Unit,
     onStopSession: () -> Unit,
     onContinueSession: () -> Unit = {},
+    onStartFresh: (() -> Unit)? = null,
     onAcknowledgeAttention: () -> Boolean,
     onSteerRequest: (String) -> Boolean,
     previewState: LiveDisplayPreviewState? = null,
@@ -323,6 +324,15 @@ fun PhoneControlApp(
     var viewerSessionKey by rememberSaveable { mutableStateOf<String?>(null) }
     var taskDisplaysSheetVisible by rememberSaveable { mutableStateOf(false) }
     val openTaskDisplays: () -> Unit = { taskDisplaysSheetVisible = true }
+    val handleStartFresh: () -> Unit = {
+        viewerSessionKey = null
+        taskDisplaysSheetVisible = false
+        if (onStartFresh != null) {
+            onStartFresh()
+        } else {
+            application.startFresh()
+        }
+    }
 
     // Until the backend exposes its registry, the active preview remains a
     // valid single-record manager model. MainActivity can pass persisted and
@@ -445,9 +455,7 @@ fun PhoneControlApp(
                             onOpenSettings = { navController.navigate(AppRoutes.SETTINGS) },
                             onOpenPhoneAccess = { navController.navigate(AppRoutes.PAIRING) },
                             onOpenTaskDisplays = openTaskDisplays,
-                            onStartFresh = {
-                                conversationStore.deleteConversation(DHD_CONVERSATION_ID)
-                            },
+                            onStartFresh = handleStartFresh,
                             developerStatus = developerStatus,
                             companionConnected = companionConnected,
                             onOpenCompanion = { navController.navigate(AppRoutes.COMPANION) },

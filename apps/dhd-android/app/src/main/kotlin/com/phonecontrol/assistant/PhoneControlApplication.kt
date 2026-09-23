@@ -5,6 +5,7 @@ import android.view.Surface
 import com.phonecontrol.assistant.apps.AppPermissionRepository
 import com.phonecontrol.assistant.bridge.DevBridgeServer
 import com.phonecontrol.assistant.data.ConversationStore
+import com.phonecontrol.assistant.data.DHD_CONVERSATION_ID
 import com.phonecontrol.assistant.developer.DhdAdbController
 import com.phonecontrol.assistant.developer.DhdAdbProcessRunner
 import com.phonecontrol.assistant.developer.DhdTaskDisplayBackend
@@ -91,6 +92,26 @@ class PhoneControlApplication : Application() {
                 // can still be removed from Task Displays.
                 taskDisplayBackend.close(sessionKey)
             }
+        }
+    }
+
+    fun closeAllTaskDisplays() {
+        previewScope.launch {
+            taskDisplayBackend.closeAllTaskDisplays(clearRecords = true)
+        }
+    }
+
+    /**
+     * Start a fresh conversation session:
+     * - Resets the coordinator to Idle and cleans up active jobs/steers/events.
+     * - Deletes the conversation history in ConversationStore.
+     * - Closes all active and retained virtual displays.
+     */
+    fun startFresh() {
+        sessionCoordinator.reset()
+        conversationStore.deleteConversation(DHD_CONVERSATION_ID)
+        previewScope.launch {
+            taskDisplayBackend.closeAllTaskDisplays(clearRecords = true)
         }
     }
 

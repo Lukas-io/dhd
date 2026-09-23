@@ -393,6 +393,9 @@ interface TaskDisplayBackend {
         code = "DISPLAY_UNAVAILABLE",
         message = "The task display backend is unavailable.",
     )
+
+    /** Explicitly end every task display, closing native resources and optionally clearing records. */
+    suspend fun closeAllTaskDisplays(clearRecords: Boolean = false) = Unit
 }
 
 val TaskDisplayStatus.isTerminal: Boolean
