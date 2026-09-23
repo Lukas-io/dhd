@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -490,7 +490,7 @@ export class CodexAppServerClient {
       throw new Error("Codex App Server client is already running.");
     mkdirSync(this.codexHome, { recursive: true });
     mkdirSync(this.runtimeCwd, { recursive: true });
-    const command = process.env.PHONE_ASSISTANT_CODEX_BIN?.trim() || "codex";
+    const command = resolveCodexBin();
     const args = ["app-server", "--listen", "stdio://"];
     for (const override of [
       ...MINIMAL_CODEX_CONFIG_OVERRIDES,
@@ -2251,6 +2251,33 @@ function extractTurnError(value: unknown): string {
   const turnError = extractRecord(turn?.error);
   if (typeof turnError?.message === "string") return turnError.message;
   return typeof record?.message === "string" ? record.message : "";
+}
+
+function resolveCodexBin(): string {
+  const configured = process.env.PHONE_ASSISTANT_CODEX_BIN?.trim();
+  if (configured) return configured;
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+    const binDirectory = join(localAppData, "OpenAI", "Codex", "bin");
+    try {
+      const installed = readdirSync(binDirectory, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => join(binDirectory, entry.name, "codex.exe"))
+        .flatMap((path) => {
+          try {
+            return [{ path, modified: statSync(path).mtimeMs }];
+          } catch {
+            return [];
+          }
+        })
+        .sort((left, right) => right.modified - left.modified);
+      if (installed[0]) return installed[0].path;
+    } catch {
+      // Standalone CLI installs are still resolved through PATH below.
+    }
+  }
+  // The unversioned desktop-app binary can lag behind the active CLI.
+  return "codex";
 }
 
 function resolveCodexHome(): string {
