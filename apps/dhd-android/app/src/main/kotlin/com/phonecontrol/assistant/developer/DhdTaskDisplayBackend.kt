@@ -24,6 +24,7 @@ import com.phonecontrol.assistant.execution.taskDisplayAppLayoutMatches
 import com.phonecontrol.assistant.execution.terminalized
 import com.phonecontrol.assistant.execution.withFullSizeAppLayout
 import java.io.IOException
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -189,6 +190,13 @@ class DhdTaskDisplayBackend(
         sessionKey: String,
         packageName: String,
         spec: TaskDisplaySpec,
+    ): TaskDisplaySession = createOwned(sessionKey, sessionKey, packageName, spec)
+
+    private suspend fun createOwned(
+        sessionKey: String,
+        runSessionKey: String,
+        packageName: String,
+        spec: TaskDisplaySpec,
     ): TaskDisplaySession {
         val operationLock = operationLocks.getOrPut(sessionKey) { Mutex() }
         return operationLock.withLock {
@@ -224,28 +232,28 @@ class DhdTaskDisplayBackend(
             val record = taskSession.toRecord(
                 status = TaskDisplayStatus.RUNNING,
                 createdAtEpochMs = nowEpochMs(),
-                lastPurpose = conversationStore?.currentPurpose(sessionKey)
+                lastPurpose = conversationStore?.currentPurpose(runSessionKey)
                     ?.take(MAX_RECORD_PURPOSE_CHARS)
                     ?.ifBlank { null }
                     ?: "Preparing request",
             )
             val shouldClose = stateLock.withLock {
-                if (cancelledKeys.contains(sessionKey)) {
-                    true
-                } else {
-                    sessions[sessionKey] = bound
-                    bindRunKey(sessionKey, sessionKey)
-                    _activeSession.value = taskSession
-                    publishPreviewStateLocked(
-                        sessionKey,
-                        TaskPreviewState.Connecting(taskSession),
-                    )
-                    // Publish while the state lock is held. A concurrent
-                    // stop can then only retain the already-visible record
-                    // after this RUNNING record exists; it cannot be
-                    // overwritten by a late create completion.
-                    publishRecord(record)
-                    false
+                synchronized(bindingsLock) {
+                    if (cancelledKeys.contains(sessionKey) || cancelledKeys.contains(runSessionKey)) {
+                        true
+                    } else {
+                        sessions[sessionKey] = bound
+                        bindRunKey(runSessionKey, sessionKey)
+                        _activeSession.value = taskSession
+                        publishPreviewStateLocked(
+                            sessionKey,
+                            TaskPreviewState.Connecting(taskSession),
+                        )
+                        // Publish while both locks are held. Stop either
+                        // tombstones this owner first or sees the new binding.
+                        publishRecord(record)
+                        false
+                    }
                 }
             }
             if (shouldClose) {
@@ -277,7 +285,7 @@ class DhdTaskDisplayBackend(
             }
             close(current)
             return@withLock TaskDisplayOpenResult(
-                create(sessionKey, packageName, spec),
+                createWithFreshOwner(sessionKey, packageName, spec),
                 created = true,
             )
         }
@@ -299,7 +307,35 @@ class DhdTaskDisplayBackend(
             }
         }
 
-        TaskDisplayOpenResult(create(sessionKey, packageName, spec), created = true)
+        // Every app open gets a fresh native owner key. A previous display
+        // may have been closed or expired even when no record is left here;
+        // its key remains permanently tombstoned in the native manager.
+        TaskDisplayOpenResult(
+            createWithFreshOwner(sessionKey, packageName, spec),
+            created = true,
+        )
+    }
+
+    private suspend fun createWithFreshOwner(
+        runSessionKey: String,
+        packageName: String,
+        spec: TaskDisplaySpec,
+    ): TaskDisplaySession {
+        val ownerKey = "dhd-${UUID.randomUUID()}"
+        synchronized(bindingsLock) {
+            if (cancelledKeys.contains(runSessionKey)) {
+                throw TaskDisplayException("The task display run was stopped before creation.")
+            }
+            // Register before native creation so Stop can tombstone this exact
+            // owner even if the daemon has not returned a display yet.
+            runBindings.getOrPut(runSessionKey) { linkedSetOf() }.add(ownerKey)
+        }
+        return try {
+            createOwned(ownerKey, runSessionKey, packageName, spec)
+        } catch (error: Throwable) {
+            unbindOwner(ownerKey)
+            throw error
+        }
     }
 
     private suspend fun reusableDisplayCandidates(
