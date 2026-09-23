@@ -100,6 +100,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.key
@@ -307,10 +308,11 @@ fun AssistantScreen(
     }
     val canSteer = state is SessionState.Running
     var showStartFreshConfirmation by rememberSaveable { mutableStateOf(false) }
-    var steerDraft by rememberSaveable { mutableStateOf("") }
+    var steerDrafts by rememberSaveable(stateSaver = steerDraftsSaver) {
+        mutableStateOf(emptyList<PendingSteerDraft>())
+    }
     var steerDraftSessionId by rememberSaveable { mutableStateOf<String?>(null) }
-    var steerDraftReasoningEffort by rememberSaveable { mutableStateOf<String?>(null) }
-    var steerDraftFastMode by rememberSaveable { mutableStateOf<Boolean?>(null) }
+    var carrySteerDraftsToNextRun by rememberSaveable { mutableStateOf(false) }
     var composerEditText by rememberSaveable { mutableStateOf<String?>(null) }
     var showReasoningSelector by rememberSaveable { mutableStateOf(false) }
     var topRecoverySlotHeightPx by remember { mutableStateOf(0) }
@@ -319,34 +321,35 @@ fun AssistantScreen(
         it.sessionId == activeSessionId && it.status == DhdToolCallStatus.RUNNING
     }
     LaunchedEffect(activeSessionId) {
-        // A draft belongs to the run in which it was composed. Do not carry an
-        // unsent steer into a newly started task or a rotated session.
         if (steerDraftSessionId != activeSessionId) {
-            steerDraft = ""
+            if (carrySteerDraftsToNextRun && activeSessionId != null && steerDrafts.isNotEmpty()) {
+                // Keep the remaining queue attached to the auto-started run.
+                carrySteerDraftsToNextRun = false
+            } else {
+                steerDrafts = emptyList()
+                carrySteerDraftsToNextRun = false
+            }
             steerDraftSessionId = activeSessionId
-            steerDraftReasoningEffort = null
-            steerDraftFastMode = null
         }
     }
     LaunchedEffect(state) {
         val completed = state as? SessionState.Completed ?: return@LaunchedEffect
-        val normalRequest = steerDraft.trim()
-        if (normalRequest.isBlank() || steerDraftSessionId != completed.sessionId) {
+        val queuedDrafts = steerDrafts
+        if (queuedDrafts.isEmpty() || steerDraftSessionId != completed.sessionId) {
             return@LaunchedEffect
         }
 
-        // A draft that was not explicitly steered becomes the next ordinary
-        // request once the current run has reached a successful terminal state.
-        steerDraft = ""
-        steerDraftSessionId = null
+        // Promote only the oldest held draft. Keep the rest in FIFO order for
+        // later follow-up runs.
+        val nextDraft = queuedDrafts.first()
+        steerDrafts = queuedDrafts.drop(1)
+        carrySteerDraftsToNextRun = steerDrafts.isNotEmpty()
         onRunRequest(
-            normalRequest,
+            nextDraft.text.trim(),
             DHD_CONVERSATION_ID,
-            steerDraftReasoningEffort ?: reasoningEffort.codexValue,
-            steerDraftFastMode ?: fastMode,
+            nextDraft.reasoningEffort,
+            nextDraft.fastMode,
         )
-        steerDraftReasoningEffort = null
-        steerDraftFastMode = null
     }
     val recentCutoff = System.currentTimeMillis() - RECENT_HISTORY_WINDOW_MS
     val continuationRunId = state.continuationSessionIdOrNullForUi()
@@ -576,29 +579,53 @@ fun AssistantScreen(
                             .padding(top = 4.dp, bottom = 12.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
-                        if (canSteer && steerDraft.isNotBlank()) {
-                            SteerDraftBar(
-                                text = steerDraft,
-                                onSteer = {
-                                    if (onSteerRequest(steerDraft)) {
-                                        steerDraft = ""
-                                        steerDraftReasoningEffort = null
-                                        steerDraftFastMode = null
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                },
-                                onDismiss = {
-                                    steerDraft = ""
-                                    steerDraftReasoningEffort = null
-                                    steerDraftFastMode = null
-                                },
-                                onEdit = {
-                                    composerEditText = steerDraft
-                                    steerDraft = ""
-                                },
-                            )
+                        if (canSteer && steerDrafts.isNotEmpty()) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 192.dp)
+                                    .verticalScroll(rememberScrollState()),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                steerDrafts.forEachIndexed { index, draft ->
+                                    SteerDraftBar(
+                                        text = draft.text,
+                                        onSteer = {
+                                            if (onSteerRequest(draft.text)) {
+                                                steerDrafts = steerDrafts.toMutableList().also {
+                                                    it.removeAt(index)
+                                                }
+                                                if (steerDrafts.isEmpty()) {
+                                                    steerDraftSessionId = null
+                                                    carrySteerDraftsToNextRun = false
+                                                }
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        },
+                                        onDismiss = {
+                                            steerDrafts = steerDrafts.toMutableList().also {
+                                                it.removeAt(index)
+                                            }
+                                            if (steerDrafts.isEmpty()) {
+                                                steerDraftSessionId = null
+                                                carrySteerDraftsToNextRun = false
+                                            }
+                                        },
+                                        onEdit = {
+                                            composerEditText = draft.text
+                                            steerDrafts = steerDrafts.toMutableList().also {
+                                                it.removeAt(index)
+                                            }
+                                            if (steerDrafts.isEmpty()) {
+                                                steerDraftSessionId = null
+                                                carrySteerDraftsToNextRun = false
+                                            }
+                                        },
+                                    )
+                                }
+                            }
                             Spacer(Modifier.height(6.dp))
                         }
                         RequestComposer(
@@ -618,10 +645,12 @@ fun AssistantScreen(
                             onEditTextConsumed = { composerEditText = null },
                             onSend = { request ->
                                 if (canSteer) {
-                                    steerDraft = request
+                                    steerDrafts = steerDrafts + PendingSteerDraft(
+                                        text = request,
+                                        reasoningEffort = reasoningEffort.codexValue,
+                                        fastMode = fastMode,
+                                    )
                                     steerDraftSessionId = activeSessionId
-                                    steerDraftReasoningEffort = reasoningEffort.codexValue
-                                    steerDraftFastMode = fastMode
                                     true
                                 } else {
                                     onRunRequest(
@@ -675,10 +704,9 @@ fun AssistantScreen(
                 TextButton(
                     onClick = {
                         showStartFreshConfirmation = false
-                        steerDraft = ""
+                        steerDrafts = emptyList()
                         steerDraftSessionId = null
-                        steerDraftReasoningEffort = null
-                        steerDraftFastMode = null
+                        carrySteerDraftsToNextRun = false
                         composerEditText = null
                         coordinator.reset()
                         onStartFresh()
@@ -2595,6 +2623,30 @@ internal fun toolActivityColor(
     DHD_LIST_ALLOWED_APPS_TOOL -> colors.accentPink
     else -> fallback
 }
+
+private data class PendingSteerDraft(
+    val text: String,
+    val reasoningEffort: String,
+    val fastMode: Boolean,
+)
+
+private val steerDraftsSaver = listSaver<List<PendingSteerDraft>, String>(
+    save = { drafts ->
+        drafts.flatMap { draft ->
+            listOf(draft.text, draft.reasoningEffort, draft.fastMode.toString())
+        }
+    },
+    restore = { saved ->
+        saved.chunked(3).mapNotNull { fields ->
+            if (fields.size != 3) return@mapNotNull null
+            PendingSteerDraft(
+                text = fields[0],
+                reasoningEffort = fields[1],
+                fastMode = fields[2].toBoolean(),
+            )
+        }
+    },
+)
 
 @Composable
 private fun SteerDraftBar(
