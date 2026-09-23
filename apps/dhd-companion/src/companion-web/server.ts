@@ -9,9 +9,12 @@ import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
 import {
+  isCompanionPlanEvent,
   isCompanionTokenUsageEvent,
   isCompanionToolCallEvent,
   type CompanionJsonValue,
+  type CompanionPlanEvent,
+  type CompanionPlanUpdatedEvent,
   type CompanionTokenUsageEvent,
   type CompanionToolCallEvent,
 } from "../companion-events.js";
@@ -38,6 +41,7 @@ import type {
   PhoneSnapshot,
   CompanionToolCall,
   CompanionToolCallResponse,
+  CompanionPlanSnapshot,
   CompanionTokenUsageSnapshot,
   DiscoveredPhoneSnapshot,
 } from "./api.js";
@@ -85,6 +89,7 @@ let phone: PhoneSnapshot | undefined;
 let lastError: string | undefined;
 let logEntries: CompanionLogEntry[] = [];
 let toolCalls: CompanionToolCall[] = [];
+let plan: CompanionPlanSnapshot | undefined;
 let tokenUsage: CompanionTokenUsageSnapshot | undefined;
 let bridgeCheckInFlight: Promise<BridgeCheckResult> | undefined;
 let lastAutomaticRediscoveryAt = 0;
@@ -185,6 +190,7 @@ function snapshot(): CompanionState {
     ...(lastError ? { lastError } : {}),
     logs: [...logEntries],
     toolCalls: [...toolCalls],
+    ...(plan ? { plan } : {}),
     ...(tokenUsage ? { tokenUsage } : {})
   };
 }
@@ -403,6 +409,24 @@ export function ingestCompanionTokenUsageEvent(value: unknown): void {
   publishState();
 }
 
+export function ingestCompanionPlanEvent(value: unknown): void {
+  if (!isCompanionPlanEvent(value)) return;
+  const event: CompanionPlanEvent = value;
+  if (event.phase === "reset") {
+    plan = undefined;
+  } else {
+    const updated: CompanionPlanUpdatedEvent = event;
+    plan = {
+      threadId: updated.threadId,
+      turnId: updated.turnId,
+      ...(updated.explanation ? { explanation: updated.explanation } : {}),
+      steps: [...updated.steps],
+      updatedAt: updated.timestamp
+    };
+  }
+  publishState();
+}
+
 function childOutput(child: ChildProcess, source: "companion" | "bridge"): void {
   for (const stream of [child.stdout, child.stderr]) {
     if (!stream) continue;
@@ -505,6 +529,7 @@ function startWorker(): CompanionState {
   child.on("message", (message) => {
     ingestCompanionToolCallEvent(message);
     ingestCompanionTokenUsageEvent(message);
+    ingestCompanionPlanEvent(message);
   });
   childOutput(child, "companion");
   child.once("error", (error) => {

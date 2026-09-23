@@ -3,6 +3,7 @@ import type {
   DiscoveredPhoneSnapshot,
   CompanionLogEntry,
   CompanionState,
+  CompanionPlanSnapshot,
   CompanionToolCall,
   CompanionToolCallDebugImage,
   CompanionToolCallImageContent
@@ -141,8 +142,13 @@ const elements = {
   toolCount: byId<HTMLSpanElement>("tool-count"),
   toolCountBadge: byId<HTMLSpanElement>("tool-count-badge"),
   clearToolCalls: byId<HTMLButtonElement>("clear-tool-calls"),
+  expandToolCalls: byId<HTMLInputElement>("expand-tool-calls"),
   toolList: byId<HTMLDivElement>("tool-list"),
   toolScrollContainer: byId<HTMLDivElement>("tool-scroll-container"),
+  agentPlan: byId<HTMLElement>("agent-plan"),
+  agentPlanProgress: byId<HTMLSpanElement>("agent-plan-progress"),
+  agentPlanExplanation: byId<HTMLParagraphElement>("agent-plan-explanation"),
+  agentPlanSteps: byId<HTMLOListElement>("agent-plan-steps"),
   toolImageDialog: byId<HTMLDialogElement>("tool-image-dialog"),
   toolImageDialogGallery: byId<HTMLDivElement>("tool-image-dialog-gallery"),
   toolImageDialogImage: byId<HTMLImageElement>("tool-image-dialog-image"),
@@ -151,6 +157,7 @@ const elements = {
   discoverPhones: byId<HTMLButtonElement>("discover-phones"),
   discoveryStatus: byId<HTMLSpanElement>("discovery-status"),
   discoveredPhones: byId<HTMLDivElement>("discovered-phones"),
+  toolsTab: byId<HTMLElement>("tab-tools"),
   check: byId<HTMLButtonElement>("check-connection"),
   logList: byId<HTMLDivElement>("log-list"),
   logScrollContainer: byId<HTMLDivElement>("log-scroll-container"),
@@ -555,7 +562,7 @@ function renderToolCall(
   call: CompanionToolCall,
   open: boolean,
   openPayloadKeys: Set<string>,
-  existingCallIds: Set<string>,
+  existingPayloadKeys: Set<string>,
 ): HTMLDetailsElement {
   const card = document.createElement("details");
   card.className = `tool-call-card ${call.status}`;
@@ -595,24 +602,26 @@ function renderToolCall(
   ].join("  ·  ");
   body.append(metadata);
 
-  const defaultPayloadOpen = !existingCallIds.has(call.id);
+  const argumentsKey = `${call.id}:Arguments`;
   body.append(renderPayload(
     "Arguments",
     call.arguments,
-    openPayloadKeys.has(`${call.id}:Arguments`) || defaultPayloadOpen,
+    openPayloadKeys.has(argumentsKey) || !existingPayloadKeys.has(argumentsKey),
   ));
   if (call.rawArguments) {
+    const rawArgumentsKey = `${call.id}:Raw invalid arguments`;
     body.append(renderPayload(
       "Raw invalid arguments",
       call.rawArguments,
-      openPayloadKeys.has(`${call.id}:Raw invalid arguments`),
+      openPayloadKeys.has(rawArgumentsKey) || !existingPayloadKeys.has(rawArgumentsKey),
     ));
   }
   if (call.response) {
+    const responseKey = `${call.id}:Response`;
     body.append(renderPayload(
       "Response",
       call.response.structuredContent ?? {},
-      openPayloadKeys.has(`${call.id}:Response`) || defaultPayloadOpen,
+      openPayloadKeys.has(responseKey) || !existingPayloadKeys.has(responseKey),
     ));
   } else {
     const pending = document.createElement("div");
@@ -647,6 +656,9 @@ function renderToolCall(
 }
 
 let renderedToolCallsSignature: string | undefined;
+const TOOL_CALLS_EXPANDED_KEY = "dhd_companion_tool_calls_expanded";
+let expandToolCalls = localStorage.getItem(TOOL_CALLS_EXPANDED_KEY) === "true";
+elements.expandToolCalls.checked = expandToolCalls;
 
 function renderToolCalls(calls: CompanionToolCall[]): void {
   const signature = JSON.stringify(calls);
@@ -656,24 +668,24 @@ function renderToolCalls(calls: CompanionToolCall[]): void {
   const previousOuterScrollTop = elements.toolScrollContainer.scrollTop;
   const previousOuterScrollLeft = elements.toolScrollContainer.scrollLeft;
   const payloadScrollPositions = new Map<string, { top: number; left: number }>();
+  const existingPayloadKeys = new Set<string>();
   for (const payload of elements.toolList.querySelectorAll<HTMLDetailsElement>(".tool-payload")) {
     const callId = payload.closest<HTMLDetailsElement>(".tool-call-card")?.dataset.callId;
     const title = payload.dataset.payloadTitle;
     const content = payload.querySelector<HTMLElement>(".tool-payload-content");
-    if (callId && title && content) {
-      payloadScrollPositions.set(`${callId}:${title}`, {
-        top: content.scrollTop,
-        left: content.scrollLeft,
-      });
+    if (callId && title) {
+      const key = `${callId}:${title}`;
+      existingPayloadKeys.add(key);
+      if (content) {
+        payloadScrollPositions.set(key, {
+          top: content.scrollTop,
+          left: content.scrollLeft,
+        });
+      }
     }
   }
 
   const existingCards = [...elements.toolList.querySelectorAll<HTMLDetailsElement>(".tool-call-card")];
-  const existingCallIds = new Set(
-    existingCards
-      .map((card) => card.dataset.callId)
-      .filter((id): id is string => Boolean(id)),
-  );
   const openCallIds = new Set(
     existingCards
       .filter((card) => card.open)
@@ -704,11 +716,9 @@ function renderToolCalls(calls: CompanionToolCall[]): void {
     return;
   }
 
-  const latestId = calls.at(-1)?.id;
   for (const call of calls) {
-    const shouldOpen = openCallIds.has(call.id) ||
-      (!existingCallIds.has(call.id) && call.id === latestId);
-    elements.toolList.append(renderToolCall(call, shouldOpen, openPayloadKeys, existingCallIds));
+    const shouldOpen = expandToolCalls || openCallIds.has(call.id);
+    elements.toolList.append(renderToolCall(call, shouldOpen, openPayloadKeys, existingPayloadKeys));
   }
 
   // Live state updates must never move the user's viewport. New calls remain
@@ -724,6 +734,53 @@ function renderToolCalls(calls: CompanionToolCall[]): void {
       content.scrollTop = position.top;
       content.scrollLeft = position.left;
     }
+  }
+}
+
+let renderedPlanSignature: string | undefined;
+
+function renderPlan(plan: CompanionPlanSnapshot | undefined): void {
+  const signature = JSON.stringify(plan ?? null);
+  if (signature === renderedPlanSignature) return;
+  renderedPlanSignature = signature;
+
+  elements.agentPlan.hidden = !plan;
+  elements.toolsTab.classList.toggle("has-plan", Boolean(plan));
+  if (!plan) return;
+
+  const completedCount = plan.steps.filter((step) => step.status === "completed").length;
+  elements.agentPlanProgress.textContent = plan.steps.length === 0
+    ? "No steps"
+    : completedCount === plan.steps.length
+      ? "Complete"
+      : `${completedCount}/${plan.steps.length} complete`;
+  elements.agentPlanExplanation.textContent = plan.explanation ?? "";
+  elements.agentPlanExplanation.hidden = !plan.explanation;
+  elements.agentPlanSteps.replaceChildren();
+
+  for (const [index, step] of plan.steps.entries()) {
+    const item = document.createElement("li");
+    item.className = `agent-plan-step ${step.status}`;
+
+    const number = document.createElement("span");
+    number.className = "agent-plan-step-number font-mono";
+    number.textContent = step.status === "completed" ? "✓" : String(index + 1);
+    number.setAttribute("aria-hidden", "true");
+
+    const label = document.createElement("span");
+    label.className = "agent-plan-step-label";
+    label.textContent = step.step;
+
+    const status = document.createElement("span");
+    status.className = `agent-plan-step-status font-mono ${step.status}`;
+    status.textContent = step.status === "in_progress"
+      ? "In progress"
+      : step.status === "completed"
+        ? "Done"
+        : "Pending";
+
+    item.append(number, label, status);
+    elements.agentPlanSteps.append(item);
   }
 }
 
@@ -883,6 +940,7 @@ function render(next: CompanionState): void {
   renderDiscoveredPhones();
 
   renderLogs(next.logs);
+  renderPlan(next.plan);
   renderToolCalls(next.toolCalls);
   renderTokenUsage(next.tokenUsage, isPhoneActive);
 }
@@ -1123,6 +1181,14 @@ if (elements.clearToolCalls) {
     }
   });
 }
+
+elements.expandToolCalls.addEventListener("change", () => {
+  expandToolCalls = elements.expandToolCalls.checked;
+  localStorage.setItem(TOOL_CALLS_EXPANDED_KEY, String(expandToolCalls));
+  for (const card of elements.toolList.querySelectorAll<HTMLDetailsElement>(".tool-call-card")) {
+    card.open = expandToolCalls;
+  }
+});
 
 elements.closeToolImageDialog.addEventListener("click", () => {
   elements.toolImageDialog.close();

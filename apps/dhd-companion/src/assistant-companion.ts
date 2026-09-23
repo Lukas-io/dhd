@@ -12,9 +12,11 @@ import {
   type PhoneAssistantToolResult,
 } from "./dhd-tools.js";
 import {
+  emitCompanionPlanEvent,
   emitCompanionTokenUsageEvent,
   emitCompanionToolCallEvent,
   type CompanionJsonValue,
+  type CompanionPlanUpdatedEvent,
   type CompanionTokenUsageEvent,
   type CompanionToolCallEvent,
 } from "./companion-events.js";
@@ -282,6 +284,7 @@ export class CodexAppServerClient {
   ): Promise<TurnResult> {
     const logger = timing ?? new PhaseTimer("codex-turn");
     this.turnRequested = true;
+    emitCompanionPlanEvent({ type: "dhd_plan", phase: "reset" });
     this.activeTiming = logger;
     this.userMessageLogged = false;
     this.interruptRequested = false;
@@ -651,6 +654,15 @@ export class CodexAppServerClient {
     if (!completion || !message.method) return;
     logServerNotification(message);
     if (message.method === "thread/tokenUsage/updated") return;
+    if (message.method === "turn/plan/updated") {
+      const planEvent = extractCompanionPlanUpdatedEvent(
+        message,
+        this.activeDhdThreadId ?? this.activeThreadId,
+        this.activeTurnId,
+      );
+      if (planEvent) emitCompanionPlanEvent(planEvent);
+      return;
+    }
     if (message.method === "turn/started") {
       this.activeTurnId = extractTurnId(message.params) || this.activeTurnId;
       this.activeTiming?.log(
@@ -2278,6 +2290,50 @@ function resolveCodexBin(): string {
   }
   // The unversioned desktop-app binary can lag behind the active CLI.
   return "codex";
+}
+
+export function extractCompanionPlanUpdatedEvent(
+  value: unknown,
+  threadId: string | null,
+  expectedTurnId: string | null,
+  timestamp = Date.now(),
+): CompanionPlanUpdatedEvent | null {
+  const message = extractRecord(value);
+  if (message?.method !== "turn/plan/updated" || !threadId) return null;
+
+  const params = extractRecord(message.params);
+  const turnId = typeof params?.turnId === "string" ? params.turnId : "";
+  if (!turnId || (expectedTurnId && expectedTurnId !== turnId)) return null;
+  if (!Array.isArray(params?.plan)) return null;
+
+  const steps: CompanionPlanUpdatedEvent["steps"] = [];
+  for (const rawStep of params.plan) {
+    const step = extractRecord(rawStep);
+    const text = typeof step?.step === "string" ? step.step : null;
+    const rawStatus = step?.status;
+    const status =
+      rawStatus === "pending"
+        ? "pending"
+        : rawStatus === "inProgress" || rawStatus === "in_progress"
+          ? "in_progress"
+          : rawStatus === "completed"
+            ? "completed"
+            : null;
+    if (text === null || status === null) return null;
+    steps.push({ step: text, status });
+  }
+
+  const explanation =
+    typeof params.explanation === "string" ? params.explanation : undefined;
+  return {
+    type: "dhd_plan",
+    phase: "updated",
+    threadId,
+    turnId,
+    ...(explanation ? { explanation } : {}),
+    steps,
+    timestamp,
+  };
 }
 
 function resolveCodexHome(): string {

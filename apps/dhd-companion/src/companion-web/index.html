@@ -195,6 +195,18 @@
 
         <!-- TAB 3: TOOL INSPECTOR -->
         <section id="tab-tools" class="tab-panel">
+          <aside class="agent-plan-sidebar">
+            <section id="agent-plan" class="agent-plan" aria-labelledby="agent-plan-title" hidden>
+              <div class="agent-plan-header">
+                <div class="agent-plan-heading">
+                  <span class="section-tag" id="agent-plan-title">Codex plan</span>
+                  <span id="agent-plan-progress" class="agent-plan-progress font-mono"></span>
+                </div>
+              </div>
+              <p id="agent-plan-explanation" class="agent-plan-explanation" hidden></p>
+              <ol id="agent-plan-steps" class="agent-plan-steps"></ol>
+            </section>
+          </aside>
           <div class="panel tools-panel">
             <div class="panel-header console-header">
               <div class="panel-header-left">
@@ -202,6 +214,16 @@
                 <span class="log-count font-mono" id="tool-count">0 calls</span>
               </div>
               <div class="console-controls">
+                <label class="tool-calls-toggle" title="Expand or collapse all tool calls">
+                  <span id="tool-calls-toggle-label">Expand calls</span>
+                  <input
+                    id="expand-tool-calls"
+                    type="checkbox"
+                    role="switch"
+                    aria-labelledby="tool-calls-toggle-label"
+                  >
+                  <span class="tool-calls-switch" aria-hidden="true"></span>
+                </label>
                 <div class="token-usage-popover" id="token-usage-popover">
                   <button
                     id="token-usage-trigger"

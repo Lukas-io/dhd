@@ -1,5 +1,6 @@
 import type {
   CompanionJsonValue,
+  CompanionPlanStep,
   CompanionTokenUsageMetrics
 } from "../companion-events.js";
 
@@ -86,6 +87,14 @@ export interface CompanionTokenUsageSnapshot extends CompanionTokenUsageMetrics 
   serviceTier?: string;
 }
 
+export interface CompanionPlanSnapshot {
+  threadId: string;
+  turnId: string;
+  explanation?: string;
+  steps: CompanionPlanStep[];
+  updatedAt: number;
+}
+
 export interface CompanionState {
   processStatus: CompanionProcessStatus;
   bridgeStatus: BridgeStatus;
@@ -94,6 +103,7 @@ export interface CompanionState {
   lastError?: string;
   logs: CompanionLogEntry[];
   toolCalls: CompanionToolCall[];
+  plan?: CompanionPlanSnapshot;
   tokenUsage?: CompanionTokenUsageSnapshot;
 }
 
