@@ -4,6 +4,7 @@ package com.phonecontrol.assistant
 enum class PermissionSetupStep {
     NOTIFICATIONS,
     OVERLAY,
+    APP_ACCESS,
     COMPLETE,
 }
 
@@ -26,10 +27,11 @@ internal fun firstRunPermissionSetupStep(
     notificationStepHandled: Boolean = false,
 ): PermissionSetupStep? {
     if (onboardingCompleted) return null
-    return nextPermissionSetupStep(
+    val nextStep = nextPermissionSetupStep(
         sdkInt = sdkInt,
         notificationGranted = notificationGranted,
         overlayGranted = overlayGranted,
         notificationStepHandled = notificationStepHandled,
-    ).takeUnless { it == PermissionSetupStep.COMPLETE }
+    )
+    return if (nextStep == PermissionSetupStep.COMPLETE) PermissionSetupStep.APP_ACCESS else nextStep
 }

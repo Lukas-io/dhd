@@ -3490,7 +3490,6 @@ fun SettingsScreen(
     onOpenPairing: () -> Unit,
     onOpenApprovedApps: () -> Unit,
     onOpenCompanion: () -> Unit,
-    onOpenPermissionSetup: () -> Unit,
     overlayEnabled: Boolean,
     overlayPermissionGranted: Boolean,
     onSetOverlayEnabled: (Boolean) -> Unit,
@@ -3785,47 +3784,6 @@ fun SettingsScreen(
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Column {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
-                                .clickable { onOpenPermissionSetup() }
-                                .padding(horizontal = 16.dp, vertical = 14.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_info),
-                                contentDescription = "Permission guide",
-                                tint = colors.textPrimary,
-                                modifier = Modifier.size(22.dp),
-                            )
-                            Column(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .padding(start = 14.dp),
-                            ) {
-                                Text(
-                                    text = "Permission guide",
-                                    fontWeight = FontWeight.Medium,
-                                    color = colors.textPrimary,
-                                    fontSize = 15.sp,
-                                )
-                                Text(
-                                    text = "Notifications and floating DHD button",
-                                    fontSize = 12.sp,
-                                    color = colors.textSecondary,
-                                )
-                            }
-                            Icon(
-                                painter = painterResource(R.drawable.ic_chevron_right),
-                                contentDescription = "Open permission guide",
-                                tint = colors.textSecondary,
-                                modifier = Modifier.size(18.dp),
-                            )
-                        }
-
-                        HorizontalDivider(thickness = 2.dp, color = colors.cardDivider)
-
                         // Display-over-other-apps overlay
                         Row(
                             modifier = Modifier
@@ -5385,8 +5343,8 @@ fun ApprovedAppsScreen(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Icon(
-                            painter = painterResource(R.drawable.ic_shield),
-                            contentDescription = "Full access",
+                            painter = painterResource(R.drawable.ic_apps),
+                            contentDescription = "Apps",
                             tint = colors.textPrimary,
                             modifier = Modifier.size(22.dp),
                         )
@@ -5429,7 +5387,7 @@ fun ApprovedAppsScreen(
 
             // Per-App List Section
             item {
-                SettingsSectionHeader(if (isFullAccess) "Apps allowlist (Full access active)" else "Allowed apps")
+                SettingsSectionHeader("Allowed apps")
                 if (filteredApps.isEmpty()) {
                     Text(
                         text = if (searchQuery.isBlank()) "No launchable user apps found." else "No matching apps found.",
@@ -5453,23 +5411,15 @@ fun ApprovedAppsScreen(
                                         .padding(horizontal = 16.dp, vertical = 12.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = app.label,
-                                            fontWeight = FontWeight.Medium,
-                                            color = colors.textPrimary,
-                                            fontSize = 14.sp,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                        Text(
-                                            text = app.packageName,
-                                            fontSize = 12.sp,
-                                            color = colors.textSecondary,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                    }
+                                    Text(
+                                        text = app.label,
+                                        modifier = Modifier.weight(1f),
+                                        fontWeight = FontWeight.Medium,
+                                        color = colors.textPrimary,
+                                        fontSize = 14.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
                                     Switch(
                                         checked = enabled,
                                         enabled = !isFullAccess,

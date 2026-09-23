@@ -200,7 +200,6 @@ fun PhoneControlApp(
     onPermissionSetupPrimaryAction: () -> Unit = {},
     onShowOverlayPermissionSetup: () -> Unit = {},
     onPermissionSetupBack: () -> Unit = {},
-    onOpenPermissionSetup: () -> Unit = {},
     onNotificationVisibilityChanged: (mainConversationVisible: Boolean, attentionVisible: Boolean) -> Unit = { _, _ -> },
 ) {
     val context = LocalContext.current
@@ -416,6 +415,8 @@ fun PhoneControlApp(
                 if (permissionSetupStep != null) {
                     PermissionOnboardingScreen(
                         step = permissionSetupStep,
+                        apps = apps,
+                        permissions = permissions,
                         onPrimaryAction = onPermissionSetupPrimaryAction,
                         onShowOverlayStep = onShowOverlayPermissionSetup,
                         onBack = onPermissionSetupBack,
@@ -484,9 +485,6 @@ fun PhoneControlApp(
                             overlayEnabled = overlayEnabled,
                             overlayPermissionGranted = overlayPermissionGranted,
                             onSetOverlayEnabled = onSetOverlayEnabled,
-                            onOpenPermissionSetup = {
-                                onOpenPermissionSetup()
-                            },
                             onBack = { navController.popBackStack() },
                         )
                     }
@@ -534,6 +532,8 @@ fun PhoneControlApp(
                     composable(AppRoutes.PERMISSION_SETUP) {
                         PermissionOnboardingScreen(
                             step = permissionSetupStep ?: PermissionSetupStep.COMPLETE,
+                            apps = apps,
+                            permissions = permissions,
                             onPrimaryAction = onPermissionSetupPrimaryAction,
                             onShowOverlayStep = onShowOverlayPermissionSetup,
                             onBack = onPermissionSetupBack,

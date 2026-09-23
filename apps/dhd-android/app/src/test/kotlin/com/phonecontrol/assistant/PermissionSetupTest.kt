@@ -89,9 +89,9 @@ class PermissionSetupTest {
     }
 
     @Test
-    fun returnsNoOutstandingStepWhenAllRequiredPermissionsAreHandled() {
+    fun showsAppAccessAfterAllRequiredPermissionsAreHandled() {
         assertEquals(
-            null,
+            PermissionSetupStep.APP_ACCESS,
             firstRunPermissionSetupStep(
                 onboardingCompleted = false,
                 sdkInt = 35,

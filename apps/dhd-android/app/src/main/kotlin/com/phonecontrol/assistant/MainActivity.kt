@@ -265,7 +265,6 @@ class MainActivity : ComponentActivity() {
                 onPermissionSetupPrimaryAction = ::handlePermissionSetupPrimaryAction,
                 onShowOverlayPermissionSetup = ::showOverlayPermissionSetup,
                 onPermissionSetupBack = ::navigateBackInPermissionSetup,
-                onOpenPermissionSetup = ::openPermissionSetup,
             )
         }
     }
@@ -376,13 +375,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun openPermissionSetup() {
-        notificationSetupStepHandled = false
-        persistNotificationSetupStepHandled()
-        permissionSetupStep = currentPermissionSetupStep()
-            .takeUnless { it == PermissionSetupStep.COMPLETE }
-    }
-
     private fun handlePermissionSetupPrimaryAction() {
         when (permissionSetupStep) {
             PermissionSetupStep.NOTIFICATIONS -> {
@@ -396,12 +388,13 @@ class MainActivity : ComponentActivity() {
             }
             PermissionSetupStep.OVERLAY -> {
                 if (Settings.canDrawOverlays(this)) {
-                    dismissPermissionSetup()
+                    updatePermissionSetupStep()
                 } else {
                     pendingOverlayEnable = true
                     openOverlayPermissionSettings()
                 }
             }
+            PermissionSetupStep.APP_ACCESS -> dismissPermissionSetup()
             PermissionSetupStep.COMPLETE -> dismissPermissionSetup()
             null -> Unit
         }
@@ -415,6 +408,7 @@ class MainActivity : ComponentActivity() {
     private fun navigateBackInPermissionSetup() {
         when (permissionSetupStep) {
             PermissionSetupStep.OVERLAY -> permissionSetupStep = PermissionSetupStep.NOTIFICATIONS
+            PermissionSetupStep.APP_ACCESS,
             PermissionSetupStep.NOTIFICATIONS,
             PermissionSetupStep.COMPLETE,
             -> finish()
@@ -424,7 +418,9 @@ class MainActivity : ComponentActivity() {
 
     private fun dismissPermissionSetup() {
         pendingOverlayEnable = false
-        if (currentPermissionSetupStep() == PermissionSetupStep.COMPLETE) {
+        if (permissionSetupStep == PermissionSetupStep.APP_ACCESS ||
+            currentPermissionSetupStep() == PermissionSetupStep.COMPLETE
+        ) {
             markFirstRunPermissionSetupCompleted()
         }
         permissionSetupStep = null
@@ -440,8 +436,7 @@ class MainActivity : ComponentActivity() {
     private fun updatePermissionSetupStep() {
         val nextStep = currentPermissionSetupStep()
         if (nextStep == PermissionSetupStep.COMPLETE) {
-            markFirstRunPermissionSetupCompleted()
-            permissionSetupStep = null
+            permissionSetupStep = PermissionSetupStep.APP_ACCESS
         } else {
             permissionSetupStep = nextStep
         }
@@ -524,7 +519,7 @@ class MainActivity : ComponentActivity() {
             pendingOverlayEnable = false
             if (granted) {
                 enableOverlay()
-                dismissPermissionSetup()
+                updatePermissionSetupStep()
             }
         } else if (overlayEnabled) {
             startService(
