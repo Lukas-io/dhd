@@ -800,13 +800,15 @@ class DhdAdbController(context: Context) {
         maintenanceRetryJob = scope.launch {
             try {
                 delay(delayMs)
-                if (!currentCoroutineContext().isActive || !started.get() || !isPaired()) return@launch
-                if (_status.value.state != DeveloperConnectionState.READY) {
-                    beginMaintenanceProbe()
-                }
             } finally {
+                // The probe can fail immediately and schedule another retry.
+                // Release this timer's gate before starting that probe.
                 maintenanceRetryGate.set(false)
                 maintenanceRetryJob = null
+            }
+            if (!currentCoroutineContext().isActive || !started.get() || !isPaired()) return@launch
+            if (_status.value.state != DeveloperConnectionState.READY) {
+                beginMaintenanceProbe()
             }
         }
     }
@@ -836,7 +838,7 @@ class DhdAdbController(context: Context) {
         const val CONNECT_DISCOVERY_TIMEOUT_MS = 7_000L
         const val PAIRING_DISCOVERY_TIMEOUT_MS = 30_000L
         const val MAINTENANCE_HEALTH_INTERVAL_MS = 15_000L
-        val MAINTENANCE_RETRY_DELAYS_MS = longArrayOf(5_000L, 15_000L, 30_000L)
+        val MAINTENANCE_RETRY_DELAYS_MS = longArrayOf(2_000L, 3_000L, 5_000L)
         const val PAIRING_SEARCHING_MESSAGE =
             "Open Wireless debugging → Pair device with pairing code. DHD is listening for the pairing service."
         const val PAIRING_SERVICE_FOUND_MESSAGE =

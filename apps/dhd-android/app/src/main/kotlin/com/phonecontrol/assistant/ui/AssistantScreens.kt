@@ -234,7 +234,7 @@ internal fun ConversationExpiryDialog(
                 }
                 Text(
                     "This chat has been inactive for 3 hours and will clear automatically. " +
-                        "Keep it to continue this conversation.",
+                            "Keep it to continue this conversation.",
                     fontSize = 14.sp,
                     lineHeight = 20.sp,
                 )
@@ -297,7 +297,7 @@ fun AssistantScreen(
         companionConnected = companionConnected,
     )
     val phoneRecoveryShownAtTop = showTopRecoveryBanner &&
-        (developerStatus.requiresUserAction || state.showsPhoneAccessRecovery())
+            (developerStatus.requiresUserAction || state.showsPhoneAccessRecovery())
     val companionRecoveryShownAtTop = showTopRecoveryBanner && !companionConnected
     val keyboardVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     val runningState = state as? SessionState.Running
@@ -363,7 +363,7 @@ fun AssistantScreen(
     }
     val recentTimeline = timeline.filter { item ->
         item.timestampEpochMs >= recentCutoff ||
-            (active && item.belongsTo(activeTaskRunIds))
+                (active && item.belongsTo(activeTaskRunIds))
     }
 
     Scaffold(
@@ -526,8 +526,8 @@ fun AssistantScreen(
                         EmptyChat(
                             modifier = Modifier.fillMaxSize(),
                             topReservedSpacePx = if (showTopRecoveryBanner) topRecoverySlotHeightPx else 0,
-                            onSelectPrompt = {
-                                prompt -> onRunRequest(
+                            onSelectPrompt = { prompt ->
+                                onRunRequest(
                                     prompt,
                                     DHD_CONVERSATION_ID,
                                     reasoningEffort.codexValue,
@@ -695,7 +695,7 @@ fun AssistantScreen(
             text = {
                 Text(
                     "This clears the DHD conversation timeline and rotates its stored Codex thread " +
-                        "binding. App permissions and DHD's local phone connection remain unchanged.",
+                            "binding. App permissions and DHD's local phone connection remain unchanged.",
                     fontSize = 14.sp,
                     lineHeight = 20.sp,
                 )
@@ -723,6 +723,7 @@ fun AssistantScreen(
         )
     }
 }
+
 @Composable
 private fun EmptyChat(
     modifier: Modifier = Modifier,
@@ -822,8 +823,8 @@ private fun EmptyChatContent(
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             PromptSuggestionChip(
-                text = "Call my Mom",
-                onClick = { onSelectPrompt("Call my Mom") },
+                text = "Get me jollof rice and chicken under 6k",
+                onClick = { onSelectPrompt("Get me jollof rice and chicken under 6k") },
             )
             PromptSuggestionChip(
                 text = "Play me \"Jesus be the name\" on Spotify",
@@ -921,6 +922,7 @@ internal fun groupTimeline(
                     builder.assistantMessages += item
                 }
             }
+
             is TimelineItem.Activity -> {
                 // The activity feed is a DHD tool trace, not a general-purpose
                 // session log. Keep only physical action events and omit
@@ -974,8 +976,8 @@ private fun TaskGroup.merge(other: TaskGroup): TaskGroup = copy(
 
 private fun TimelineItem.Activity.isDhdActionActivity(): Boolean =
     !status.equals("confirmation", ignoreCase = true) &&
-        !toolName.equals("dhd_close_display", ignoreCase = true) &&
-        !toolName.equals("close_display", ignoreCase = true)
+            !toolName.equals("dhd_close_display", ignoreCase = true) &&
+            !toolName.equals("close_display", ignoreCase = true)
 
 internal const val MAX_VISIBLE_TRACE_ACTIVITIES = 5
 
@@ -1023,17 +1025,17 @@ private fun TimelineItem.Activity.isInFlight(): Boolean =
 private fun TimelineItem.Activity.matchesLiveTool(toolCall: DhdToolCall): Boolean {
     val activityStatus = status.lowercase()
     val sameTool = toolName?.equals(toolCall.toolName, ignoreCase = true) == true ||
-        (toolCall.toolName.equals(DHD_OPEN_APP_TOOL, ignoreCase = true) &&
-            toolName.equals(DHD_EXECUTE_TOOL, ignoreCase = true) &&
-            actionType.equals("OPEN_APP", ignoreCase = true))
+            (toolCall.toolName.equals(DHD_OPEN_APP_TOOL, ignoreCase = true) &&
+                    toolName.equals(DHD_EXECUTE_TOOL, ignoreCase = true) &&
+                    actionType.equals("OPEN_APP", ignoreCase = true))
     return runId == toolCall.sessionId &&
-        sameTool &&
-        createdAtEpochMs >= toolCall.startedAtEpochMs &&
-        // The phone records ACTION_SUCCEEDED/ACTION_FAILED before the bridge
-        // finishes the outer live tool call. Treat that terminal row as the
-        // same call so the UI never renders a green persisted row alongside
-        // its cyan synthetic counterpart.
-        activityStatus in setOf("info", "proposed", "running", "completed", "failed", "attention")
+            sameTool &&
+            createdAtEpochMs >= toolCall.startedAtEpochMs &&
+            // The phone records ACTION_SUCCEEDED/ACTION_FAILED before the bridge
+            // finishes the outer live tool call. Treat that terminal row as the
+            // same call so the UI never renders a green persisted row alongside
+            // its cyan synthetic counterpart.
+            activityStatus in setOf("info", "proposed", "running", "completed", "failed", "attention")
 }
 
 @Composable
@@ -1089,14 +1091,14 @@ private fun ConversationTimeline(
     // preview attached to its historical task group while the display is
     // retained; stopping the run only removes action authority.
     val previewBelongsToCurrentTimeline = state.sessionIdOrNullForUi() != null &&
-        previewState?.let { preview ->
-            preview.belongsToRun(state.sessionIdOrNullForUi()) &&
-                groups.any { group ->
-                    group.runIds.any { runId -> preview.belongsToGroup(runId) }
-                }
-        } == true
+            previewState?.let { preview ->
+                preview.belongsToRun(state.sessionIdOrNullForUi()) &&
+                        groups.any { group ->
+                            group.runIds.any { runId -> preview.belongsToGroup(runId) }
+                        }
+            } == true
     val previewExpandedInViewer = previewBelongsToCurrentTimeline &&
-        previewState?.isExpanded(expandedPreviewSessionKey) == true
+            previewState?.isExpanded(expandedPreviewSessionKey) == true
     val inlinePreviewVisible = previewBelongsToCurrentTimeline && !previewExpandedInViewer
     LaunchedEffect(
         groups.lastOrNull()?.id,
@@ -1157,7 +1159,7 @@ private fun ConversationTimeline(
                     },
                     expandedPreviewSessionKey = expandedPreviewSessionKey,
                     active = state.isActive() &&
-                        state.sessionIdOrNullForUi()?.let(group.runIds::contains) == true,
+                            state.sessionIdOrNullForUi()?.let(group.runIds::contains) == true,
                 )
             }
         }
@@ -1282,11 +1284,11 @@ private fun TaskGroupCard(
         }
         val previewVisibleForGroup = taskPreviewState?.let { preview ->
             group.runIds.any { runId -> preview.belongsToGroup(runId) } &&
-                !preview.isExpanded(expandedPreviewSessionKey)
+                    !preview.isExpanded(expandedPreviewSessionKey)
         } == true
         val previewExpandedForGroup = taskPreviewState?.let { preview ->
             group.runIds.any { runId -> preview.belongsToGroup(runId) } &&
-                preview.isExpanded(expandedPreviewSessionKey)
+                    preview.isExpanded(expandedPreviewSessionKey)
         } == true
         if (previewVisibleForGroup) {
             // Keep the preview outside any SelectionContainer. Its native
@@ -1329,10 +1331,11 @@ private fun TaskGroupCard(
                         onAcknowledgeAttention = onAcknowledgeAttention,
                     )
                 }
+
                 is SessionState.Paused -> if (
                     state.attentionReason != null &&
                     !(phoneRecoveryShownAtTop &&
-                        state.attentionActionLabel.equals("View instructions", ignoreCase = true))
+                            state.attentionActionLabel.equals("View instructions", ignoreCase = true))
                 ) {
                     AttentionRecoveryCard(
                         reason = state.attentionReason,
@@ -1348,6 +1351,7 @@ private fun TaskGroupCard(
                         currentPurpose = state.currentPurpose,
                     )
                 }
+
                 else -> Unit
             }
         }
@@ -1411,7 +1415,7 @@ private fun RunningStatusIndicator(
     // completing a biometric/PIN prompt.
     if (currentPurpose.equals("Needs your attention", ignoreCase = true)) {
         val phoneAccessInstructionsAtTop = phoneAccessRecoveryShownAtTop &&
-            attentionActionLabel.equals("View instructions", ignoreCase = true)
+                attentionActionLabel.equals("View instructions", ignoreCase = true)
         if (!phoneAccessInstructionsAtTop) {
             AttentionRecoveryCard(
                 reason = attentionReason,
@@ -1831,7 +1835,7 @@ private fun AttentionRecoveryCard(
 ) {
     val colors = LocalAssistantColors.current
     val usesPhoneAccessInstructions = actionLabel.equals("View instructions", ignoreCase = true) &&
-        onOpenPhoneAccess != null
+            onOpenPhoneAccess != null
     if (usesPhoneAccessInstructions) {
         PhoneAccessPausedCard(
             title = phoneAccessTitle,
@@ -2015,15 +2019,20 @@ internal fun accumulatedElapsedSeconds(
     elapsedBeforeStartMs: Long,
     nowEpochMs: Long,
 ): Long = (
-    elapsedBeforeStartMs.coerceAtLeast(0L) +
-        (nowEpochMs - startedAtEpochMs).coerceAtLeast(0L)
-    ) / 1_000L
+        elapsedBeforeStartMs.coerceAtLeast(0L) +
+                (nowEpochMs - startedAtEpochMs).coerceAtLeast(0L)
+        ) / 1_000L
 
 private fun thinkingDetail(currentPurpose: String, elapsedSeconds: Long): String = when {
     currentPurpose.equals("Preparing request", ignoreCase = true) && elapsedSeconds >= COMPANION_WAIT_CALLOUT_SECONDS ->
         "Waiting for the desktop companion"
+
     currentPurpose.equals("Preparing request", ignoreCase = true) -> "Connecting to the desktop companion"
-    currentPurpose.equals("Codex is planning", ignoreCase = true) || currentPurpose.equals("DHD is planning", ignoreCase = true) -> "Thinking…"
+    currentPurpose.equals("Codex is planning", ignoreCase = true) || currentPurpose.equals(
+        "DHD is planning",
+        ignoreCase = true
+    ) -> "Thinking…"
+
     else -> currentPurpose.ifBlank { "Preparing the next step" }
 }
 
@@ -2294,7 +2303,7 @@ private fun AnimatedCollapsedTrace(
         }
         if (incomingRows.isNotEmpty()) {
             rows = previousRows.map { it.copy(visible = true) } +
-                incomingRows.map { AnimatedTraceRow(it) }
+                    incomingRows.map { AnimatedTraceRow(it) }
         }
 
         // Let the new tool call arrive before the displaced row is moved into
@@ -2421,7 +2430,7 @@ private fun WorkedTraceSection(
                             onDoubleTap = { onToggleExpand() },
                         )
                     }
-                .padding(top = 8.dp, bottom = 4.dp),
+                    .padding(top = 8.dp, bottom = 4.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 activities.forEach { activity ->
@@ -2759,11 +2768,9 @@ private fun SteerMessageBubble(message: TimelineItem.Message) {
 }
 
 
-
 private fun activityLabel(activity: TimelineItem.Activity): String = activity.purpose
     .trim()
     .ifBlank { "Working on the phone" }
-
 
 
 @Composable
@@ -3075,7 +3082,9 @@ internal fun FastModeButton(
             Icon(
                 painter = painterResource(R.drawable.ic_fast_mode),
                 contentDescription = null,
-                tint = if (selected) Color.White else if (enabled) colors.textPrimary else colors.textSecondary.copy(alpha = 0.45f),
+                tint = if (selected) Color.White else if (enabled) colors.textPrimary else colors.textSecondary.copy(
+                    alpha = 0.45f
+                ),
                 modifier = Modifier.size(18.dp),
             )
         }
@@ -3338,7 +3347,8 @@ internal fun ReasoningEffortTrack(
 
                 // Active blue pill track
                 if (currentFraction > 0.001f) {
-                    val pillWidth = (selectedX + thumbRadius - innerMargin).coerceIn(pillHeight, size.width - 2f * innerMargin)
+                    val pillWidth =
+                        (selectedX + thumbRadius - innerMargin).coerceIn(pillHeight, size.width - 2f * innerMargin)
                     drawRoundRect(
                         color = colors.accentBlue,
                         topLeft = Offset(innerMargin, innerMargin),
@@ -3616,7 +3626,10 @@ fun SettingsScreen(
                                     onDismissRequest = { isAppearanceMenuOpen = false },
                                     shape = RoundedCornerShape(16.dp),
                                     containerColor = if (colors.isDark) Color(0xFF262628) else Color(0xFFFFFFFF),
-                                    border = BorderStroke(1.dp, if (colors.isDark) Color(0xFF38383B) else Color(0xFFE5E7EB)),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (colors.isDark) Color(0xFF38383B) else Color(0xFFE5E7EB)
+                                    ),
                                     modifier = Modifier.width(220.dp),
                                 ) {
                                     ThemeMode.entries.forEach { mode ->
@@ -3698,7 +3711,10 @@ fun SettingsScreen(
                                     onDismissRequest = { isReasoningMenuOpen = false },
                                     shape = RoundedCornerShape(16.dp),
                                     containerColor = if (colors.isDark) Color(0xFF262628) else Color(0xFFFFFFFF),
-                                    border = BorderStroke(1.dp, if (colors.isDark) Color(0xFF38383B) else Color(0xFFE5E7EB)),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (colors.isDark) Color(0xFF38383B) else Color(0xFFE5E7EB)
+                                    ),
                                     modifier = Modifier.width(220.dp),
                                 ) {
                                     ReasoningEffort.entries.forEach { effort ->
@@ -3708,7 +3724,9 @@ fun SettingsScreen(
                                             text = {
                                                 Text(
                                                     text = effort.label,
-                                                    color = if (canToggle || isVisible) colors.textPrimary else colors.textSecondary.copy(alpha = 0.5f),
+                                                    color = if (canToggle || isVisible) colors.textPrimary else colors.textSecondary.copy(
+                                                        alpha = 0.5f
+                                                    ),
                                                     fontSize = 15.sp,
                                                     fontWeight = if (isVisible) FontWeight.SemiBold else FontWeight.Normal,
                                                 )
@@ -3910,85 +3928,69 @@ fun SettingsScreen(
                                     .padding(horizontal = 16.dp, vertical = 14.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_terminal),
-                                contentDescription = "Wireless Debugging",
-                                tint = colors.textPrimary,
-                                modifier = Modifier.size(22.dp),
-                            )
-                            Column(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .padding(start = 14.dp),
-                            ) {
-                                Text(
-                                    text = "DHD phone access",
-                                    fontWeight = FontWeight.Medium,
-                                    color = colors.textPrimary,
-                                    fontSize = 15.sp,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
+                                Icon(
+                                    painter = painterResource(R.drawable.ic_terminal),
+                                    contentDescription = "Wireless Debugging",
+                                    tint = colors.textPrimary,
+                                    modifier = Modifier.size(22.dp),
                                 )
-                                Text(
-                                    text = when (developerStatus.state) {
-                                        DeveloperConnectionState.READY -> "Phone access is active"
-                                        DeveloperConnectionState.CONNECTING,
-                                        DeveloperConnectionState.CHECKING -> "Connecting phone access automatically…"
-                                        DeveloperConnectionState.PAIRING_REQUIRED -> if (developerStatus.paired) {
-                                            "Phone access needed; view the steps to reconnect"
-                                        } else {
-                                            "Set up phone access once"
-                                        }
-                                        DeveloperConnectionState.PAIRING_SEARCHING -> "Listening for the pairing service…"
-                                        DeveloperConnectionState.PAIRING_SERVICE_FOUND -> "Check the DHD notification"
-                                        DeveloperConnectionState.WIRELESS_DEBUGGING_OFF -> "Phone access needed; view the steps to reconnect"
-                                        DeveloperConnectionState.UNSUPPORTED -> "DHD needs Android 11+ for phone access"
-                                        DeveloperConnectionState.ERROR -> if (developerStatus.paired) {
-                                            "Phone access needed; view the steps to reconnect"
-                                        } else {
-                                            "Set up phone access once"
-                                        }
-                                    },
-                                    fontSize = 12.sp,
-                                    color = colors.textSecondary,
-                                    maxLines = 2,
-                                    lineHeight = 17.sp,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
-                            Text(
-                                text = when (developerStatus.state) {
-                                    DeveloperConnectionState.READY -> "Active"
-                                    DeveloperConnectionState.CONNECTING,
-                                    DeveloperConnectionState.CHECKING -> "Connecting"
-                                    DeveloperConnectionState.PAIRING_REQUIRED -> if (developerStatus.paired) "View steps" else "Set up"
-                                    DeveloperConnectionState.PAIRING_SEARCHING -> "Searching"
-                                    DeveloperConnectionState.PAIRING_SERVICE_FOUND -> "Found"
-                                    DeveloperConnectionState.WIRELESS_DEBUGGING_OFF -> "View steps"
-                                    DeveloperConnectionState.UNSUPPORTED -> "Unavailable"
-                                    DeveloperConnectionState.ERROR -> if (developerStatus.paired) "View steps" else "Set up"
-                                },
-                                color = when (developerStatus.state) {
-                                    DeveloperConnectionState.READY -> colors.accentGreen
-                                    DeveloperConnectionState.PAIRING_SEARCHING,
-                                    DeveloperConnectionState.PAIRING_SERVICE_FOUND,
-                                    DeveloperConnectionState.CONNECTING,
-                                    DeveloperConnectionState.CHECKING -> colors.accentBlue
-                                    DeveloperConnectionState.PAIRING_REQUIRED -> if (developerStatus.paired) {
-                                        colors.warningAmber
-                                    } else {
-                                        colors.accentBlue
-                                    }
-                                    DeveloperConnectionState.WIRELESS_DEBUGGING_OFF,
-                                    DeveloperConnectionState.ERROR -> colors.warningAmber
-                                    DeveloperConnectionState.UNSUPPORTED -> colors.textSecondary
-                                },
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Medium,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.padding(start = 8.dp),
-                            )
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(start = 14.dp),
+                                ) {
+                                    Text(
+                                        text = "DHD phone access",
+                                        fontWeight = FontWeight.Medium,
+                                        color = colors.textPrimary,
+                                        fontSize = 15.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    Text(
+                                        text = when (developerStatus.state) {
+                                            DeveloperConnectionState.READY -> "Phone access is active"
+                                            DeveloperConnectionState.CONNECTING,
+                                            DeveloperConnectionState.CHECKING -> "Connecting phone access automatically…"
+
+                                            DeveloperConnectionState.PAIRING_REQUIRED -> if (developerStatus.paired) {
+                                                "Phone access needed; view the steps to reconnect"
+                                            } else {
+                                                "Set up phone access once"
+                                            }
+
+                                            DeveloperConnectionState.PAIRING_SEARCHING -> "Listening for the pairing service…"
+                                            DeveloperConnectionState.PAIRING_SERVICE_FOUND -> "Check the DHD notification"
+                                            DeveloperConnectionState.WIRELESS_DEBUGGING_OFF -> "Phone access needed; view the steps to reconnect"
+                                            DeveloperConnectionState.UNSUPPORTED -> "DHD needs Android 11+ for phone access"
+                                            DeveloperConnectionState.ERROR -> if (developerStatus.paired) {
+                                                "Phone access needed; view the steps to reconnect"
+                                            } else {
+                                                "Set up phone access once"
+                                            }
+                                        },
+                                        fontSize = 12.sp,
+                                        color = colors.textSecondary,
+                                        maxLines = 2,
+                                        lineHeight = 17.sp,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        text = "Set up",
+                                        color = colors.textSecondary,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        modifier = Modifier.padding(end = 4.dp),
+                                    )
+                                    Icon(
+                                        painter = painterResource(R.drawable.ic_chevron_right),
+                                        contentDescription = "Open phone access instructions",
+                                        tint = colors.textSecondary,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                }
                             }
                         }
                     }
@@ -4072,7 +4074,7 @@ fun TaskDisplaysScreen(
     val visibleRecords = remember(records) {
         records.filter {
             it.lifecycle != TaskDisplayLifecycle.ENDED &&
-                it.lifecycle != TaskDisplayLifecycle.EXPIRED
+                    it.lifecycle != TaskDisplayLifecycle.EXPIRED
         }
     }
     val sortedRecords = remember(visibleRecords) {
@@ -4114,66 +4116,66 @@ fun TaskDisplaysScreen(
                 )
             }
 
-        if (sortedRecords.isEmpty()) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 24.dp, vertical = 24.dp),
-                contentAlignment = Alignment.TopCenter,
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        painter = painterResource(R.drawable.ic_laptop),
-                        contentDescription = null,
-                        tint = colors.textSecondary,
-                        modifier = Modifier.size(42.dp),
-                    )
-                    Text(
-                        text = "No task displays",
-                        color = colors.textPrimary,
-                        fontSize = 17.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.padding(top = 12.dp),
-                    )
-                    Text(
-                        text = "Displays created by an agent will appear here.",
-                        color = colors.textSecondary,
-                        fontSize = 13.sp,
-                        modifier = Modifier.padding(top = 5.dp),
-                    )
-                }
-            }
-        } else {
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .padding(horizontal = 18.dp),
-            ) {
-                Text(
-                    text = "Tap an app to view it. Long-press an icon for actions.",
-                    color = colors.textSecondary,
-                    fontSize = 13.sp,
-                    lineHeight = 19.sp,
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                )
-                LazyRow(
+            if (sortedRecords.isEmpty()) {
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                        .padding(horizontal = 24.dp, vertical = 24.dp),
+                    contentAlignment = Alignment.TopCenter,
                 ) {
-                    items(sortedRecords, key = { it.sessionKey }) { record ->
-                        TaskDisplayIconTile(
-                            record = record,
-                            onView = { onView(record) },
-                            onLongPress = { actionCandidate = record },
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_laptop),
+                            contentDescription = null,
+                            tint = colors.textSecondary,
+                            modifier = Modifier.size(42.dp),
+                        )
+                        Text(
+                            text = "No task displays",
+                            color = colors.textPrimary,
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(top = 12.dp),
+                        )
+                        Text(
+                            text = "Displays created by an agent will appear here.",
+                            color = colors.textSecondary,
+                            fontSize = 13.sp,
+                            modifier = Modifier.padding(top = 5.dp),
                         )
                     }
                 }
+            } else {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(horizontal = 18.dp),
+                ) {
+                    Text(
+                        text = "Tap an app to view it. Long-press an icon for actions.",
+                        color = colors.textSecondary,
+                        fontSize = 13.sp,
+                        lineHeight = 19.sp,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                    )
+                    LazyRow(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                    ) {
+                        items(sortedRecords, key = { it.sessionKey }) { record ->
+                            TaskDisplayIconTile(
+                                record = record,
+                                onView = { onView(record) },
+                                onLongPress = { actionCandidate = record },
+                            )
+                        }
+                    }
+                }
             }
-        }
         }
     }
 
@@ -4204,7 +4206,7 @@ fun TaskDisplaysScreen(
             text = {
                 Text(
                     "This closes the ${record.appLabel ?: record.packageName ?: "app"} display. " +
-                        "An active task will be stopped before the display is released.",
+                            "An active task will be stopped before the display is released.",
                     fontSize = 14.sp,
                     lineHeight = 20.sp,
                 )
@@ -4237,19 +4239,21 @@ private fun TaskDisplayIconTile(
     val colors = LocalAssistantColors.current
     val appLabel = record.appLabel ?: record.packageName ?: "Task display"
     val canView = record.lifecycle != TaskDisplayLifecycle.ENDED &&
-        record.lifecycle != TaskDisplayLifecycle.EXPIRED
+            record.lifecycle != TaskDisplayLifecycle.EXPIRED
     val statusColor = when (record.lifecycle) {
         TaskDisplayLifecycle.RUNNING -> colors.accentGreen
         TaskDisplayLifecycle.PAUSED -> colors.accentBlue
         TaskDisplayLifecycle.COMPLETED,
         TaskDisplayLifecycle.STOPPED -> colors.textSecondary
+
         TaskDisplayLifecycle.FAILED,
         TaskDisplayLifecycle.UNAVAILABLE -> colors.warningAmber
+
         TaskDisplayLifecycle.ENDED,
         TaskDisplayLifecycle.EXPIRED -> colors.textSecondary.copy(alpha = 0.7f)
     }
     val description = "$appLabel task display, ${record.lifecycle.displayLabel()}. " +
-        "Tap to view. Long press for actions."
+            "Tap to view. Long press for actions."
 
     val tileShape = RoundedCornerShape(18.dp)
     Surface(
@@ -4340,7 +4344,7 @@ private fun TaskDisplayActionsDialog(
     val packageName = record.packageName?.takeIf(String::isNotBlank)
     val appLabel = record.appLabel ?: packageName ?: "this app"
     val canView = record.lifecycle != TaskDisplayLifecycle.ENDED &&
-        record.lifecycle != TaskDisplayLifecycle.EXPIRED
+            record.lifecycle != TaskDisplayLifecycle.EXPIRED
     val canEnd = canView
 
     AlertDialog(
@@ -4423,9 +4427,9 @@ private fun TaskDisplayManagerCard(
     val colors = LocalAssistantColors.current
     val statusColor = colors.textSecondary
     val canView = record.lifecycle != TaskDisplayLifecycle.ENDED &&
-        record.lifecycle != TaskDisplayLifecycle.EXPIRED
+            record.lifecycle != TaskDisplayLifecycle.EXPIRED
     val canEnd = record.lifecycle != TaskDisplayLifecycle.ENDED &&
-        record.lifecycle != TaskDisplayLifecycle.EXPIRED
+            record.lifecycle != TaskDisplayLifecycle.EXPIRED
 
     Surface(
         shape = RoundedCornerShape(20.dp),
@@ -4476,15 +4480,15 @@ private fun TaskDisplayManagerCard(
                 ?.takeIf(String::isNotBlank)
                 ?.takeUnless { record.lifecycle == TaskDisplayLifecycle.COMPLETED }
                 ?.let { purpose ->
-                Text(
-                    text = purpose,
-                    color = colors.textSecondary,
-                    fontSize = 13.sp,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(start = 22.dp, top = 10.dp),
-                )
-            }
+                    Text(
+                        text = purpose,
+                        color = colors.textSecondary,
+                        fontSize = 13.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(start = 22.dp, top = 10.dp),
+                    )
+                }
             record.error?.takeIf(String::isNotBlank)?.let { error ->
                 Text(
                     text = error,
@@ -4525,6 +4529,7 @@ private const val TASK_DISPLAY_MANAGER_REFRESH_MS = 30_000L
 private fun TaskDisplayLifecycle.isLive(): Boolean = when (this) {
     TaskDisplayLifecycle.RUNNING,
     TaskDisplayLifecycle.PAUSED -> true
+
     else -> false
 }
 
@@ -4724,13 +4729,16 @@ private fun PairingStatusCard(status: DeveloperModeStatus) {
         DeveloperConnectionState.PAIRING_SERVICE_FOUND,
         DeveloperConnectionState.CONNECTING,
         DeveloperConnectionState.CHECKING -> colors.accentBlue
+
         DeveloperConnectionState.PAIRING_REQUIRED -> if (status.paired) {
             colors.warningAmber
         } else {
             colors.accentBlue
         }
+
         DeveloperConnectionState.WIRELESS_DEBUGGING_OFF,
         DeveloperConnectionState.ERROR -> colors.warningAmber
+
         DeveloperConnectionState.UNSUPPORTED -> colors.textSecondary
     }
     val statusTitle = when (status.state) {
@@ -4742,6 +4750,7 @@ private fun PairingStatusCard(status: DeveloperModeStatus) {
         } else {
             "Ready to connect your phone"
         }
+
         DeveloperConnectionState.CONNECTING -> "Reconnecting to your phone"
         DeveloperConnectionState.CHECKING -> "Checking phone access"
         DeveloperConnectionState.WIRELESS_DEBUGGING_OFF -> "Phone access needed"
@@ -4997,7 +5006,7 @@ fun ApprovedAppsScreen(
         if (searchQuery.isBlank()) apps
         else apps.filter {
             it.label.contains(searchQuery, ignoreCase = true) ||
-                it.packageName.contains(searchQuery, ignoreCase = true)
+                    it.packageName.contains(searchQuery, ignoreCase = true)
         }
     }
 
@@ -5288,7 +5297,7 @@ fun ApprovedAppsScreen(
             text = {
                 Text(
                     "Full Access allows DHD to open, inspect, and operate any application installed on this device.\n\n" +
-                        "This bypasses the per-app allowlist and lets DHD carry out tasks across all your apps.",
+                            "This bypasses the per-app allowlist and lets DHD carry out tasks across all your apps.",
                     fontSize = 14.sp,
                     lineHeight = 20.sp,
                 )
@@ -5323,8 +5332,12 @@ fun assistantSwitchColors(colors: AssistantColorScheme) = SwitchDefaults.colors(
     uncheckedBorderColor = Color.Transparent,
     disabledCheckedThumbColor = if (colors.isDark) Color.Black.copy(alpha = 0.6f) else Color.White.copy(alpha = 0.6f),
     disabledCheckedTrackColor = if (colors.isDark) Color.White.copy(alpha = 0.5f) else Color.Black.copy(alpha = 0.5f),
-    disabledUncheckedThumbColor = if (colors.isDark) Color(0xFF8E8E93).copy(alpha = 0.4f) else Color(0xFF9CA3AF).copy(alpha = 0.4f),
-    disabledUncheckedTrackColor = if (colors.isDark) Color(0xFF212124).copy(alpha = 0.4f) else Color(0xFFE5E7EB).copy(alpha = 0.4f),
+    disabledUncheckedThumbColor = if (colors.isDark) Color(0xFF8E8E93).copy(alpha = 0.4f) else Color(0xFF9CA3AF).copy(
+        alpha = 0.4f
+    ),
+    disabledUncheckedTrackColor = if (colors.isDark) Color(0xFF212124).copy(alpha = 0.4f) else Color(0xFFE5E7EB).copy(
+        alpha = 0.4f
+    ),
 )
 
 @Composable
@@ -5370,7 +5383,7 @@ internal fun LiveDisplayPreviewState.belongsToGroup(groupId: String): Boolean =
 
 private fun LiveDisplayPreviewState.isExpanded(expandedSessionKey: String?): Boolean =
     expandedSessionKey != null &&
-        (sessionKey == expandedSessionKey || runSessionKey == expandedSessionKey)
+            (sessionKey == expandedSessionKey || runSessionKey == expandedSessionKey)
 
 private fun SessionState.isActive(): Boolean = this is SessionState.Running || this is SessionState.Paused
 
@@ -5386,14 +5399,16 @@ internal fun shouldShowTopRecoveryBanner(
     developerStatus: DeveloperModeStatus,
     companionConnected: Boolean,
 ): Boolean = developerStatus.requiresUserAction ||
-    state.showsPhoneAccessRecovery() ||
-    !companionConnected
+        state.showsPhoneAccessRecovery() ||
+        !companionConnected
 
 private fun SessionState.showsPhoneAccessRecovery(): Boolean = when (this) {
     is SessionState.Running -> currentPurpose.equals("Needs your attention", ignoreCase = true) &&
-        attentionActionLabel.equals("View instructions", ignoreCase = true)
+            attentionActionLabel.equals("View instructions", ignoreCase = true)
+
     is SessionState.Paused -> attentionReason != null &&
-        attentionActionLabel.equals("View instructions", ignoreCase = true)
+            attentionActionLabel.equals("View instructions", ignoreCase = true)
+
     else -> false
 }
 
