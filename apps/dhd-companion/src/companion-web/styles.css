@@ -1097,7 +1097,8 @@ button:disabled {
 .tool-list {
   display: flex;
   flex-direction: column;
-  gap: 0;
+  gap: 8px;
+  padding: 12px;
 }
 
 .agent-plan {
@@ -1203,14 +1204,9 @@ button:disabled {
 }
 
 .tool-call-card {
-  background-color: transparent;
-  border: 0;
-  border-bottom: 2px solid var(--border-subtle);
-  border-radius: 0;
-}
-
-.tool-call-card:last-child {
-  border-bottom: 0;
+  background-color: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
 }
 
 .tool-call-card > summary {
@@ -1222,10 +1218,9 @@ button:disabled {
 }
 
 .tool-call-summary {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
   min-height: 46px;
   padding: 9px 18px;
   cursor: pointer;
@@ -1258,11 +1253,16 @@ button:disabled {
 .tool-call-summary-right {
   display: flex;
   align-items: center;
-  gap: 9px;
   min-width: 0;
 }
 
+.tool-call-summary-left {
+  grid-column: 2;
+  justify-content: center;
+}
+
 .tool-call-name {
+  min-width: 0;
   color: var(--text-primary);
   font-size: 12px;
   font-weight: 700;
@@ -1272,7 +1272,15 @@ button:disabled {
 }
 
 .tool-call-summary-right {
-  flex-shrink: 0;
+  grid-column: 3;
+  justify-self: end;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.tool-call-duration {
+  text-align: right;
+  white-space: nowrap;
 }
 
 .tool-call-status.success {
