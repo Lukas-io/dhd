@@ -83,6 +83,33 @@ class TaskDisplayBackendTest {
     }
 
     @Test
+    fun `reused display shows the new app while preserving its native owner`() {
+        val kuda = TaskDisplayRecord(
+            sessionKey = "kuda-owner",
+            taskId = "kuda-owner@12",
+            packageName = "com.kudabank.app",
+            displayId = 12,
+            width = 720,
+            height = 1_560,
+            densityDpi = 420,
+            rotation = 0,
+            status = TaskDisplayStatus.COMPLETED,
+            createdAtEpochMs = 1L,
+        )
+        val displayRef = kuda.displayRef
+
+        val moniepoint = kuda.withOpenedPackage("com.moniepoint.personal")
+        assertEquals("com.moniepoint.personal", moniepoint.packageName)
+        assertEquals("com.kudabank.app", moniepoint.nativePackageName)
+        assertEquals(displayRef, moniepoint.displayRef)
+
+        val switchedBack = moniepoint.withOpenedPackage("com.kudabank.app")
+        assertEquals("com.kudabank.app", switchedBack.packageName)
+        assertEquals("com.kudabank.app", switchedBack.nativePackageName)
+        assertEquals(displayRef, switchedBack.displayRef)
+    }
+
+    @Test
     fun `terminalization starts retention at the first terminal timestamp`() {
         val record = TaskDisplayRecord(
             sessionKey = "run-1",

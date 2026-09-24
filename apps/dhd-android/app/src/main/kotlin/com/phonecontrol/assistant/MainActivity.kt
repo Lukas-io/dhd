@@ -154,7 +154,10 @@ class MainActivity : ComponentActivity() {
                     ?: playback.forSession(session.sessionKey)
                 val error = playbackForSession as? TaskPreviewState.Error
                 val ended = playbackForSession as? TaskPreviewState.Ended
-                val appLabel = session.packageName.applicationLabel(appPackageManager)
+                val currentPackage = backendDisplayRecords
+                    .firstOrNull { it.sessionKey == session.sessionKey }
+                    ?.packageName ?: session.packageName
+                val appLabel = currentPackage.applicationLabel(appPackageManager)
                 LiveDisplayPreviewState(
                     status = when {
                         error?.sessionKey == session.sessionKey -> LiveDisplayPreviewStatus.ERROR
@@ -187,11 +190,14 @@ class MainActivity : ComponentActivity() {
             // frame before its durable registry record is published. Keep the
             // manager populated during that small handoff window.
             displayForRun?.let { session ->
+                val currentPackage = backendDisplayRecords
+                    .firstOrNull { it.sessionKey == session.sessionKey }
+                    ?.packageName ?: session.packageName
                 val activeRecord = TaskDisplayUiRecord(
                     sessionKey = session.sessionKey,
                     taskId = session.taskId,
-                    packageName = session.packageName,
-                    appLabel = session.packageName.applicationLabel(appPackageManager),
+                    packageName = currentPackage,
+                    appLabel = currentPackage.applicationLabel(appPackageManager),
                     displayId = session.displayId,
                     displayRef = taskDisplayReference(session.sessionKey, session.displayId),
                     geometry = session.geometry,

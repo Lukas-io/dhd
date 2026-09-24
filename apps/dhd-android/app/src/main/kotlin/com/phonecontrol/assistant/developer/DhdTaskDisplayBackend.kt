@@ -316,6 +316,22 @@ class DhdTaskDisplayBackend(
         )
     }
 
+    override suspend fun markAppOpened(session: TaskDisplaySession, packageName: String) {
+        val operationLock = operationLocks.getOrPut(session.sessionKey) { Mutex() }
+        operationLock.withLock {
+            val stillCurrent = stateLock.withLock {
+                sessions[session.sessionKey]?.taskSession == session
+            }
+            if (stillCurrent) publishOpenedApp(session, packageName)
+        }
+    }
+
+    private fun publishOpenedApp(session: TaskDisplaySession, packageName: String) {
+        val record = findRecord(session.sessionKey) ?: return
+        if (record.taskId != session.taskId || record.packageName == packageName) return
+        publishRecord(record.withOpenedPackage(packageName))
+    }
+
     private suspend fun createWithFreshOwner(
         runSessionKey: String,
         packageName: String,
@@ -812,7 +828,8 @@ class DhdTaskDisplayBackend(
                 val currentKeys = candidates.mapTo(mutableSetOf()) { it.sessionKey }
                 missingPolls.keys.retainAll(currentKeys)
                 candidates.forEach { session ->
-                    when (parseDisplayTaskPresence(output, session.displayId, session.packageName)) {
+                    val currentPackage = findRecord(session.sessionKey)?.packageName ?: session.packageName
+                    when (parseDisplayTaskPresence(output, session.displayId, currentPackage)) {
                         true -> missingPolls.remove(session.sessionKey)
                         false -> {
                             val count = (missingPolls[session.sessionKey] ?: 0) + 1
@@ -1259,7 +1276,7 @@ class DhdTaskDisplayBackend(
                 val taskSession = nativeSession.toTaskSession(appContext)
                 val sameIdentity = taskSession.displayId == record.displayId &&
                     taskSession.taskId == record.taskId &&
-                    taskSession.packageName == record.packageName &&
+                    taskSession.packageName == record.nativePackageName &&
                     taskSession.geometry.width == record.width &&
                     taskSession.geometry.height == record.height &&
                     taskSession.geometry.densityDpi == record.densityDpi &&
@@ -1303,6 +1320,25 @@ class DhdTaskDisplayBackend(
                     // prove that the stopped run is still active.
                     if (record.status.isTerminal && !claimedByDifferentRun) {
                         cancelledKeys += record.sessionKey
+                    }
+                }
+                // Older records only knew the first package launched on this
+                // display. Recover the currently visible app after an upgrade.
+                if (record.ownerPackageName == null) {
+                    val foregroundPackage = try {
+                        resolveForeground(taskSession)?.packageName
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    val launchable = foregroundPackage?.let { packageName ->
+                        runCatching {
+                            appContext.packageManager.getLaunchIntentForPackage(packageName)
+                        }.getOrNull() != null
+                    } == true
+                    if (foregroundPackage != null && launchable) {
+                        publishOpenedApp(taskSession, foregroundPackage)
                     }
                 }
                 scheduleExpiry(record)

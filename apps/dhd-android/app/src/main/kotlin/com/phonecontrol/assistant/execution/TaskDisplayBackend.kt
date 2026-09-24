@@ -107,6 +107,8 @@ data class TaskDisplayRecord(
     val expiresAtEpochMs: Long? = null,
     val lastPurpose: String = "Preparing request",
     val error: String? = null,
+    /** Original package owned by the native session when this display later opens another app. */
+    val ownerPackageName: String? = null,
 ) {
     init {
         require(sessionKey.isNotBlank()) { "Task display record session key must not be blank." }
@@ -119,6 +121,15 @@ data class TaskDisplayRecord(
 
     val geometry: TaskDisplayGeometry
         get() = TaskDisplayGeometry(width, height, densityDpi, rotation)
+
+    val nativePackageName: String
+        get() = ownerPackageName ?: packageName
+
+    fun withOpenedPackage(openedPackageName: String): TaskDisplayRecord =
+        if (openedPackageName == packageName) this else copy(
+            packageName = openedPackageName,
+            ownerPackageName = nativePackageName,
+        )
 
     /** Opaque generation-aware reference safe to expose to the agent. */
     val displayRef: String
@@ -286,6 +297,9 @@ interface TaskDisplayBackend {
         current(sessionKey)?.let { return TaskDisplayOpenResult(it, created = false) }
         return TaskDisplayOpenResult(create(sessionKey, packageName, spec), created = true)
     }
+
+    /** Record the app successfully launched on a reused display. */
+    suspend fun markAppOpened(session: TaskDisplaySession, packageName: String) = Unit
 
     /** Return the current session for a coordinator key, if it still exists. */
     suspend fun current(sessionKey: String): TaskDisplaySession?

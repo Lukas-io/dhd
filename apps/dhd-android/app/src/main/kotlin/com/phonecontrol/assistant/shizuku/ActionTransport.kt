@@ -309,6 +309,7 @@ class TypedPhoneActionTransport(
                         )
                     }
                 }
+                backend.markAppOpened(opened.session, action.packageName)
                 TransportResult.Succeeded("Opened ${action.packageName}.")
             } catch (error: kotlinx.coroutines.CancellationException) {
                 throw error

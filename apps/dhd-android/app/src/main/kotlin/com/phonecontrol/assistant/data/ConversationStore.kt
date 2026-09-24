@@ -124,6 +124,7 @@ data class TaskDisplayEntity(
     val expiresAtEpochMs: Long? = null,
     val lastPurpose: String,
     val error: String? = null,
+    val ownerPackageName: String? = null,
 )
 
 @Dao
@@ -212,7 +213,7 @@ interface ConversationDao {
         ToolActivityEntity::class,
         TaskDisplayEntity::class,
     ],
-    version = 2,
+    version = 3,
     exportSchema = false,
 )
 abstract class AssistantDatabase : RoomDatabase() {
@@ -255,6 +256,12 @@ abstract class AssistantDatabase : RoomDatabase() {
                     "CREATE INDEX IF NOT EXISTS `index_task_displays_expiresAtEpochMs` " +
                         "ON `task_displays` (`expiresAtEpochMs`)"
                 )
+            }
+        }
+
+        val MIGRATION_2_3: Migration = object : Migration(2, 3) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("ALTER TABLE `task_displays` ADD COLUMN `ownerPackageName` TEXT")
             }
         }
     }
@@ -325,7 +332,7 @@ class ConversationStore(context: Context) {
         AssistantDatabase::class.java,
         "dhd-conversations.db",
     )
-        .addMigrations(AssistantDatabase.MIGRATION_1_2)
+        .addMigrations(AssistantDatabase.MIGRATION_1_2, AssistantDatabase.MIGRATION_2_3)
         .allowMainThreadQueries()
         .build()
     private val dao = database.conversationDao()
@@ -849,6 +856,7 @@ private fun TaskDisplayRecord.toEntity(): TaskDisplayEntity = TaskDisplayEntity(
     expiresAtEpochMs = expiresAtEpochMs,
     lastPurpose = lastPurpose,
     error = error,
+    ownerPackageName = ownerPackageName,
 )
 
 private fun TaskDisplayEntity.toTaskDisplayRecord(): TaskDisplayRecord? {
@@ -869,6 +877,7 @@ private fun TaskDisplayEntity.toTaskDisplayRecord(): TaskDisplayRecord? {
             expiresAtEpochMs = expiresAtEpochMs,
             lastPurpose = lastPurpose,
             error = error,
+            ownerPackageName = ownerPackageName,
         )
     }.getOrNull()
 }
