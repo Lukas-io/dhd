@@ -1229,10 +1229,13 @@ button:disabled {
 }
 
 .tool-call-summary::before {
+  grid-column: 1;
+  justify-self: start;
   flex-shrink: 0;
   color: var(--text-dim);
   content: "▸";
   transition: transform 140ms ease;
+  transform-origin: center;
 }
 
 .tool-call-card[open] > .tool-call-summary::before {
