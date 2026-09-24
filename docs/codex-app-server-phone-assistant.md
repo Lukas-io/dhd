@@ -193,11 +193,16 @@ needed. It also uses a dedicated Codex home at
 Authenticate that home once with `CODEX_HOME` pointing to it before starting
 the companion. The companion passes `CODEX_HOME` only to the App Server child,
 so it does not change the desktop Codex process or the parent environment.
-The companion passes minimal App Server config overrides that disable configured
+The repository packages DHD-specific guidance at
+`apps/dhd-companion/codex-home/AGENTS.md`. `pnpm dhd:setup` installs it as
+`AGENTS.md` in the selected Codex home when one is not already present, so fresh
+setups receive the same DHD behavior without inheriting the Phone Control
+repository's instructions. The companion passes minimal App Server config
+overrides that disable configured
 MCP servers, shell execution, apps, browser use, computer use, memories,
 multi-agent tools, plugins, remote plugins, skill search, unified exec, hooks,
-and dependency installation. Project instructions are not capped: the runtime
-can provide its own small `AGENTS.md` for DHD-specific guidance, without
+and dependency installation. Project instructions are not capped, so App
+Server can load the DHD-specific guidance from its isolated Codex home without
 inheriting the Phone Control repository's project instructions.
 It also turns off goals, shell snapshots, image generation, the in-app browser,
 tool suggestions, image viewing, and workspace dependencies for this child.
@@ -266,8 +271,8 @@ accidentally shown as the final result.
 The companion treats `turn/completed` as the App Server transport reaching its
 terminal state, not as independent proof that the user's phone task succeeded.
 The request itself is passed to App Server unchanged; persistent DHD behavior
-belongs in the runtime `AGENTS.md`, while phone capabilities and argument
-constraints belong in the direct tool contracts. A terminal-turn log line means
+belongs in the isolated DHD Codex home's `AGENTS.md`, while phone capabilities
+and argument constraints belong in the direct tool contracts. A terminal-turn log line means
 that Codex stopped producing work; the following `complete_session` call is the
 point at which the phone timeline is closed.
 

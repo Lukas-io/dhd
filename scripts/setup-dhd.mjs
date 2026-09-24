@@ -1,7 +1,8 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const configuredHome = process.env.PHONE_ASSISTANT_CODEX_HOME?.trim();
 const configuredRuntime = process.env.PHONE_ASSISTANT_CODEX_CWD?.trim();
@@ -24,9 +25,25 @@ const childOptions = {
   stdio: "inherit",
   windowsHide: false,
 };
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const instructionsTemplate = join(
+  repositoryRoot,
+  "apps",
+  "dhd-companion",
+  "codex-home",
+  "AGENTS.md",
+);
+const installedInstructions = join(codexHome, "AGENTS.md");
 
 mkdirSync(codexHome, { recursive: true });
 mkdirSync(runtimeCwd, { recursive: true });
+
+if (!existsSync(installedInstructions)) {
+  copyFileSync(instructionsTemplate, installedInstructions);
+  console.log(`Installed DHD Codex instructions: ${installedInstructions}`);
+} else {
+  console.log(`Keeping existing DHD Codex instructions: ${installedInstructions}`);
+}
 
 console.log(`DHD Codex home: ${codexHome}`);
 console.log(`DHD runtime directory: ${runtimeCwd}`);
