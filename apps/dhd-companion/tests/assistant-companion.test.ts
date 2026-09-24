@@ -1,12 +1,63 @@
 import { describe, expect, it } from "vitest";
 
-import type { CompanionToolCallEvent } from "../src/companion-events.js";
+import type {
+  CompanionTokenUsageEvent,
+  CompanionToolCallEvent
+} from "../src/companion-events.js";
 import {
   CodexAppServerClient,
+  extractCompanionTokenUsageEvent,
   handleDynamicToolCall,
+  shouldInterruptForPhoneStop,
 } from "../src/assistant-companion.js";
 
 describe("Codex App Server agent-message extraction", () => {
+  it("extracts the latest per-turn token usage without cumulative thread totals", () => {
+    const event = extractCompanionTokenUsageEvent(
+      {
+        method: "thread/tokenUsage/updated",
+        params: {
+          threadId: "thread-usage",
+          turnId: "turn-usage",
+          tokenUsage: {
+            last: {
+              inputTokens: 1200,
+              cachedInputTokens: 800,
+              outputTokens: 240,
+              reasoningOutputTokens: 90,
+              totalTokens: 1440,
+            },
+            total: {
+              inputTokens: 9000,
+              cachedInputTokens: 6400,
+              outputTokens: 1200,
+              reasoningOutputTokens: 500,
+              totalTokens: 10200,
+            },
+            modelContextWindow: 258400,
+          },
+        },
+      },
+      1234,
+    );
+
+    expect(event).toEqual<CompanionTokenUsageEvent>({
+      type: "dhd_token_usage",
+      threadId: "thread-usage",
+      turnId: "turn-usage",
+      usage: {
+        inputTokens: 1200,
+        cachedInputTokens: 800,
+        outputTokens: 240,
+        reasoningOutputTokens: 90,
+        totalTokens: 1440,
+      },
+      modelContextWindow: 258400,
+      timestamp: 1234,
+    });
+    expect(event).not.toHaveProperty("threadTokenUsage");
+  });
+
   it("uses the final answer instead of concatenating commentary from the same turn", async () => {
     const client = new CodexAppServerClient();
     const streamed: Array<{ itemId: string; text: string }> = [];
@@ -105,15 +156,52 @@ describe("Codex App Server agent-message extraction", () => {
     });
   });
 
+  it("does not crash when an interrupted App Server closes before an error response", async () => {
+    const client = new CodexAppServerClient() as any;
+    client.child = null;
+
+    await expect(client.handleServerRequest({
+      id: "late-request",
+      method: "unsupported/server/request",
+      params: {},
+    })).resolves.toBeUndefined();
+  });
+
+  it("does not let a stale App Server close reject a replacement child", () => {
+    const client = new CodexAppServerClient() as any;
+    const replacementChild = {};
+    let rejected = false;
+    client.child = replacementChild;
+    client.turnCompletion = {
+      resolve: () => undefined,
+      reject: () => { rejected = true; },
+      agentMessages: new Map(),
+      nextAgentMessageOrder: 0,
+      phoneToolFailures: [],
+    };
+
+    client.handleChildClose({}, null, "SIGTERM");
+
+    expect(rejected).toBe(false);
+    expect(client.child).toBe(replacementChild);
+    expect(client.turnCompletion).not.toBeNull();
+  });
+
+  it("does not interpret a pending attention request as a phone stop", () => {
+    expect(shouldInterruptForPhoneStop({ active: false, attentionPending: true })).toBe(false);
+    expect(shouldInterruptForPhoneStop({ active: false })).toBe(true);
+    expect(shouldInterruptForPhoneStop({ active: true, attentionPending: true })).toBe(false);
+  });
+
   it("emits a complete diagnostic event with normalized arguments and images", async () => {
     const events: CompanionToolCallEvent[] = [];
     const imageData = Buffer.from("test-image").toString("base64");
     const response = await handleDynamicToolCall(
-      { tool: "dhd_observe", arguments: '{"expectedPackageName":"com.example.app"}' },
+      { tool: "dhd_observe", arguments: "{}" },
       {
         emit: (event) => events.push(event),
         invoke: async (_name, input) => {
-          expect(input).toEqual({ expectedPackageName: "com.example.app" });
+          expect(input).toEqual({});
           return {
             content: [
               { type: "text", text: '{"ok":true}' },
@@ -137,7 +225,7 @@ describe("Codex App Server agent-message extraction", () => {
       type: "dhd_tool_call",
       phase: "started",
       tool: "dhd_observe",
-      arguments: { expectedPackageName: "com.example.app" },
+      arguments: {},
     });
     expect(events[1]).toMatchObject({
       type: "dhd_tool_call",

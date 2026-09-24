@@ -7,8 +7,8 @@ import com.phonecontrol.assistant.domain.KeypressKey
 import com.phonecontrol.assistant.domain.ObservationSnapshot
 import com.phonecontrol.assistant.domain.TapAction
 import com.phonecontrol.assistant.session.ActionExecutionResult
-import com.phonecontrol.assistant.shizuku.ObservationCaptureResult
-import com.phonecontrol.assistant.shizuku.TransportResult
+import com.phonecontrol.assistant.execution.ObservationCaptureResult
+import com.phonecontrol.assistant.execution.TransportResult
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -38,7 +38,9 @@ class SequenceExecutorTest {
         val result = SequenceExecutor(
             executeAction = { action, observation ->
                 executedObservationIds += "${action.type.name.lowercase()}:${observation.id}:${action.metadata.observationId}"
-                ActionExecutionResult.TransportFinished(TransportResult.Succeeded("done"))
+                ActionExecutionResult.TransportFinished(
+                    TransportResult.Succeeded("done", beforeScreenshot = byteArrayOf(9)),
+                )
             },
             captureAfterAction = { captures[captureIndex++] },
             rememberObservation = { remembered += it.id },
@@ -51,6 +53,7 @@ class SequenceExecutorTest {
         assertEquals(listOf("tap", "keypress"), settledActions)
         assertEquals(listOf("obs-1", "obs-2"), remembered)
         assertEquals("obs-2", result.finalObservation?.snapshot?.id)
+        assertEquals(listOf<Byte>(9), result.beforeScreenshot?.toList())
         assertEquals(listOf("obs-1", "obs-2"), result.steps.mapNotNull { it.observationId })
     }
 
@@ -87,7 +90,7 @@ class SequenceExecutorTest {
                 executions += 1
                 ActionExecutionResult.TransportFinished(
                     TransportResult.Rejected(
-                        code = com.phonecontrol.assistant.shizuku.RejectionCode.STALE_OBSERVATION,
+                        code = com.phonecontrol.assistant.execution.RejectionCode.STALE_OBSERVATION,
                         message = "stale",
                     ),
                 )

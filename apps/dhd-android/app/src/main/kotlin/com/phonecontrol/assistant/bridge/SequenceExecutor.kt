@@ -6,14 +6,14 @@ import com.phonecontrol.assistant.domain.KeypressAction
 import com.phonecontrol.assistant.domain.OpenAppAction
 import com.phonecontrol.assistant.domain.ObservationSnapshot
 import com.phonecontrol.assistant.domain.PhoneAction
-import com.phonecontrol.assistant.domain.ScrollAction
 import com.phonecontrol.assistant.domain.SwipeAction
+import com.phonecontrol.assistant.domain.StaleObservationDiagnostics
 import com.phonecontrol.assistant.domain.TapAction
 import com.phonecontrol.assistant.domain.TypeAction
 import com.phonecontrol.assistant.domain.WaitAction
 import com.phonecontrol.assistant.session.ActionExecutionResult
-import com.phonecontrol.assistant.shizuku.ObservationCaptureResult
-import com.phonecontrol.assistant.shizuku.TransportResult
+import com.phonecontrol.assistant.execution.ObservationCaptureResult
+import com.phonecontrol.assistant.execution.TransportResult
 
 internal data class SequenceStepResult(
     val index: Int,
@@ -24,6 +24,7 @@ internal data class SequenceStepResult(
     val code: String? = null,
     val outcome: String? = null,
     val executed: Boolean? = null,
+    val details: StaleObservationDiagnostics? = null,
 ) {
     enum class Status {
         SUCCESS,
@@ -36,6 +37,7 @@ internal data class SequenceExecutionResult(
     val steps: List<SequenceStepResult>,
     val finalObservation: ObservationCaptureResult.Succeeded? = null,
     val failure: SequenceStepResult? = null,
+    val beforeScreenshot: ByteArray? = null,
 ) {
     val completedSteps: Int
         get() = steps.count { it.status == SequenceStepResult.Status.SUCCESS }
@@ -63,11 +65,15 @@ internal class SequenceExecutor(
 
         var baseline = initialObservation
         var finalObservation: ObservationCaptureResult.Succeeded? = null
+        var beforeScreenshot: ByteArray? = null
         val steps = mutableListOf<SequenceStepResult>()
 
         actions.forEachIndexed { index, unboundAction ->
             val action = bindObservation(unboundAction, baseline.id)
             val execution = executeAction(action, baseline)
+            if (index == 0 && beforeScreenshot == null) {
+                beforeScreenshot = execution.beforeScreenshotOrNull()
+            }
             if (!execution.isSuccessful()) {
                 val failure = failureStep(index, action, execution)
                 steps += failure
@@ -75,6 +81,7 @@ internal class SequenceExecutor(
                     requestedSteps = actions.size,
                     steps = steps,
                     failure = failure,
+                    beforeScreenshot = beforeScreenshot,
                 )
             }
 
@@ -99,6 +106,7 @@ internal class SequenceExecutor(
                         requestedSteps = actions.size,
                         steps = steps,
                         failure = failure,
+                        beforeScreenshot = beforeScreenshot,
                     )
                 }
 
@@ -121,6 +129,7 @@ internal class SequenceExecutor(
             requestedSteps = actions.size,
             steps = steps,
             finalObservation = finalObservation,
+            beforeScreenshot = beforeScreenshot,
         )
     }
 
@@ -138,6 +147,7 @@ internal class SequenceExecutor(
             code = code,
             outcome = "failed",
             executed = false,
+            details = result.staleDetailsOrNull(),
         )
     }
 
@@ -160,12 +170,24 @@ internal class SequenceExecutor(
             is TapAction -> action.copy(metadata = metadata)
             is TypeAction -> action.copy(metadata = metadata)
             is SwipeAction -> action.copy(metadata = metadata)
-            is ScrollAction -> action.copy(metadata = metadata)
             is BackAction -> action.copy(metadata = metadata)
             is KeypressAction -> action.copy(metadata = metadata)
             is WaitAction -> action.copy(metadata = metadata)
         }
     }
+}
+
+private fun ActionExecutionResult.staleDetailsOrNull(): StaleObservationDiagnostics? = when (this) {
+    is ActionExecutionResult.TransportFinished -> (result as? TransportResult.Rejected)?.details
+    is ActionExecutionResult.PolicyRejected -> details
+    ActionExecutionResult.SessionNotRunning -> null
+}
+
+private fun ActionExecutionResult.beforeScreenshotOrNull(): ByteArray? = when (this) {
+    is ActionExecutionResult.TransportFinished ->
+        (result as? TransportResult.Succeeded)?.beforeScreenshot
+    is ActionExecutionResult.PolicyRejected,
+    ActionExecutionResult.SessionNotRunning -> null
 }
 
 private fun ActionExecutionResult.isSuccessful(): Boolean = this is ActionExecutionResult.TransportFinished &&

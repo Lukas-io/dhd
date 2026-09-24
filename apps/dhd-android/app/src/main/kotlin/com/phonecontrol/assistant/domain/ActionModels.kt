@@ -6,7 +6,6 @@ enum class ActionType {
     TAP,
     TYPE,
     SWIPE,
-    SCROLL,
     BACK,
     KEYPRESS,
     WAIT,
@@ -17,19 +16,6 @@ enum class KeypressKey {
     HOME,
     ENTER,
     DELETE,
-}
-
-enum class ScrollDirection {
-    UP,
-    DOWN,
-    LEFT,
-    RIGHT,
-}
-
-enum class ScrollAmount {
-    SMALL,
-    MEDIUM,
-    LARGE,
 }
 
 /**
@@ -118,14 +104,6 @@ data class SwipeAction(
     override val type: ActionType = ActionType.SWIPE
 }
 
-data class ScrollAction(
-    val direction: ScrollDirection,
-    val amount: ScrollAmount,
-    override val metadata: ActionMetadata,
-) : PhoneAction {
-    override val type: ActionType = ActionType.SCROLL
-}
-
 data class BackAction(
     override val metadata: ActionMetadata,
 ) : PhoneAction {
@@ -156,10 +134,20 @@ data class ObservationSnapshot(
     val packageName: String,
     val activityName: String?,
     val displayId: Int,
+    /**
+     * Owner identity for a task virtual display.  Physical-display
+     * observations leave this null.  It is deliberately carried alongside
+     * displayId because Android may reuse a display ID after a task stops.
+     */
+    val taskSessionKey: String? = null,
+    /** Backend identity for the concrete display instance, when available. */
+    val taskId: String? = null,
     val rotation: Int,
     val width: Int,
     val height: Int,
     val screenshotFingerprint: String,
+    /** Metadata explaining why the task preview may be blank or protected. */
+    val screenProtection: ScreenProtection = ScreenProtection.VISIBLE,
     /**
      * Fingerprints for the stable regions supplied with a coordinate action.
      * The raw screenshot is deliberately not kept in the domain model; the
@@ -191,6 +179,7 @@ data class ActivityEvent(
     val kind: ActivityEventKind,
     val message: String,
     val actionType: ActionType? = null,
+    val toolName: String? = null,
     val purpose: String? = null,
     val observationId: String? = null,
     val targetDescription: String? = null,
@@ -229,10 +218,10 @@ fun userFacingActivityLabel(
             cleanPurpose.startsWith("Entering ", ignoreCase = true) -> cleanPurpose
             else -> "Entering text"
         }
-        ActionType.SWIPE, ActionType.SCROLL -> when {
-            target.isNotBlank() -> "Scrolling $target"
-            cleanPurpose.startsWith("Scrolling ", ignoreCase = true) -> cleanPurpose
-            else -> "Scrolling"
+        ActionType.SWIPE -> when {
+            target.isNotBlank() -> "Swiping $target"
+            cleanPurpose.startsWith("Swiping ", ignoreCase = true) -> cleanPurpose
+            else -> "Swiping"
         }
         ActionType.BACK -> "Going back"
         ActionType.KEYPRESS -> "Pressing ${cleanTarget.ifBlank { "the key" }}"
@@ -273,8 +262,7 @@ private fun String.cleanActivityText(): String {
         "type" to "Typing",
         "tap" to "Tapping",
         "click" to "Tapping",
-        "scroll" to "Scrolling",
-        "swipe" to "Scrolling",
+        "swipe" to "Swiping",
         "wait" to "Waiting",
         "press" to "Pressing",
     )[firstWord]

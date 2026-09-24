@@ -13,7 +13,11 @@ import {
   asPhoneControlError,
   PhoneControlError
 } from "./errors.js";
-import { hashScreenshot, ObservationStore } from "./observation-store.js";
+import {
+  hashScreenshot,
+  ObservationStore,
+  staleObservationDiagnostics
+} from "./observation-store.js";
 import {
   assertAllowedForeground,
   assertAllowedTarget,
@@ -95,7 +99,6 @@ interface SequenceActionExecution {
 const DEFAULT_WAIT_TIMEOUT_MS = 10_000;
 const MAX_WAIT_TIMEOUT_MS = 30_000;
 const DEFAULT_POLL_INTERVAL_MS = 250;
-const POINTER_START_DELAY_MS = 150;
 const DEFAULT_ACTION_LOG_PATH = resolve(
   process.cwd(),
   "logs",
@@ -184,7 +187,8 @@ export class PhoneControlService {
       ok: true,
       data: {
         profile: policy.profile,
-        allowedApps: policy.allowedApps
+        allowedApps: policy.allowedApps,
+        allowAllApps: policy.allowAllApps === true
       }
     };
   }
@@ -710,7 +714,14 @@ export class PhoneControlService {
         throw new PhoneControlError(
           "STALE_OBSERVATION",
           "The stable-surface observation changed before dispatch; refresh before acting.",
-          { observationId: reference.observationId, changed: comparison.changed }
+          {
+            observationId: reference.observationId,
+            ...staleObservationDiagnostics(
+              reference,
+              surface,
+              comparison.changed
+            )
+          }
         );
       }
       initialCaptureMs = elapsedMilliseconds(initialStarted);
@@ -1150,7 +1161,10 @@ export class PhoneControlService {
       throw new PhoneControlError(
         "STALE_OBSERVATION",
         "The screen changed between sequence steps; refresh before acting.",
-        { observationId: baseline.observationId, changed }
+        {
+          observationId: baseline.observationId,
+          ...staleObservationDiagnostics(baseline, current, changed)
+        }
       );
     };
 
@@ -1483,11 +1497,20 @@ export class PhoneControlService {
         ? this.#observations.compareCoordinateAction(observation, current)
         : this.#observations.compare(observation, current);
     if (!comparison.matches) {
+      const currentObservation = this.#observations.create(current);
       this.#observations.invalidate(observation.observationId);
       throw new PhoneControlError(
         "STALE_OBSERVATION",
         "The screen changed since the observation was captured; refresh before acting.",
-        { observationId: observation.observationId, changed: comparison.changed }
+        {
+          observationId: observation.observationId,
+          ...staleObservationDiagnostics(
+            observation,
+            current,
+            comparison.changed,
+            currentObservation.observationId
+          )
+        }
       );
     }
 
@@ -1521,7 +1544,6 @@ export class PhoneControlService {
         outcome: "pending",
         phase: "start"
       });
-      await this.#sleep(POINTER_START_DELAY_MS);
     }
 
     const preflightMs = elapsedMilliseconds(preflightStarted);

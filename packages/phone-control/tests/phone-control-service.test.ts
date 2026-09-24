@@ -43,6 +43,11 @@ const POLICY: PolicyProfile = {
   profile: "local",
   allowedApps: ["com.sec.android.app.popupcalculator"]
 };
+const FULL_ACCESS_POLICY: PolicyProfile = {
+  profile: "local",
+  allowedApps: [],
+  allowAllApps: true
+};
 
 class MemoryAuditLogger {
   readonly entries: AuditLogEntry[] = [];
@@ -391,6 +396,10 @@ describe("UI Automator and observation core", () => {
 });
 
 describe("phone-control service safety", () => {
+  it("allows any non-empty package when full app access is enabled", () => {
+    expect(() => assertAllowedTarget(FULL_ACCESS_POLICY, "com.android.settings")).not.toThrow();
+  });
+
   it("opens an approved app in a virtual display by default on Android 10+", async () => {
     const adb = new FakeAdb();
     adb.foreground = {
@@ -500,7 +509,14 @@ describe("phone-control service safety", () => {
       })
     ).rejects.toMatchObject({
       code: "STALE_OBSERVATION",
-      details: { changed: ["screenshotHash"] }
+      details: {
+        changed: ["screenshotHash"],
+        approvedObservationId: observationId,
+        currentObservationId: expect.any(String),
+        reasons: [
+          expect.objectContaining({ code: "SCREENSHOT_CHANGED" })
+        ]
+      }
     });
     expect(adb.taps).toHaveLength(0);
     expect(adb.calls.dumpUiAutomatorXml).toBe(0);
@@ -655,7 +671,14 @@ describe("phone-control service safety", () => {
       })
     ).rejects.toMatchObject({
       code: "STALE_OBSERVATION",
-      details: { changed: ["screenshotHash"] }
+      details: {
+        changed: ["screenshotHash"],
+        approvedObservationId: observationId,
+        currentObservationId: expect.any(String),
+        reasons: [
+          expect.objectContaining({ code: "SCREENSHOT_CHANGED" })
+        ]
+      }
     });
     expect(adb.taps).toHaveLength(0);
   });
@@ -950,7 +973,12 @@ describe("phone-control service safety", () => {
     adb.tap = async () => {
       order.push("tap");
     };
-    const service = createService(adb, logger);
+    const sleeps: number[] = [];
+    const service = createService(adb, logger, {
+      sleep: async (milliseconds) => {
+        sleeps.push(milliseconds);
+      }
+    });
     const observed = await service.observe();
 
     await service.execute({
@@ -959,6 +987,7 @@ describe("phone-control service safety", () => {
     });
 
     expect(order.slice(0, 2)).toEqual(["audit:start", "tap"]);
+    expect(sleeps).toEqual([]);
   });
 
   it("rejects coordinates outside the current display", async () => {

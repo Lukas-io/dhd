@@ -2,6 +2,8 @@
 
 package com.phonecontrol.assistant.ui
 
+import android.widget.ImageView
+import android.view.Surface as AndroidSurface
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
@@ -24,7 +26,9 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -47,16 +51,21 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.text.KeyboardActions
@@ -65,12 +74,16 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -87,8 +100,10 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.key
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -98,6 +113,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -107,11 +123,16 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.SubcomposeLayout
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
@@ -121,20 +142,35 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
+import androidx.compose.ui.viewinterop.AndroidView
 import com.phonecontrol.assistant.R
 import com.phonecontrol.assistant.apps.AppPermissionRepository
 import com.phonecontrol.assistant.apps.InstalledUserApp
 import com.phonecontrol.assistant.bridge.DevBridgeServer
+import com.phonecontrol.assistant.bridge.PendingCompanionPairing
 import com.phonecontrol.assistant.data.ConversationStore
+import com.phonecontrol.assistant.data.DHD_BROWSE_APP_TOOL
 import com.phonecontrol.assistant.data.DHD_CONVERSATION_ID
+import com.phonecontrol.assistant.data.DHD_EXECUTE_SEQUENCE_TOOL
+import com.phonecontrol.assistant.data.DHD_EXECUTE_TOOL
+import com.phonecontrol.assistant.data.DHD_FOREGROUND_APP_TOOL
+import com.phonecontrol.assistant.data.DHD_LIST_ALLOWED_APPS_TOOL
+import com.phonecontrol.assistant.data.DHD_OBSERVE_TOOL
+import com.phonecontrol.assistant.data.DHD_OPEN_APP_TOOL
 import com.phonecontrol.assistant.data.TimelineItem
 import com.phonecontrol.assistant.domain.ReasoningEffort
-import com.phonecontrol.assistant.domain.userFacingActivityLabel
+import com.phonecontrol.assistant.session.DhdToolCall
+import com.phonecontrol.assistant.session.DhdToolCallStatus
 import com.phonecontrol.assistant.session.SessionCoordinator
 import com.phonecontrol.assistant.session.SessionState
-import com.phonecontrol.assistant.shizuku.ShizukuStatus
+import com.phonecontrol.assistant.developer.DeveloperConnectionState
+import com.phonecontrol.assistant.developer.DeveloperModeStatus
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import java.text.DateFormat
@@ -143,6 +179,79 @@ import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.random.Random
+
+private const val STALE_CONVERSATION_COUNTDOWN_SECONDS = 5
+
+@Composable
+internal fun ConversationExpiryDialog(
+    onKeep: () -> Unit,
+    onClear: () -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    var secondsRemaining by remember {
+        mutableStateOf(STALE_CONVERSATION_COUNTDOWN_SECONDS)
+    }
+
+    LaunchedEffect(Unit) {
+        for (remaining in STALE_CONVERSATION_COUNTDOWN_SECONDS downTo 1) {
+            secondsRemaining = remaining
+            delay(1_000L)
+        }
+        onClear()
+    }
+
+    AlertDialog(
+        onDismissRequest = onKeep,
+        containerColor = colors.surfaceCard,
+        titleContentColor = colors.textPrimary,
+        textContentColor = colors.textSecondary,
+        shape = RoundedCornerShape(20.dp),
+        title = { Text("This conversation is stale", fontWeight = FontWeight.SemiBold) },
+        text = {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Box(
+                    modifier = Modifier.size(112.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator(
+                        progress = {
+                            secondsRemaining.toFloat() / STALE_CONVERSATION_COUNTDOWN_SECONDS
+                        },
+                        modifier = Modifier.fillMaxSize(),
+                        color = colors.accentBlue,
+                        trackColor = colors.composerBackground,
+                        strokeWidth = 5.dp,
+                    )
+                    Text(
+                        text = secondsRemaining.toString(),
+                        fontSize = 40.sp,
+                        fontWeight = FontWeight.Light,
+                        color = colors.textPrimary,
+                    )
+                }
+                Text(
+                    "This chat has been inactive for 3 hours and will clear automatically. " +
+                            "Keep it to continue this conversation.",
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onClear) {
+                Text("Clear now", color = colors.accentBlue, fontWeight = FontWeight.SemiBold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onKeep) {
+                Text("Keep conversation", color = colors.textSecondary)
+            }
+        },
+    )
+}
 
 @Composable
 fun AssistantScreen(
@@ -156,61 +265,105 @@ fun AssistantScreen(
     fastMode: Boolean,
     onSetFastMode: (Boolean) -> Unit,
     onStopSession: () -> Unit,
+    onContinueSession: () -> Unit = {},
+    onAcknowledgeAttention: () -> Boolean,
     onSteerRequest: (String) -> Boolean,
     onOpenSettings: () -> Unit,
+    onOpenPhoneAccess: () -> Unit,
+    onOpenTaskDisplays: () -> Unit = {},
     onStartFresh: () -> Unit,
-    shizukuStatus: ShizukuStatus,
+    developerStatus: DeveloperModeStatus,
     companionConnected: Boolean,
-    onOpenShizuku: () -> Unit,
     onOpenCompanion: () -> Unit,
+    previewState: LiveDisplayPreviewState? = null,
+    onPreviewSurfaceAvailable: (AndroidSurface) -> Unit = {},
+    onPreviewSurfaceDestroyed: PreviewSurfaceDestroyed = { _, release -> release() },
+    onOpenPreview: (String) -> Unit = {},
+    expandedPreviewSessionKey: String? = null,
 ) {
     val colors = LocalAssistantColors.current
     val state by coordinator.state.collectAsState()
+    val toolCalls by coordinator.toolCalls.collectAsState()
     val timeline by store.timeline(DHD_CONVERSATION_ID).collectAsState()
     val active = state.isActive()
+    val combinePhoneAndCompanionRecovery = shouldCombineRecoveryBanners(
+        state = state,
+        developerStatus = developerStatus,
+        companionConnected = companionConnected,
+    )
+    val showTopRecoveryBanner = shouldShowTopRecoveryBanner(
+        state = state,
+        developerStatus = developerStatus,
+        companionConnected = companionConnected,
+    )
+    val phoneRecoveryShownAtTop = showTopRecoveryBanner &&
+            (developerStatus.requiresUserAction || state.showsPhoneAccessRecovery())
+    val companionRecoveryShownAtTop = showTopRecoveryBanner && !companionConnected
+    val keyboardVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    val runningState = state as? SessionState.Running
+    val companionWaitSeconds = if (combinePhoneAndCompanionRecovery && runningState != null) {
+        rememberElapsedSeconds(runningState.startedAtEpochMs, runningState.elapsedBeforeStartMs)
+    } else {
+        null
+    }
     val canSteer = state is SessionState.Running
     var showStartFreshConfirmation by rememberSaveable { mutableStateOf(false) }
-    var steerDraft by rememberSaveable { mutableStateOf("") }
+    var steerDrafts by rememberSaveable(stateSaver = steerDraftsSaver) {
+        mutableStateOf(emptyList<PendingSteerDraft>())
+    }
     var steerDraftSessionId by rememberSaveable { mutableStateOf<String?>(null) }
-    var steerDraftReasoningEffort by rememberSaveable { mutableStateOf<String?>(null) }
-    var steerDraftFastMode by rememberSaveable { mutableStateOf<Boolean?>(null) }
+    var carrySteerDraftsToNextRun by rememberSaveable { mutableStateOf(false) }
     var composerEditText by rememberSaveable { mutableStateOf<String?>(null) }
     var showReasoningSelector by rememberSaveable { mutableStateOf(false) }
+    var topRecoverySlotHeightPx by remember { mutableStateOf(0) }
     val activeSessionId = state.sessionIdOrNullForUi()
+    val currentToolCall = toolCalls.lastOrNull {
+        it.sessionId == activeSessionId && it.status == DhdToolCallStatus.RUNNING
+    }
     LaunchedEffect(activeSessionId) {
-        // A draft belongs to the run in which it was composed. Do not carry an
-        // unsent steer into a newly started task or a rotated session.
         if (steerDraftSessionId != activeSessionId) {
-            steerDraft = ""
+            if (carrySteerDraftsToNextRun && activeSessionId != null && steerDrafts.isNotEmpty()) {
+                // Keep the remaining queue attached to the auto-started run.
+                carrySteerDraftsToNextRun = false
+            } else {
+                steerDrafts = emptyList()
+                carrySteerDraftsToNextRun = false
+            }
             steerDraftSessionId = activeSessionId
-            steerDraftReasoningEffort = null
-            steerDraftFastMode = null
         }
     }
     LaunchedEffect(state) {
         val completed = state as? SessionState.Completed ?: return@LaunchedEffect
-        val normalRequest = steerDraft.trim()
-        if (normalRequest.isBlank() || steerDraftSessionId != completed.sessionId) {
+        val queuedDrafts = steerDrafts
+        if (queuedDrafts.isEmpty() || steerDraftSessionId != completed.sessionId) {
             return@LaunchedEffect
         }
 
-        // A draft that was not explicitly steered becomes the next ordinary
-        // request once the current run has reached a successful terminal state.
-        steerDraft = ""
-        steerDraftSessionId = null
+        // Promote only the oldest held draft. Keep the rest in FIFO order for
+        // later follow-up runs.
+        val nextDraft = queuedDrafts.first()
+        steerDrafts = queuedDrafts.drop(1)
+        carrySteerDraftsToNextRun = steerDrafts.isNotEmpty()
         onRunRequest(
-            normalRequest,
+            nextDraft.text.trim(),
             DHD_CONVERSATION_ID,
-            steerDraftReasoningEffort ?: reasoningEffort.codexValue,
-            steerDraftFastMode ?: fastMode,
+            nextDraft.reasoningEffort,
+            nextDraft.fastMode,
         )
-        steerDraftReasoningEffort = null
-        steerDraftFastMode = null
     }
     val recentCutoff = System.currentTimeMillis() - RECENT_HISTORY_WINDOW_MS
+    val continuationRunId = state.continuationSessionIdOrNullForUi()
+    val activeTaskRunIds = if (active && activeSessionId != null) {
+        groupTimeline(timeline, continuationRunId)
+            .firstOrNull { activeSessionId in it.runIds }
+            ?.runIds
+            ?: setOf(activeSessionId)
+    } else {
+        emptySet()
+    }
     val recentTimeline = timeline.filter { item ->
         item.timestampEpochMs >= recentCutoff ||
-            (active && item.belongsTo(state.sessionIdOrNullForUi()))
+                (active && item.belongsTo(activeTaskRunIds))
     }
 
     Scaffold(
@@ -235,6 +388,25 @@ fun AssistantScreen(
                 },
                 actions = {
                     // Start fresh circular button (48dp)
+                    Surface(
+                        shape = CircleShape,
+                        color = colors.composerBackground,
+                        border = BorderStroke(1.dp, colors.borderColor),
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .clickable(onClick = onOpenTaskDisplays),
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_laptop),
+                                contentDescription = "Task displays",
+                                tint = colors.textPrimary,
+                                modifier = Modifier.size(22.dp),
+                            )
+                        }
+                    }
+                    Spacer(Modifier.width(8.dp))
                     Surface(
                         shape = CircleShape,
                         color = colors.composerBackground,
@@ -287,6 +459,50 @@ fun AssistantScreen(
                     .navigationBarsPadding()
                     .imePadding(),
             ) {
+                if (showTopRecoveryBanner) {
+                    // Keep the island visually floating while giving it a
+                    // real layout slot. Conversation content is measured
+                    // below it instead of rendering underneath an overlay.
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .onGloballyPositioned { topRecoverySlotHeightPx = it.size.height },
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 8.dp, start = 16.dp, end = 16.dp),
+                            contentAlignment = Alignment.TopCenter,
+                        ) {
+                            if (combinePhoneAndCompanionRecovery) {
+                                CombinedRecoveryCard(
+                                    phoneStatus = developerStatus,
+                                    companionWaitSeconds = companionWaitSeconds,
+                                    onOpenPhoneAccess = onOpenPhoneAccess,
+                                    onOpenCompanion = onOpenCompanion,
+                                    compact = keyboardVisible || recentTimeline.isEmpty(),
+                                    modifier = Modifier.widthIn(max = 520.dp),
+                                )
+                            } else if (phoneRecoveryShownAtTop) {
+                                DeveloperConnectionRecoveryCard(
+                                    status = developerStatus,
+                                    onOpenPhoneAccess = onOpenPhoneAccess,
+                                    compact = recentTimeline.isEmpty(),
+                                    modifier = Modifier.widthIn(max = 520.dp),
+                                )
+                            } else {
+                                CompanionRecoveryCard(
+                                    elapsedSeconds = null,
+                                    onOpenCompanion = onOpenCompanion,
+                                    compact = recentTimeline.isEmpty(),
+                                    modifier = Modifier.widthIn(max = 520.dp),
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                    }
+                }
+
                 // Chat timeline stays strictly above composer area with soft fade at the bottom
                 Box(
                     modifier = Modifier
@@ -309,8 +525,9 @@ fun AssistantScreen(
                     if (recentTimeline.isEmpty()) {
                         EmptyChat(
                             modifier = Modifier.fillMaxSize(),
-                            onSelectPrompt = {
-                                prompt -> onRunRequest(
+                            topReservedSpacePx = if (showTopRecoveryBanner) topRecoverySlotHeightPx else 0,
+                            onSelectPrompt = { prompt ->
+                                onRunRequest(
                                     prompt,
                                     DHD_CONVERSATION_ID,
                                     reasoningEffort.codexValue,
@@ -322,12 +539,20 @@ fun AssistantScreen(
                         ConversationTimeline(
                             timeline = recentTimeline,
                             state = state,
-                            shizukuStatus = shizukuStatus,
+                            currentToolCall = currentToolCall,
+                            developerStatus = developerStatus,
+                            phoneRecoveryShownAtTop = phoneRecoveryShownAtTop,
+                            companionRecoveryShownAtTop = companionRecoveryShownAtTop,
                             companionConnected = companionConnected,
-                            onOpenSettings = onOpenSettings,
-                            onOpenShizuku = onOpenShizuku,
+                            onOpenPhoneAccess = onOpenPhoneAccess,
                             onOpenCompanion = onOpenCompanion,
                             onStopSession = onStopSession,
+                            onAcknowledgeAttention = onAcknowledgeAttention,
+                            previewState = previewState,
+                            onPreviewSurfaceAvailable = onPreviewSurfaceAvailable,
+                            onPreviewSurfaceDestroyed = onPreviewSurfaceDestroyed,
+                            onOpenPreview = onOpenPreview,
+                            expandedPreviewSessionKey = expandedPreviewSessionKey,
                             modifier = Modifier.fillMaxSize(),
                             contentPadding = PaddingValues(
                                 top = 12.dp,
@@ -354,29 +579,53 @@ fun AssistantScreen(
                             .padding(top = 4.dp, bottom = 12.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
-                        if (canSteer && steerDraft.isNotBlank()) {
-                            SteerDraftBar(
-                                text = steerDraft,
-                                onSteer = {
-                                    if (onSteerRequest(steerDraft)) {
-                                        steerDraft = ""
-                                        steerDraftReasoningEffort = null
-                                        steerDraftFastMode = null
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                },
-                                onDismiss = {
-                                    steerDraft = ""
-                                    steerDraftReasoningEffort = null
-                                    steerDraftFastMode = null
-                                },
-                                onEdit = {
-                                    composerEditText = steerDraft
-                                    steerDraft = ""
-                                },
-                            )
+                        if (canSteer && steerDrafts.isNotEmpty()) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(max = 192.dp)
+                                    .verticalScroll(rememberScrollState()),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                steerDrafts.forEachIndexed { index, draft ->
+                                    SteerDraftBar(
+                                        text = draft.text,
+                                        onSteer = {
+                                            if (onSteerRequest(draft.text)) {
+                                                steerDrafts = steerDrafts.toMutableList().also {
+                                                    it.removeAt(index)
+                                                }
+                                                if (steerDrafts.isEmpty()) {
+                                                    steerDraftSessionId = null
+                                                    carrySteerDraftsToNextRun = false
+                                                }
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        },
+                                        onDismiss = {
+                                            steerDrafts = steerDrafts.toMutableList().also {
+                                                it.removeAt(index)
+                                            }
+                                            if (steerDrafts.isEmpty()) {
+                                                steerDraftSessionId = null
+                                                carrySteerDraftsToNextRun = false
+                                            }
+                                        },
+                                        onEdit = {
+                                            composerEditText = draft.text
+                                            steerDrafts = steerDrafts.toMutableList().also {
+                                                it.removeAt(index)
+                                            }
+                                            if (steerDrafts.isEmpty()) {
+                                                steerDraftSessionId = null
+                                                carrySteerDraftsToNextRun = false
+                                            }
+                                        },
+                                    )
+                                }
+                            }
                             Spacer(Modifier.height(6.dp))
                         }
                         RequestComposer(
@@ -396,10 +645,12 @@ fun AssistantScreen(
                             onEditTextConsumed = { composerEditText = null },
                             onSend = { request ->
                                 if (canSteer) {
-                                    steerDraft = request
+                                    steerDrafts = steerDrafts + PendingSteerDraft(
+                                        text = request,
+                                        reasoningEffort = reasoningEffort.codexValue,
+                                        fastMode = fastMode,
+                                    )
                                     steerDraftSessionId = activeSessionId
-                                    steerDraftReasoningEffort = reasoningEffort.codexValue
-                                    steerDraftFastMode = fastMode
                                     true
                                 } else {
                                     onRunRequest(
@@ -412,6 +663,8 @@ fun AssistantScreen(
                                 }
                             },
                             onStop = onStopSession,
+                            canContinue = state is SessionState.Stopped && recentTimeline.isNotEmpty(),
+                            onContinue = onContinueSession,
                         )
                     }
                 }
@@ -442,7 +695,7 @@ fun AssistantScreen(
             text = {
                 Text(
                     "This clears the DHD conversation timeline and rotates its stored Codex thread " +
-                        "binding. App permissions and Shizuku configuration remain unchanged.",
+                            "binding. App permissions and DHD's local phone connection remain unchanged.",
                     fontSize = 14.sp,
                     lineHeight = 20.sp,
                 )
@@ -451,6 +704,11 @@ fun AssistantScreen(
                 TextButton(
                     onClick = {
                         showStartFreshConfirmation = false
+                        steerDrafts = emptyList()
+                        steerDraftSessionId = null
+                        carrySteerDraftsToNextRun = false
+                        composerEditText = null
+                        coordinator.reset()
                         onStartFresh()
                     },
                 ) {
@@ -465,48 +723,113 @@ fun AssistantScreen(
         )
     }
 }
+
 @Composable
 private fun EmptyChat(
     modifier: Modifier = Modifier,
+    topReservedSpacePx: Int = 0,
     onSelectPrompt: (String) -> Unit = {},
 ) {
-    val colors = LocalAssistantColors.current
-    Box(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(horizontal = 24.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
-            Text(
-                text = "What can I do on your phone?",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold,
-                color = colors.textPrimary,
+    SubcomposeLayout(
+        modifier = modifier.padding(horizontal = 24.dp),
+    ) { constraints ->
+        val layoutWidth = constraints.maxWidth
+        val hasBoundedHeight = constraints.maxHeight != Constraints.Infinity
+        val layoutHeight = if (hasBoundedHeight) constraints.maxHeight else 0
+        val content = subcompose("centered-content") {
+            EmptyChatContent(
+                modifier = Modifier.widthIn(max = 480.dp),
+                onSelectPrompt = onSelectPrompt,
             )
-            Text(
-                text = "Ask DHD to operate apps on your device.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = colors.textSecondary,
-                lineHeight = 20.sp,
-            )
-            Spacer(Modifier.height(8.dp))
-            Column(
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                PromptSuggestionChip(
-                    text = "Call my Mom",
-                    onClick = { onSelectPrompt("Call my Mom") },
-                )
-                PromptSuggestionChip(
-                    text = "Play me \"Jesus be the name\" on Spotify",
-                    onClick = { onSelectPrompt("Play me \"Jesus be the name\" on Spotify") },
+        }.single().measure(
+            constraints.copy(
+                minWidth = 0,
+                minHeight = 0,
+                maxHeight = Constraints.Infinity,
+            ),
+        )
+
+        if (!hasBoundedHeight) {
+            layout(layoutWidth, content.height) {
+                content.placeRelative(
+                    x = ((layoutWidth - content.width) / 2).coerceAtLeast(0),
+                    y = 0,
                 )
             }
+        } else if (content.height <= layoutHeight) {
+            val reserved = topReservedSpacePx.coerceAtMost(layoutHeight)
+            val idealTop = ((reserved + layoutHeight) / 2f - reserved - content.height / 2f)
+                .roundToInt()
+            val top = idealTop.coerceIn(0, (layoutHeight - content.height).coerceAtLeast(0))
+            layout(layoutWidth, layoutHeight) {
+                content.placeRelative(
+                    x = ((layoutWidth - content.width) / 2).coerceAtLeast(0),
+                    y = top,
+                )
+            }
+        } else {
+            val scrollableContent = subcompose("scrollable-content") {
+                EmptyChatContent(
+                    modifier = Modifier
+                        .widthIn(max = 480.dp)
+                        .verticalScroll(rememberScrollState()),
+                    onSelectPrompt = onSelectPrompt,
+                )
+            }.single().measure(
+                constraints.copy(minWidth = 0, minHeight = 0),
+            )
+            val height = if (hasBoundedHeight) layoutHeight else scrollableContent.height
+            layout(layoutWidth, height) {
+                scrollableContent.placeRelative(
+                    x = ((layoutWidth - scrollableContent.width) / 2).coerceAtLeast(0),
+                    y = 0,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun EmptyChatContent(
+    modifier: Modifier = Modifier,
+    onSelectPrompt: (String) -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        Text(
+            text = "What can I do on your phone?",
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.SemiBold,
+            color = colors.textPrimary,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Text(
+            text = "Ask DHD to operate apps on your device.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = colors.textSecondary,
+            lineHeight = 20.sp,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(8.dp))
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            PromptSuggestionChip(
+                text = "Get me jollof rice and chicken under 6k",
+                onClick = { onSelectPrompt("Get me jollof rice and chicken under 6k") },
+            )
+            PromptSuggestionChip(
+                text = "Play me \"Jesus be the name\" on Spotify",
+                onClick = { onSelectPrompt("Play me \"Jesus be the name\" on Spotify") },
+            )
         }
     }
 }
@@ -543,8 +866,9 @@ private fun PromptSuggestionChip(
     }
 }
 
-private data class TaskGroup(
+internal data class TaskGroup(
     val id: String,
+    val runIds: Set<String>,
     val userMessage: TimelineItem.Message?,
     val steerMessages: List<TimelineItem.Message>,
     val activities: List<TimelineItem.Activity>,
@@ -553,6 +877,7 @@ private data class TaskGroup(
 )
 
 private class TaskGroupBuilder(val id: String) {
+    val runIds = linkedSetOf<String>()
     var userMessage: TimelineItem.Message? = null
     val steerMessages = mutableListOf<TimelineItem.Message>()
     val activities = mutableListOf<TimelineItem.Activity>()
@@ -565,6 +890,7 @@ private class TaskGroupBuilder(val id: String) {
 
     fun build(): TaskGroup = TaskGroup(
         id = id,
+        runIds = runIds.toSet(),
         userMessage = userMessage,
         steerMessages = steerMessages.toList(),
         activities = activities.toList(),
@@ -573,7 +899,10 @@ private class TaskGroupBuilder(val id: String) {
     )
 }
 
-private fun groupTimeline(timeline: List<TimelineItem>): List<TaskGroup> {
+internal fun groupTimeline(
+    timeline: List<TimelineItem>,
+    continuationRunId: String? = null,
+): List<TaskGroup> {
     val builders = linkedMapOf<String, TaskGroupBuilder>()
     timeline.forEach { item ->
         val key = when (item) {
@@ -581,6 +910,7 @@ private fun groupTimeline(timeline: List<TimelineItem>): List<TaskGroup> {
             is TimelineItem.Activity -> item.runId
         }
         val builder = builders.getOrPut(key) { TaskGroupBuilder(key) }
+        builder.runIds += key
         builder.addTimestamp(item.timestampEpochMs)
         when (item) {
             is TimelineItem.Message -> {
@@ -592,6 +922,7 @@ private fun groupTimeline(timeline: List<TimelineItem>): List<TaskGroup> {
                     builder.assistantMessages += item
                 }
             }
+
             is TimelineItem.Activity -> {
                 // The activity feed is a DHD tool trace, not a general-purpose
                 // session log. Keep only physical action events and omit
@@ -600,27 +931,141 @@ private fun groupTimeline(timeline: List<TimelineItem>): List<TaskGroup> {
             }
         }
     }
-    return builders.values.map(TaskGroupBuilder::build).sortedBy { it.timestampEpochMs }
+    val rawGroups = builders.values.map(TaskGroupBuilder::build).sortedBy { it.timestampEpochMs }
+    val groups = mutableListOf<TaskGroup>()
+
+    rawGroups.forEach { group ->
+        // A Continue run deliberately has no user-message row. Fold those
+        // hidden runs into the latest visible task so an interrupted task
+        // keeps one activity trace after it resumes. The actual run IDs stay
+        // in the group for active-state and preview matching.
+        if (group.userMessage == null) {
+            val parentIndex = groups.indexOfLast { it.userMessage != null }
+            if (parentIndex >= 0) {
+                groups[parentIndex] = groups[parentIndex].merge(group)
+                return@forEach
+            }
+        }
+        groups += group
+    }
+
+    // Before the resumed turn emits its first event, it has no timeline item
+    // of its own. Associate the active continuation with the latest task now
+    // so the thinking animation is visible immediately after Continue.
+    if (continuationRunId != null && groups.isNotEmpty() &&
+        groups.none { continuationRunId in it.runIds }
+    ) {
+        val parentIndex = groups.indexOfLast { it.userMessage != null }
+            .takeIf { it >= 0 }
+            ?: groups.lastIndex
+        groups[parentIndex] = groups[parentIndex].copy(
+            runIds = groups[parentIndex].runIds + continuationRunId,
+        )
+    }
+
+    return groups
 }
 
+private fun TaskGroup.merge(other: TaskGroup): TaskGroup = copy(
+    runIds = runIds + other.runIds,
+    steerMessages = steerMessages + other.steerMessages,
+    activities = activities + other.activities,
+    assistantMessages = assistantMessages + other.assistantMessages,
+    timestampEpochMs = minOf(timestampEpochMs, other.timestampEpochMs),
+)
+
 private fun TimelineItem.Activity.isDhdActionActivity(): Boolean =
-    !status.equals("confirmation", ignoreCase = true)
+    !status.equals("confirmation", ignoreCase = true) &&
+            !toolName.equals("dhd_close_display", ignoreCase = true) &&
+            !toolName.equals("close_display", ignoreCase = true)
+
+internal const val MAX_VISIBLE_TRACE_ACTIVITIES = 5
+
+internal data class ActivityTraceSlice(
+    val visibleActivities: List<TimelineItem.Activity>,
+    val earlierCount: Int,
+    val currentActivityId: String?,
+    val hasSyntheticCurrent: Boolean,
+)
+
+/** Keep the conversation trace compact without discarding the stored history. */
+internal fun capActivityTrace(
+    activities: List<TimelineItem.Activity>,
+    active: Boolean,
+    currentActivityId: String? = null,
+    hasCurrentTool: Boolean = false,
+): ActivityTraceSlice {
+    val persistedCurrentId = currentActivityId
+        ?.takeIf { id -> active && activities.any { it.id == id } }
+    val hasCurrent = persistedCurrentId != null || (active && hasCurrentTool)
+    val historyLimit = (MAX_VISIBLE_TRACE_ACTIVITIES - if (hasCurrent) 1 else 0)
+        .coerceAtLeast(0)
+    val recentActivities = activities
+        .filterNot { it.id == persistedCurrentId }
+        .takeLast(historyLimit)
+    val visibleIds = (recentActivities.map { it.id } + listOfNotNull(persistedCurrentId)).toSet()
+    val visibleActivities = activities.filter { it.id in visibleIds }
+
+    return ActivityTraceSlice(
+        visibleActivities = visibleActivities,
+        earlierCount = (activities.size - visibleActivities.size).coerceAtLeast(0),
+        currentActivityId = persistedCurrentId,
+        hasSyntheticCurrent = active && hasCurrentTool && persistedCurrentId == null,
+    )
+}
+
+internal fun earlierActionsLabel(count: Int): String {
+    val safeCount = count.coerceAtLeast(0)
+    return "+$safeCount earlier action${if (safeCount == 1) "" else "s"}"
+}
+
+private fun TimelineItem.Activity.isInFlight(): Boolean =
+    status.equals("proposed", ignoreCase = true) || status.equals("running", ignoreCase = true)
+
+private fun TimelineItem.Activity.matchesLiveTool(toolCall: DhdToolCall): Boolean {
+    val activityStatus = status.lowercase()
+    val sameTool = toolName?.equals(toolCall.toolName, ignoreCase = true) == true ||
+            (toolCall.toolName.equals(DHD_OPEN_APP_TOOL, ignoreCase = true) &&
+                    toolName.equals(DHD_EXECUTE_TOOL, ignoreCase = true) &&
+                    actionType.equals("OPEN_APP", ignoreCase = true))
+    return runId == toolCall.sessionId &&
+            sameTool &&
+            createdAtEpochMs >= toolCall.startedAtEpochMs &&
+            // The phone records ACTION_SUCCEEDED/ACTION_FAILED before the bridge
+            // finishes the outer live tool call. Treat that terminal row as the
+            // same call so the UI never renders a green persisted row alongside
+            // its cyan synthetic counterpart.
+            activityStatus in setOf("info", "proposed", "running", "completed", "failed", "attention")
+}
 
 @Composable
 private fun ConversationTimeline(
     timeline: List<TimelineItem>,
     state: SessionState,
-    shizukuStatus: ShizukuStatus,
+    currentToolCall: DhdToolCall? = null,
+    developerStatus: DeveloperModeStatus,
+    phoneRecoveryShownAtTop: Boolean,
+    companionRecoveryShownAtTop: Boolean,
     companionConnected: Boolean,
-    onOpenSettings: () -> Unit,
-    onOpenShizuku: () -> Unit,
+    onOpenPhoneAccess: () -> Unit,
     onOpenCompanion: () -> Unit,
     onStopSession: () -> Unit,
+    onAcknowledgeAttention: () -> Boolean,
+    previewState: LiveDisplayPreviewState? = null,
+    onPreviewSurfaceAvailable: (AndroidSurface) -> Unit = {},
+    onPreviewSurfaceDestroyed: PreviewSurfaceDestroyed = { _, release -> release() },
+    onOpenPreview: (String) -> Unit = {},
+    expandedPreviewSessionKey: String? = null,
     modifier: Modifier = Modifier,
     contentPadding: PaddingValues = PaddingValues(vertical = 12.dp),
 ) {
     val listState = rememberLazyListState()
-    val groups = remember(timeline) { groupTimeline(timeline) }
+    var timelineBounds by remember { mutableStateOf<Rect?>(null) }
+    var expandButtonBounds by remember { mutableStateOf<Rect?>(null) }
+    val continuationRunId = state.continuationSessionIdOrNullForUi()
+    val groups = remember(timeline, continuationRunId) {
+        groupTimeline(timeline, continuationRunId)
+    }
 
     // Keep following the live answer until the user starts a real list drag.
     // Content growth can temporarily make the list report that it is no longer
@@ -639,38 +1084,118 @@ private fun ConversationTimeline(
             if (!canScrollForward) followLatest = true
         }
     }
+    // The inline preview is a live child of the task group. Its decoder and
+    // tool rows can change height while the user is reading older messages;
+    // do not reposition the list around that child as it updates.
+    // A stopped/completed run can still own a retained display. Keep the
+    // preview attached to its historical task group while the display is
+    // retained; stopping the run only removes action authority.
+    val previewBelongsToCurrentTimeline = state.sessionIdOrNullForUi() != null &&
+            previewState?.let { preview ->
+                preview.belongsToRun(state.sessionIdOrNullForUi()) &&
+                        groups.any { group ->
+                            group.runIds.any { runId -> preview.belongsToGroup(runId) }
+                        }
+            } == true
+    val previewExpandedInViewer = previewBelongsToCurrentTimeline &&
+            previewState?.isExpanded(expandedPreviewSessionKey) == true
+    val inlinePreviewVisible = previewBelongsToCurrentTimeline && !previewExpandedInViewer
     LaunchedEffect(
         groups.lastOrNull()?.id,
         groups.lastOrNull()?.activities?.size,
         groups.lastOrNull()?.steerMessages?.size,
         groups.lastOrNull()?.assistantMessages?.lastOrNull()?.text?.length,
+        currentToolCall?.id,
+        currentToolCall?.status,
+        inlinePreviewVisible,
+        previewExpandedInViewer,
     ) {
-        if (groups.isNotEmpty() && followLatest && !listState.isScrollInProgress) {
-            // A very large offset positions the last item at the bottom of the
-            // viewport instead of repeatedly snapping to the card's start.
+        if (
+            groups.isNotEmpty() &&
+            followLatest &&
+            !listState.isScrollInProgress &&
+            !inlinePreviewVisible &&
+            !previewExpandedInViewer
+        ) {
+            // A very large offset positions the last item at the bottom of
+            // the viewport instead of repeatedly snapping to its start.
             listState.scrollToItem(groups.lastIndex, scrollOffset = Int.MAX_VALUE)
         }
     }
-    SelectionContainer {
+    val expandSessionKey = previewState?.sessionKey ?: state.sessionIdOrNullForUi()
+    Box(
+        modifier = Modifier.onGloballyPositioned { coordinates ->
+            timelineBounds = coordinates.boundsInRoot()
+        },
+    ) {
         LazyColumn(
             state = listState,
             modifier = modifier.fillMaxWidth(),
             contentPadding = contentPadding,
             verticalArrangement = Arrangement.spacedBy(18.dp),
+            // The preview has interactive Compose children. Do not keep an
+            // edge overscroll gesture active over them at the list boundary.
+            overscrollEffect = null,
         ) {
             items(groups, key = { it.id }) { group ->
                 TaskGroupCard(
                     group = group,
                     state = state,
-                    shizukuStatus = shizukuStatus,
+                    currentToolCall = currentToolCall,
+                    developerStatus = developerStatus,
+                    phoneRecoveryShownAtTop = phoneRecoveryShownAtTop,
+                    companionRecoveryShownAtTop = companionRecoveryShownAtTop,
                     companionConnected = companionConnected,
-                    onOpenSettings = onOpenSettings,
-                    onOpenShizuku = onOpenShizuku,
+                    onOpenPhoneAccess = onOpenPhoneAccess,
                     onOpenCompanion = onOpenCompanion,
                     onStopSession = onStopSession,
-                    active = state.isActive() && state.sessionIdOrNullForUi() == group.id,
+                    onAcknowledgeAttention = onAcknowledgeAttention,
+                    previewState = previewState,
+                    onPreviewSurfaceAvailable = onPreviewSurfaceAvailable,
+                    onPreviewSurfaceDestroyed = onPreviewSurfaceDestroyed,
+                    onOpenPreview = onOpenPreview,
+                    onPreviewExpandBoundsChanged = { bounds ->
+                        expandButtonBounds = bounds
+                    },
+                    expandedPreviewSessionKey = expandedPreviewSessionKey,
+                    active = state.isActive() &&
+                            state.sessionIdOrNullForUi()?.let(group.runIds::contains) == true,
                 )
             }
+        }
+
+        // Keep the visible affordance in the item for stable semantics and
+        // rendering, but route physical taps through a sibling of LazyColumn.
+        // LazyColumn's drag/selection/edge gesture chain can otherwise retain
+        // the pointer stream after the list reaches its final offset.
+        val rootBounds = timelineBounds
+        val buttonBounds = expandButtonBounds
+        if (
+            rootBounds != null &&
+            buttonBounds != null &&
+            buttonBounds.left >= rootBounds.left &&
+            buttonBounds.top >= rootBounds.top &&
+            buttonBounds.right <= rootBounds.right &&
+            buttonBounds.bottom <= rootBounds.bottom &&
+            expandSessionKey != null
+        ) {
+            Box(
+                modifier = Modifier
+                    .offset {
+                        IntOffset(
+                            x = (buttonBounds.left - rootBounds.left).roundToInt(),
+                            y = (buttonBounds.top - rootBounds.top).roundToInt(),
+                        )
+                    }
+                    .size(48.dp)
+                    .zIndex(3f)
+                    .pointerInput(expandSessionKey) {
+                        detectTapGestures {
+                            android.util.Log.d("DhdPreview", "Expand requested")
+                            onOpenPreview(expandSessionKey)
+                        }
+                    },
+            )
         }
     }
 }
@@ -680,68 +1205,171 @@ private fun ConversationTimeline(
 private fun TaskGroupCard(
     group: TaskGroup,
     state: SessionState,
-    shizukuStatus: ShizukuStatus,
+    currentToolCall: DhdToolCall? = null,
+    developerStatus: DeveloperModeStatus,
+    phoneRecoveryShownAtTop: Boolean,
+    companionRecoveryShownAtTop: Boolean,
     companionConnected: Boolean,
-    onOpenSettings: () -> Unit,
-    onOpenShizuku: () -> Unit,
+    onOpenPhoneAccess: () -> Unit,
     onOpenCompanion: () -> Unit,
     onStopSession: () -> Unit,
+    onAcknowledgeAttention: () -> Boolean,
+    previewState: LiveDisplayPreviewState? = null,
+    onPreviewSurfaceAvailable: (AndroidSurface) -> Unit = {},
+    onPreviewSurfaceDestroyed: PreviewSurfaceDestroyed = { _, release -> release() },
+    onOpenPreview: (String) -> Unit = {},
+    onPreviewExpandBoundsChanged: (Rect?) -> Unit = {},
+    expandedPreviewSessionKey: String? = null,
     active: Boolean,
 ) {
     var traceExpanded by rememberSaveable(group.id) { mutableStateOf(false) }
+    var earlierActionsExpanded by rememberSaveable(group.id) { mutableStateOf(false) }
 
-    val durationSeconds = remember(group) {
-        val start = group.userMessage?.timestampEpochMs ?: group.timestampEpochMs
-        val end = group.assistantMessages.lastOrNull()?.timestampEpochMs
-            ?: group.activities.lastOrNull()?.timestampEpochMs
-            ?: start
-        maxOf(1L, (end - start) / 1000L)
+    val terminalDurationMs = state.workedDurationMsOrNullForUi()
+        ?.takeIf { state.sessionIdOrNullForUi()?.let(group.runIds::contains) == true }
+    val durationSeconds = remember(group, terminalDurationMs) {
+        terminalDurationMs?.let { maxOf(1L, it / 1_000L) } ?: run {
+            val start = group.userMessage?.timestampEpochMs ?: group.timestampEpochMs
+            val end = group.assistantMessages.lastOrNull()?.timestampEpochMs
+                ?: group.activities.lastOrNull()?.timestampEpochMs
+                ?: start
+            maxOf(1L, (end - start) / 1000L)
+        }
     }
+    val liveToolCall = currentToolCall?.takeIf { toolCall ->
+        active && toolCall.sessionId in group.runIds
+    }
+    val liveActivity = liveToolCall?.let { toolCall ->
+        group.activities.asReversed().firstOrNull { it.matchesLiveTool(toolCall) }
+    }
+    val fallbackLiveActivity = if (liveToolCall == null && active) {
+        group.activities.asReversed().firstOrNull { it.isInFlight() }
+    } else {
+        null
+    }
+    val trace = capActivityTrace(
+        activities = group.activities,
+        active = active,
+        currentActivityId = liveActivity?.id ?: fallbackLiveActivity?.id,
+        hasCurrentTool = liveToolCall != null,
+    )
+    val visibleTraceIds = trace.visibleActivities.map { it.id }.toSet()
+    val earlierTraceActivities = group.activities.filterNot { it.id in visibleTraceIds }
 
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         // User message bubble (ChatGPT navy bubble in dark, soft gray bubble in light)
-        group.userMessage?.let { MessageBubble(it) }
+        group.userMessage?.let { message ->
+            SelectionContainer {
+                MessageBubble(message)
+            }
+        }
 
         // Steering instructions stay attached to the current run instead of
         // appearing as a new task.
-        group.steerMessages.forEach { SteerMessageBubble(it) }
+        group.steerMessages.forEach { message ->
+            SelectionContainer {
+                SteerMessageBubble(message)
+            }
+        }
 
-        // Keep the playful status for healthy work, but replace it with a
-        // concrete recovery card whenever the phone cannot make progress.
+        val taskPreviewState = previewState?.let { preview ->
+            if (preview.sessionKey == null) {
+                preview.copy(sessionKey = state.sessionIdOrNullForUi())
+            } else {
+                preview
+            }
+        }
+        val previewVisibleForGroup = taskPreviewState?.let { preview ->
+            group.runIds.any { runId -> preview.belongsToGroup(runId) } &&
+                    !preview.isExpanded(expandedPreviewSessionKey)
+        } == true
+        val previewExpandedForGroup = taskPreviewState?.let { preview ->
+            group.runIds.any { runId -> preview.belongsToGroup(runId) } &&
+                    preview.isExpanded(expandedPreviewSessionKey)
+        } == true
+        if (previewVisibleForGroup) {
+            // Keep the preview outside any SelectionContainer. Its native
+            // TextureView and expand control must not share a selection
+            // gesture surface with the surrounding timeline text.
+            LiveDisplayPreview(
+                state = taskPreviewState,
+                onSurfaceAvailable = onPreviewSurfaceAvailable,
+                onSurfaceDestroyed = onPreviewSurfaceDestroyed,
+                onExpand = { taskPreviewState.sessionKey?.let(onOpenPreview) },
+                onExpandBoundsChanged = onPreviewExpandBoundsChanged,
+            )
+        } else if (previewExpandedForGroup) {
+            // Fullscreen owns the decoder surface. Keep this equal-sized slot
+            // in the timeline so opening/closing the viewer cannot change the
+            // LazyColumn's measured content or clamp its scroll offset.
+            LiveDisplayPreviewPlaceholder(state = taskPreviewState)
+        }
+
+        // Keep the playful status for healthy work. Phone-access recovery is
+        // rendered above the conversation so it does not jump underneath the
+        // user's newly submitted message.
         if (active) {
             when (state) {
-                is SessionState.Running -> RunningStatusIndicator(
-                    currentPurpose = state.currentPurpose,
-                    startedAtEpochMs = state.startedAtEpochMs,
-                    shizukuStatus = shizukuStatus,
-                    companionConnected = companionConnected,
-                    onOpenSettings = onOpenSettings,
-                    onOpenShizuku = onOpenShizuku,
-                    onOpenCompanion = onOpenCompanion,
-                    onStopSession = onStopSession,
-                )
-                is SessionState.Paused -> PausedStatusIndicator(
-                    currentPurpose = state.currentPurpose,
-                )
+                is SessionState.Running -> {
+                    RunningStatusIndicator(
+                        currentPurpose = state.currentPurpose,
+                        attentionReason = state.attentionReason,
+                        attentionActionLabel = state.attentionActionLabel,
+                        startedAtEpochMs = state.startedAtEpochMs,
+                        elapsedBeforeStartMs = state.elapsedBeforeStartMs,
+                        phoneAccessTitle = developerStatus.recoveryTitle,
+                        phoneAccessDetail = developerStatus.recoveryDetail,
+                        companionConnected = companionConnected,
+                        phoneAccessRecoveryShownAtTop = phoneRecoveryShownAtTop,
+                        companionRecoveryShownAtTop = companionRecoveryShownAtTop,
+                        onOpenPhoneAccess = onOpenPhoneAccess,
+                        onOpenCompanion = onOpenCompanion,
+                        onStopSession = onStopSession,
+                        onAcknowledgeAttention = onAcknowledgeAttention,
+                    )
+                }
+
+                is SessionState.Paused -> if (
+                    state.attentionReason != null &&
+                    !(phoneRecoveryShownAtTop &&
+                            state.attentionActionLabel.equals("View instructions", ignoreCase = true))
+                ) {
+                    AttentionRecoveryCard(
+                        reason = state.attentionReason,
+                        actionLabel = state.attentionActionLabel,
+                        phoneAccessTitle = developerStatus.recoveryTitle,
+                        phoneAccessDetail = developerStatus.recoveryDetail,
+                        onAcknowledgeAttention = onAcknowledgeAttention,
+                        onOpenPhoneAccess = onOpenPhoneAccess,
+                        onStopSession = onStopSession,
+                    )
+                } else {
+                    PausedStatusIndicator(
+                        currentPurpose = state.currentPurpose,
+                    )
+                }
+
                 else -> Unit
             }
         }
 
-        // While active: show in-flight tool steps directly under thinking indicator (clean, no boxed container)
-        if (active && group.activities.isNotEmpty()) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 4.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                group.activities.forEach { activity ->
-                    TraceStepRow(activity)
-                }
-            }
+        // While active: show the current tool and the latest four completed
+        // steps directly under the thinking indicator. Older work is summarized
+        // so a long-running task cannot push the conversation downward forever.
+        if (active && (trace.visibleActivities.isNotEmpty() || trace.hasSyntheticCurrent)) {
+            val syntheticCurrent = liveToolCall?.takeIf { trace.hasSyntheticCurrent }
+            AnimatedCollapsedTrace(
+                activities = trace.visibleActivities,
+                earlierActivities = earlierTraceActivities,
+                earlierCount = trace.earlierCount,
+                earlierExpanded = earlierActionsExpanded,
+                currentActivityId = trace.currentActivityId,
+                syntheticCurrent = syntheticCurrent,
+                onToggleEarlier = { earlierActionsExpanded = !earlierActionsExpanded },
+            )
         }
 
         // Completed runs with phone actions keep a collapsible trace. Direct
@@ -756,50 +1384,69 @@ private fun TaskGroupCard(
         }
 
         // Assistant response message(s)
-        group.assistantMessages.forEach { MessageBubble(it) }
+        group.assistantMessages.forEach { message ->
+            SelectionContainer {
+                MessageBubble(message)
+            }
+        }
     }
 }
 
 @Composable
 private fun RunningStatusIndicator(
     currentPurpose: String,
+    attentionReason: String?,
+    attentionActionLabel: String?,
     startedAtEpochMs: Long,
-    shizukuStatus: ShizukuStatus,
+    elapsedBeforeStartMs: Long,
+    phoneAccessTitle: String,
+    phoneAccessDetail: String,
     companionConnected: Boolean,
-    onOpenSettings: () -> Unit,
-    onOpenShizuku: () -> Unit,
+    phoneAccessRecoveryShownAtTop: Boolean,
+    companionRecoveryShownAtTop: Boolean,
+    onOpenPhoneAccess: () -> Unit,
     onOpenCompanion: () -> Unit,
     onStopSession: () -> Unit,
+    onAcknowledgeAttention: () -> Boolean,
 ) {
-    val elapsedSeconds = rememberElapsedSeconds(startedAtEpochMs)
-    val shizukuCheckFinished = !shizukuStatus.message.startsWith("Checking", ignoreCase = true)
-    if (shizukuCheckFinished && !shizukuStatus.privilegedApiReady) {
-        ShizukuRecoveryCard(
-            status = shizukuStatus,
-            onOpenSettings = onOpenSettings,
-            onOpenShizuku = onOpenShizuku,
-        )
-        return
-    }
-
-    val waitingForCompanion = !companionConnected ||
-        currentPurpose.equals("Waiting for desktop Codex bridge", ignoreCase = true) ||
-        (currentPurpose.equals("Preparing request", ignoreCase = true) && elapsedSeconds >= COMPANION_WAIT_CALLOUT_SECONDS)
-    if (waitingForCompanion) {
-        CompanionRecoveryCard(
-            elapsedSeconds = elapsedSeconds,
-            onOpenCompanion = onOpenCompanion,
-        )
-        return
-    }
-
+    val elapsedSeconds = rememberElapsedSeconds(startedAtEpochMs, elapsedBeforeStartMs)
+    // A pending attention request owns the next step. Keep Done visible even
+    // if the companion or developer-status poll changes while the user is
+    // completing a biometric/PIN prompt.
     if (currentPurpose.equals("Needs your attention", ignoreCase = true)) {
-        AttentionRecoveryCard(onStopSession = onStopSession)
+        val phoneAccessInstructionsAtTop = phoneAccessRecoveryShownAtTop &&
+                attentionActionLabel.equals("View instructions", ignoreCase = true)
+        if (!phoneAccessInstructionsAtTop) {
+            AttentionRecoveryCard(
+                reason = attentionReason,
+                actionLabel = attentionActionLabel,
+                phoneAccessTitle = phoneAccessTitle,
+                phoneAccessDetail = phoneAccessDetail,
+                onAcknowledgeAttention = onAcknowledgeAttention,
+                onOpenPhoneAccess = onOpenPhoneAccess,
+                onStopSession = onStopSession,
+            )
+        }
+        return
+    }
+
+    // A slow Codex startup or a released request does not mean that the LAN
+    // companion is disconnected. The phone-side heartbeat lease is the source
+    // of truth for this recovery card.
+    val waitingForCompanion = !companionConnected
+    if (waitingForCompanion) {
+        if (!companionRecoveryShownAtTop) {
+            CompanionRecoveryCard(
+                elapsedSeconds = elapsedSeconds,
+                onOpenCompanion = onOpenCompanion,
+            )
+        }
         return
     }
 
     ShimmerThinkingIndicator(
         startedAtEpochMs = startedAtEpochMs,
+        elapsedBeforeStartMs = elapsedBeforeStartMs,
         elapsedSeconds = elapsedSeconds,
     )
 }
@@ -807,6 +1454,7 @@ private fun RunningStatusIndicator(
 @Composable
 private fun ShimmerThinkingIndicator(
     startedAtEpochMs: Long,
+    elapsedBeforeStartMs: Long,
     elapsedSeconds: Long,
 ) {
     val colors = LocalAssistantColors.current
@@ -918,51 +1566,348 @@ private fun PausedStatusIndicator(currentPurpose: String) {
 
 @Composable
 private fun CompanionRecoveryCard(
-    elapsedSeconds: Long,
+    elapsedSeconds: Long?,
     onOpenCompanion: () -> Unit,
+    compact: Boolean = false,
+    modifier: Modifier = Modifier,
 ) {
     val colors = LocalAssistantColors.current
+    if (compact) {
+        CompactRecoveryStatusCard(
+            icon = R.drawable.ic_laptop,
+            title = "Desktop companion not connected",
+            detail = "DHD is waiting for the desktop companion.",
+            accent = colors.warningAmber,
+            actionLabel = "Instructions",
+            onAction = onOpenCompanion,
+            modifier = modifier,
+        )
+        return
+    }
     RecoveryCard(
         icon = R.drawable.ic_laptop,
         title = "Desktop companion not connected",
-        detail = "DHD has not sent any phone action yet. Check the Codex companion and try again.",
+        detail = "DHD is waiting for the desktop companion. Connect this phone on your local network.",
         accent = colors.warningAmber,
-        actionLabel = "Open desktop companion",
+        actionLabel = "View connection instructions",
         onAction = onOpenCompanion,
-        trailing = "Waiting ${elapsedSeconds}s",
+        modifier = modifier,
+        trailing = elapsedSeconds?.let { "Waiting ${it}s" },
     )
 }
 
 @Composable
-private fun ShizukuRecoveryCard(
-    status: ShizukuStatus,
-    onOpenSettings: () -> Unit,
-    onOpenShizuku: () -> Unit,
+private fun DeveloperConnectionRecoveryCard(
+    status: DeveloperModeStatus,
+    onOpenPhoneAccess: () -> Unit,
+    compact: Boolean = false,
+    modifier: Modifier = Modifier,
 ) {
     val colors = LocalAssistantColors.current
+    if (compact) {
+        CompactRecoveryStatusCard(
+            icon = R.drawable.ic_shield,
+            title = status.recoveryTitle,
+            detail = status.recoveryDetail,
+            accent = colors.warningAmber,
+            actionLabel = "Instructions",
+            onAction = onOpenPhoneAccess,
+            modifier = modifier,
+        )
+        return
+    }
     RecoveryCard(
         icon = R.drawable.ic_shield,
-        title = if (status.binderAvailable) "Shizuku permission needed" else "Shizuku isn’t running",
-        detail = "DHD is paused before the next phone action. ${status.message}",
+        title = status.recoveryTitle,
+        detail = status.recoveryDetail,
         accent = colors.warningAmber,
-        actionLabel = "Open Shizuku",
-        onAction = onOpenShizuku,
-        secondaryActionLabel = "DHD settings",
-        onSecondaryAction = onOpenSettings,
+        actionLabel = "View instructions",
+        onAction = onOpenPhoneAccess,
+        modifier = modifier,
     )
 }
 
 @Composable
-private fun AttentionRecoveryCard(onStopSession: () -> Unit) {
+private fun CompactRecoveryStatusCard(
+    icon: Int,
+    title: String,
+    detail: String,
+    accent: Color,
+    actionLabel: String,
+    onAction: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val colors = LocalAssistantColors.current
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = colors.surfaceCard,
+        border = BorderStroke(1.dp, colors.borderColor),
+        shadowElevation = 0.dp,
+        tonalElevation = 0.dp,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 44.dp)
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                painter = painterResource(icon),
+                contentDescription = null,
+                tint = accent,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(Modifier.width(8.dp))
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text(
+                    text = title,
+                    color = colors.textPrimary,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = detail,
+                    color = colors.textSecondary,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Spacer(Modifier.width(6.dp))
+            Button(
+                onClick = onAction,
+                colors = ButtonDefaults.buttonColors(containerColor = colors.warningAmber),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 9.dp, vertical = 5.dp),
+            ) {
+                Text(actionLabel, fontSize = 11.sp, maxLines = 1)
+            }
+        }
+    }
+}
+
+@Composable
+private fun CombinedRecoveryCard(
+    phoneStatus: DeveloperModeStatus,
+    companionWaitSeconds: Long?,
+    onOpenPhoneAccess: () -> Unit,
+    onOpenCompanion: () -> Unit,
+    compact: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val colors = LocalAssistantColors.current
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = colors.surfaceCard,
+        border = BorderStroke(1.dp, colors.borderColor),
+        shadowElevation = 0.dp,
+        tonalElevation = 0.dp,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = if (compact) 8.dp else 13.dp),
+            verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 12.dp),
+        ) {
+            CombinedRecoverySection(
+                icon = R.drawable.ic_shield,
+                title = if (compact) "Phone access needed" else phoneStatus.recoveryTitle,
+                detail = phoneStatus.recoveryDetail,
+                actionLabel = "View instructions",
+                onAction = onOpenPhoneAccess,
+                compact = compact,
+                compactActionLabel = "Instructions",
+            )
+            HorizontalDivider(color = colors.borderColor.copy(alpha = 0.8f))
+            CombinedRecoverySection(
+                icon = R.drawable.ic_laptop,
+                title = if (compact) "Companion not connected" else "Desktop companion not connected",
+                detail = "DHD is waiting for the desktop companion. Connect this phone on your local network.",
+                trailing = companionWaitSeconds?.let { "Waiting ${it}s" },
+                actionLabel = "View instructions",
+                onAction = onOpenCompanion,
+                compact = compact,
+                compactActionLabel = "Instructions",
+            )
+        }
+    }
+}
+
+@Composable
+private fun CombinedRecoverySection(
+    icon: Int,
+    title: String,
+    detail: String,
+    actionLabel: String,
+    onAction: () -> Unit,
+    trailing: String? = null,
+    compact: Boolean = false,
+    compactActionLabel: String = actionLabel,
+) {
+    val colors = LocalAssistantColors.current
+    if (compact) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 40.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                painter = painterResource(icon),
+                contentDescription = null,
+                tint = colors.warningAmber,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(Modifier.width(9.dp))
+            Text(
+                text = title,
+                color = colors.textPrimary,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(6.dp))
+            Button(
+                onClick = onAction,
+                colors = ButtonDefaults.buttonColors(containerColor = colors.warningAmber),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 9.dp, vertical = 5.dp),
+            ) {
+                Text(compactActionLabel, fontSize = 11.sp, maxLines = 1)
+            }
+        }
+    } else {
+        Column {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    painter = painterResource(icon),
+                    contentDescription = null,
+                    tint = colors.warningAmber,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(9.dp))
+                Text(
+                    text = title,
+                    color = colors.textPrimary,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                )
+                trailing?.let { Text(text = it, color = colors.textSecondary, fontSize = 11.sp) }
+            }
+            Text(
+                text = detail,
+                color = colors.textSecondary,
+                fontSize = 12.sp,
+                lineHeight = 17.sp,
+                modifier = Modifier.padding(start = 27.dp, top = 5.dp),
+            )
+            Button(
+                onClick = onAction,
+                colors = ButtonDefaults.buttonColors(containerColor = colors.warningAmber),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
+                modifier = Modifier.padding(start = 27.dp, top = 9.dp),
+            ) {
+                Text(actionLabel, fontSize = 12.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun AttentionRecoveryCard(
+    reason: String?,
+    actionLabel: String?,
+    phoneAccessTitle: String,
+    phoneAccessDetail: String,
+    onAcknowledgeAttention: () -> Boolean,
+    onOpenPhoneAccess: (() -> Unit)? = null,
+    onStopSession: () -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    val usesPhoneAccessInstructions = actionLabel.equals("View instructions", ignoreCase = true) &&
+            onOpenPhoneAccess != null
+    if (usesPhoneAccessInstructions) {
+        PhoneAccessPausedCard(
+            title = phoneAccessTitle,
+            detail = phoneAccessDetail,
+            onOpenPhoneAccess = onOpenPhoneAccess!!,
+        )
+        return
+    }
     RecoveryCard(
         icon = R.drawable.ic_info,
         title = "DHD needs your attention",
-        detail = "The phone screen changed unexpectedly. Review the phone before continuing.",
+        detail = reason?.takeIf(String::isNotBlank)
+            ?: "Review the phone and complete the requested step before continuing.",
         accent = colors.warningAmber,
-        actionLabel = "Stop",
-        onAction = onStopSession,
+        actionLabel = actionLabel?.takeIf(String::isNotBlank) ?: "Done",
+        onAction = {
+            onAcknowledgeAttention()
+        },
+        secondaryActionLabel = "Stop",
+        onSecondaryAction = onStopSession,
     )
+}
+
+@Composable
+private fun PhoneAccessPausedCard(
+    title: String,
+    detail: String,
+    onOpenPhoneAccess: () -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = Color.Transparent,
+        border = BorderStroke(1.dp, colors.warningAmber.copy(alpha = 0.55f)),
+        shadowElevation = 0.dp,
+        tonalElevation = 0.dp,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_info),
+                    contentDescription = null,
+                    tint = colors.warningAmber,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(9.dp))
+                Text(
+                    text = title,
+                    color = colors.textPrimary,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            Text(
+                text = detail,
+                color = colors.textSecondary,
+                fontSize = 12.sp,
+                lineHeight = 17.sp,
+                modifier = Modifier.padding(start = 27.dp, top = 5.dp),
+            )
+            Button(
+                onClick = onOpenPhoneAccess,
+                colors = ButtonDefaults.buttonColors(containerColor = colors.warningAmber),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
+                modifier = Modifier.padding(start = 27.dp, top = 9.dp),
+            ) {
+                Text("View instructions", fontSize = 12.sp)
+            }
+        }
+    }
 }
 
 @Composable
@@ -976,13 +1921,16 @@ private fun RecoveryCard(
     trailing: String? = null,
     secondaryActionLabel: String? = null,
     onSecondaryAction: (() -> Unit)? = null,
+    modifier: Modifier = Modifier,
 ) {
     val colors = LocalAssistantColors.current
     Surface(
         shape = RoundedCornerShape(16.dp),
         color = colors.surfaceCard,
         border = BorderStroke(1.dp, colors.borderColor),
-        modifier = Modifier.fillMaxWidth(),
+        shadowElevation = 0.dp,
+        tonalElevation = 0.dp,
+        modifier = modifier.fillMaxWidth(),
     ) {
         Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 13.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1039,28 +1987,56 @@ private fun RecoveryCard(
 }
 
 @Composable
-private fun rememberElapsedSeconds(startedAtEpochMs: Long): Long {
-    var elapsedSeconds by remember(startedAtEpochMs) {
-        mutableStateOf(((System.currentTimeMillis() - startedAtEpochMs) / 1_000L).coerceAtLeast(0L))
+private fun rememberElapsedSeconds(
+    startedAtEpochMs: Long,
+    elapsedBeforeStartMs: Long = 0L,
+): Long {
+    val normalizedElapsedBeforeStartMs = elapsedBeforeStartMs.coerceAtLeast(0L)
+    var elapsedSeconds by remember(startedAtEpochMs, normalizedElapsedBeforeStartMs) {
+        mutableStateOf(
+            accumulatedElapsedSeconds(
+                startedAtEpochMs,
+                normalizedElapsedBeforeStartMs,
+                System.currentTimeMillis(),
+            ),
+        )
     }
-    LaunchedEffect(startedAtEpochMs) {
+    LaunchedEffect(startedAtEpochMs, normalizedElapsedBeforeStartMs) {
         while (true) {
-            elapsedSeconds = ((System.currentTimeMillis() - startedAtEpochMs) / 1_000L).coerceAtLeast(0L)
+            elapsedSeconds = accumulatedElapsedSeconds(
+                startedAtEpochMs,
+                normalizedElapsedBeforeStartMs,
+                System.currentTimeMillis(),
+            )
             delay(1_000L)
         }
     }
     return elapsedSeconds
 }
 
+internal fun accumulatedElapsedSeconds(
+    startedAtEpochMs: Long,
+    elapsedBeforeStartMs: Long,
+    nowEpochMs: Long,
+): Long = (
+        elapsedBeforeStartMs.coerceAtLeast(0L) +
+                (nowEpochMs - startedAtEpochMs).coerceAtLeast(0L)
+        ) / 1_000L
+
 private fun thinkingDetail(currentPurpose: String, elapsedSeconds: Long): String = when {
     currentPurpose.equals("Preparing request", ignoreCase = true) && elapsedSeconds >= COMPANION_WAIT_CALLOUT_SECONDS ->
         "Waiting for the desktop companion"
+
     currentPurpose.equals("Preparing request", ignoreCase = true) -> "Connecting to the desktop companion"
-    currentPurpose.equals("Codex is planning", ignoreCase = true) -> "Thinking…"
+    currentPurpose.equals("Codex is planning", ignoreCase = true) || currentPurpose.equals(
+        "DHD is planning",
+        ignoreCase = true
+    ) -> "Thinking…"
+
     else -> currentPurpose.ifBlank { "Preparing the next step" }
 }
 
-private val THINKING_WORDS = listOf(
+internal val THINKING_WORDS = listOf(
     "Thinking…",
     "DHD-ing…",
     "Discombobulating…",
@@ -1273,6 +2249,135 @@ private fun MessageBubble(message: TimelineItem.Message) {
     }
 }
 
+private const val TRACE_NEW_ROW_HANDOFF_MS = 220L
+private const val TRACE_ROW_EXIT_MS = 180L
+
+private data class AnimatedTraceRow(
+    val activity: TimelineItem.Activity,
+    val visible: Boolean = true,
+)
+
+@Composable
+private fun AnimatedCollapsedTrace(
+    activities: List<TimelineItem.Activity>,
+    earlierActivities: List<TimelineItem.Activity>,
+    earlierCount: Int,
+    earlierExpanded: Boolean,
+    currentActivityId: String?,
+    syntheticCurrent: DhdToolCall?,
+    onToggleEarlier: () -> Unit,
+) {
+    var rows by remember { mutableStateOf(activities.map { AnimatedTraceRow(it) }) }
+    var displayedEarlierCount by remember { mutableStateOf(earlierCount) }
+    var displayedSyntheticCurrent by remember { mutableStateOf(syntheticCurrent) }
+    var syntheticVisible by remember { mutableStateOf(syntheticCurrent != null) }
+    val activityIds = activities.map { it.id }
+    val activityById = remember(activities) { activities.associateBy { it.id } }
+
+    LaunchedEffect(activityIds, syntheticCurrent?.id, earlierCount) {
+        val desiredIds = activityIds.toSet()
+        val previousRows = rows
+        val previousIds = previousRows.map { it.activity.id }.toSet()
+        val incomingRows = activities.filter { it.id !in previousIds }
+        val removedIds = previousRows
+            .filter { it.activity.id !in desiredIds }
+            .map { it.activity.id }
+            .toSet()
+        val previousSynthetic = displayedSyntheticCurrent
+        val syntheticAdded = syntheticCurrent != null && previousSynthetic?.id != syntheticCurrent.id
+        val syntheticRemoved = syntheticCurrent == null && previousSynthetic != null
+        val syntheticReplacedByPersisted = syntheticRemoved && previousSynthetic?.let { previous ->
+            activities.any { it.matchesLiveTool(previous) }
+        } == true
+
+        if (syntheticCurrent != null) {
+            displayedSyntheticCurrent = syntheticCurrent
+            syntheticVisible = true
+        }
+        if (syntheticReplacedByPersisted) {
+            // The persisted lifecycle row is the same tool call, not a new
+            // action. Swap it in place instead of running the add/remove
+            // handoff that is reserved for genuinely new calls.
+            displayedSyntheticCurrent = null
+            syntheticVisible = false
+        }
+        if (incomingRows.isNotEmpty()) {
+            rows = previousRows.map { it.copy(visible = true) } +
+                    incomingRows.map { AnimatedTraceRow(it) }
+        }
+
+        // Let the new tool call arrive before the displaced row is moved into
+        // the earlier-actions bucket.
+        if ((incomingRows.isNotEmpty() || syntheticAdded) && !syntheticReplacedByPersisted) {
+            delay(TRACE_NEW_ROW_HANDOFF_MS)
+        }
+
+        if (removedIds.isNotEmpty()) {
+            rows = rows.map { row ->
+                if (row.activity.id in removedIds) row.copy(visible = false) else row
+            }
+        }
+        if (syntheticRemoved && !syntheticReplacedByPersisted) {
+            syntheticVisible = false
+        }
+        displayedEarlierCount = earlierCount
+
+        val syntheticNeedsExit = syntheticRemoved && !syntheticReplacedByPersisted
+        if (removedIds.isNotEmpty() || syntheticNeedsExit) {
+            delay(TRACE_ROW_EXIT_MS)
+            rows = rows.filter { it.activity.id in desiredIds }
+            if (syntheticNeedsExit) {
+                displayedSyntheticCurrent = null
+            }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        EarlierActionsRow(
+            count = displayedEarlierCount,
+            expanded = earlierExpanded,
+            onToggle = onToggleEarlier,
+        )
+        earlierActivities.forEach { activity ->
+            key("earlier-${activity.id}") {
+                AnimatedVisibility(
+                    visible = earlierExpanded,
+                    enter = fadeIn(tween(180)) + expandVertically(tween(220)),
+                    exit = fadeOut(tween(140)) + shrinkVertically(tween(200)),
+                ) {
+                    TraceStepRow(activity = activity)
+                }
+            }
+        }
+        rows.forEach { row ->
+            key(row.activity.id) {
+                AnimatedVisibility(
+                    visible = row.visible,
+                    enter = fadeIn(tween(180)) + expandVertically(tween(180)),
+                    exit = fadeOut(tween(160)) + shrinkVertically(tween(160)),
+                ) {
+                    TraceStepRow(
+                        activity = activityById[row.activity.id] ?: row.activity,
+                        isCurrent = row.activity.id == currentActivityId,
+                    )
+                }
+            }
+        }
+        AnimatedVisibility(
+            visible = syntheticVisible,
+            enter = fadeIn(tween(180)) + expandVertically(tween(180)),
+            exit = fadeOut(tween(160)) + shrinkVertically(tween(160)),
+        ) {
+            displayedSyntheticCurrent?.let { CurrentToolTraceRow(it) }
+        }
+    }
+}
+
 @Composable
 private fun WorkedTraceSection(
     durationSeconds: Long,
@@ -1329,7 +2434,7 @@ private fun WorkedTraceSection(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 activities.forEach { activity ->
-                    TraceStepRow(activity)
+                    TraceStepRow(activity = activity)
                 }
             }
         }
@@ -1337,15 +2442,155 @@ private fun WorkedTraceSection(
 }
 
 @Composable
-private fun TraceStepRow(activity: TimelineItem.Activity) {
+private fun EarlierActionsRow(
+    count: Int,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+) {
+    if (count <= 0) return
+    val colors = LocalAssistantColors.current
+    val label = if (expanded) "Hide earlier actions" else earlierActionsLabel(count)
+    val chevronRotation by animateFloatAsState(
+        targetValue = if (expanded) 180f else 0f,
+        animationSpec = tween(180),
+        label = "earlier_actions_chevron",
+    )
+    Row(
+        modifier = Modifier
+            .padding(start = 30.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(
+                role = Role.Button,
+                onClickLabel = if (expanded) "Collapse earlier actions" else "Show earlier actions",
+                onClick = onToggle,
+            )
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        AnimatedContent(
+            targetState = label,
+            transitionSpec = { fadeIn(tween(140)) togetherWith fadeOut(tween(100)) },
+            label = "earlier_actions_label",
+        ) { animatedLabel ->
+            Text(
+                text = animatedLabel,
+                fontSize = 12.5.sp,
+                color = colors.textSecondary.copy(alpha = 0.78f),
+            )
+        }
+        Icon(
+            painter = painterResource(R.drawable.ic_chevron_down),
+            contentDescription = null,
+            tint = colors.textSecondary.copy(alpha = 0.78f),
+            modifier = Modifier
+                .size(13.dp)
+                .graphicsLayer { rotationZ = chevronRotation },
+        )
+    }
+}
+
+@Composable
+private fun TraceStepRow(
+    activity: TimelineItem.Activity,
+    isCurrent: Boolean = false,
+) {
+    TraceStepRowContent(
+        toolName = activity.toolName,
+        actionType = activity.actionType,
+        label = activityLabel(activity),
+        status = activity.status,
+        isCurrent = isCurrent,
+    )
+}
+
+@Composable
+private fun CurrentToolTraceRow(toolCall: DhdToolCall) {
+    TraceStepRowContent(
+        toolName = toolCall.toolName,
+        label = toolCall.purpose,
+        status = "running",
+        isCurrent = true,
+    )
+}
+
+private data class ToolActivityShimmer(
+    val brush: Brush,
+    val pulseAlpha: Float,
+)
+
+@Composable
+private fun rememberToolActivityShimmer(
+    colors: AssistantColorScheme,
+    shimmerColor: Color,
+): ToolActivityShimmer {
+    val infiniteTransition = rememberInfiniteTransition(label = "tool_activity_shimmer")
+    val shimmerTranslate by infiniteTransition.animateFloat(
+        initialValue = -150f,
+        targetValue = 450f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1300, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "tool_activity_shimmer_translate",
+    )
+    val pulseAlpha by infiniteTransition.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 750, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "tool_activity_pulse_alpha",
+    )
+    return ToolActivityShimmer(
+        brush = Brush.linearGradient(
+            colors = listOf(
+                shimmerColor.copy(alpha = 0.35f),
+                shimmerColor,
+                colors.textPrimary,
+                shimmerColor,
+                shimmerColor.copy(alpha = 0.35f),
+            ),
+            start = Offset(shimmerTranslate, 0f),
+            end = Offset(shimmerTranslate + 160f, 0f),
+        ),
+        pulseAlpha = pulseAlpha,
+    )
+}
+
+@Composable
+private fun TraceStepRowContent(
+    toolName: String?,
+    actionType: String? = null,
+    label: String,
+    status: String,
+    isCurrent: Boolean,
+) {
     val colors = LocalAssistantColors.current
 
-    val statusColor = when (activity.status.lowercase()) {
+    val normalizedStatus = status.lowercase()
+    val statusColor = when (normalizedStatus) {
         "completed" -> colors.accentGreen
         "failed" -> colors.errorRed
         "attention" -> colors.warningAmber
         else -> colors.textSecondary
     }
+    val iconColor = when (normalizedStatus) {
+        "failed" -> colors.errorRed
+        "attention" -> colors.warningAmber
+        else -> toolActivityColor(toolName, colors, statusColor, actionType)
+    }
+    val shimmer = if (isCurrent) {
+        rememberToolActivityShimmer(colors, iconColor)
+    } else {
+        null
+    }
+    val labelStyle = TextStyle(
+        brush = shimmer?.brush,
+        fontSize = 13.5.sp,
+        fontWeight = FontWeight.Normal,
+    )
 
     Row(
         modifier = Modifier
@@ -1357,21 +2602,68 @@ private fun TraceStepRow(activity: TimelineItem.Activity) {
     ) {
         Icon(
             painter = painterResource(R.drawable.ic_connected_nodes),
-            contentDescription = "Tool Call",
-            tint = statusColor,
+            contentDescription = "${toolName ?: "Tool"} call${if (isCurrent) " in progress" else ""}",
+            tint = shimmer?.let { iconColor.copy(alpha = it.pulseAlpha) } ?: iconColor,
             modifier = Modifier.size(18.dp),
         )
         Text(
-            text = activityLabel(activity),
-            fontSize = 13.5.sp,
-            color = colors.textPrimary,
-            fontWeight = FontWeight.Normal,
+            text = label,
+            color = if (shimmer == null) colors.textPrimary else Color.Unspecified,
+            style = labelStyle,
             modifier = Modifier.weight(1f),
             maxLines = 4,
             overflow = TextOverflow.Ellipsis,
         )
     }
 }
+
+/**
+ * Maps the DHD tool represented by an activity row to the same accent used by
+ * the live task-display footer. Unknown tools retain the caller's fallback.
+ */
+internal fun toolActivityColor(
+    toolName: String?,
+    colors: AssistantColorScheme,
+    fallback: Color = colors.textSecondary,
+    actionType: String? = null,
+): Color {
+    if (actionType.equals("WAIT", ignoreCase = true)) return colors.accentMagenta
+
+    return when (toolName?.lowercase()) {
+        "wait", "dhd_wait", "phone_wait_for" -> colors.accentMagenta
+        DHD_OBSERVE_TOOL, "dhd_observe_app" -> colors.accentBlue
+        DHD_EXECUTE_TOOL, DHD_EXECUTE_SEQUENCE_TOOL -> colors.accentGreen
+        DHD_BROWSE_APP_TOOL -> colors.accentPurple
+        DHD_OPEN_APP_TOOL -> colors.accentCyan
+        DHD_FOREGROUND_APP_TOOL -> colors.accentOrange
+        DHD_LIST_ALLOWED_APPS_TOOL -> colors.accentPink
+        else -> fallback
+    }
+}
+
+private data class PendingSteerDraft(
+    val text: String,
+    val reasoningEffort: String,
+    val fastMode: Boolean,
+)
+
+private val steerDraftsSaver = listSaver<List<PendingSteerDraft>, String>(
+    save = { drafts ->
+        drafts.flatMap { draft ->
+            listOf(draft.text, draft.reasoningEffort, draft.fastMode.toString())
+        }
+    },
+    restore = { saved ->
+        saved.chunked(3).mapNotNull { fields ->
+            if (fields.size != 3) return@mapNotNull null
+            PendingSteerDraft(
+                text = fields[0],
+                reasoningEffort = fields[1],
+                fastMode = fields[2].toBoolean(),
+            )
+        }
+    },
+)
 
 @Composable
 private fun SteerDraftBar(
@@ -1476,13 +2768,9 @@ private fun SteerMessageBubble(message: TimelineItem.Message) {
 }
 
 
-
-private fun activityLabel(activity: TimelineItem.Activity): String = userFacingActivityLabel(
-    actionType = activity.actionType?.let { runCatching { com.phonecontrol.assistant.domain.ActionType.valueOf(it) }.getOrNull() },
-    purpose = activity.purpose,
-    targetDescription = activity.targetDescription,
-)
-
+private fun activityLabel(activity: TimelineItem.Activity): String = activity.purpose
+    .trim()
+    .ifBlank { "Working on the phone" }
 
 
 @Composable
@@ -1501,6 +2789,8 @@ private fun RequestComposer(
     onEditTextConsumed: () -> Unit = {},
     onSend: (String) -> Boolean,
     onStop: () -> Unit,
+    canContinue: Boolean,
+    onContinue: () -> Unit,
 ) {
     val colors = LocalAssistantColors.current
     val focusManager = LocalFocusManager.current
@@ -1610,7 +2900,7 @@ private fun RequestComposer(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = 36.dp),
+                    .heightIn(min = if (isExpanded) 48.dp else 36.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 if (!isExpanded) {
@@ -1682,6 +2972,8 @@ private fun RequestComposer(
                         onSend = ::submitRequest,
                         onStop = onStop,
                         canSteer = canSteer,
+                        canContinue = canContinue,
+                        onContinue = onContinue,
                     )
                 }
             }
@@ -1727,6 +3019,8 @@ private fun RequestComposer(
                             onSend = ::submitRequest,
                             onStop = onStop,
                             canSteer = canSteer,
+                            canContinue = canContinue,
+                            onContinue = onContinue,
                         )
                     }
                 }
@@ -1760,7 +3054,7 @@ private fun AttachButton(
 }
 
 @Composable
-private fun FastModeButton(
+internal fun FastModeButton(
     enabled: Boolean,
     selected: Boolean,
     onToggle: () -> Unit,
@@ -1788,7 +3082,9 @@ private fun FastModeButton(
             Icon(
                 painter = painterResource(R.drawable.ic_fast_mode),
                 contentDescription = null,
-                tint = if (selected) Color.White else if (enabled) colors.textPrimary else colors.textSecondary.copy(alpha = 0.45f),
+                tint = if (selected) Color.White else if (enabled) colors.textPrimary else colors.textSecondary.copy(
+                    alpha = 0.45f
+                ),
                 modifier = Modifier.size(18.dp),
             )
         }
@@ -1796,7 +3092,7 @@ private fun FastModeButton(
 }
 
 @Composable
-private fun ReasoningEffortButton(
+internal fun ReasoningEffortButton(
     effort: ReasoningEffort,
     visibleEfforts: List<ReasoningEffort>,
     enabled: Boolean,
@@ -1827,7 +3123,7 @@ private fun ReasoningEffortButton(
 }
 
 @Composable
-private fun ReasoningMeterIcon(
+internal fun ReasoningMeterIcon(
     effort: ReasoningEffort,
     visibleEfforts: List<ReasoningEffort> = ReasoningEffort.entries,
     tint: Color,
@@ -1948,7 +3244,7 @@ private fun ReasoningEffortOverlay(
 }
 
 @Composable
-private fun ReasoningEffortTrack(
+internal fun ReasoningEffortTrack(
     selectedEffort: ReasoningEffort,
     visibleEfforts: List<ReasoningEffort>,
     onSelect: (ReasoningEffort) -> Unit,
@@ -2051,7 +3347,8 @@ private fun ReasoningEffortTrack(
 
                 // Active blue pill track
                 if (currentFraction > 0.001f) {
-                    val pillWidth = (selectedX + thumbRadius - innerMargin).coerceIn(pillHeight, size.width - 2f * innerMargin)
+                    val pillWidth =
+                        (selectedX + thumbRadius - innerMargin).coerceIn(pillHeight, size.width - 2f * innerMargin)
                     drawRoundRect(
                         color = colors.accentBlue,
                         topLeft = Offset(innerMargin, innerMargin),
@@ -2111,9 +3408,11 @@ private fun ActionOrSendButton(
     hasText: Boolean,
     enabled: Boolean,
     canSteer: Boolean,
+    canContinue: Boolean,
     colors: AssistantColorScheme,
     onSend: () -> Unit,
     onStop: () -> Unit,
+    onContinue: () -> Unit,
 ) {
     if (isActive) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -2156,6 +3455,24 @@ private fun ActionOrSendButton(
                 }
             }
         }
+    } else if (canContinue && !hasText) {
+        Surface(
+            shape = CircleShape,
+            color = if (enabled) colors.accentBlue else colors.sendButtonInactiveBg,
+            modifier = Modifier
+                .size(36.dp)
+                .clip(CircleShape)
+                .clickable(enabled = enabled, onClick = onContinue),
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_play),
+                    contentDescription = "Continue task",
+                    tint = if (enabled) Color.White else colors.sendButtonInactiveIcon,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+        }
     } else {
         // Send Upward Arrow Button
         Surface(
@@ -2182,23 +3499,31 @@ private fun ActionOrSendButton(
 fun SettingsScreen(
     apps: List<InstalledUserApp>,
     permissions: AppPermissionRepository,
-    shizukuStatus: ShizukuStatus,
-    bridgeServer: DevBridgeServer,
+    developerStatus: DeveloperModeStatus,
+    companionConnected: Boolean,
     themeMode: ThemeMode,
     onSelectThemeMode: (ThemeMode) -> Unit,
     visibleReasoningEfforts: List<ReasoningEffort>,
     onSetReasoningEffortVisibility: (ReasoningEffort, Boolean) -> Unit,
-    onRequestShizukuPermission: () -> Unit,
+    onOpenPairing: () -> Unit,
     onOpenApprovedApps: () -> Unit,
     onOpenCompanion: () -> Unit,
+    overlayEnabled: Boolean,
+    overlayPermissionGranted: Boolean,
+    onSetOverlayEnabled: (Boolean) -> Unit,
     onBack: () -> Unit,
+    onOpenTaskDisplays: () -> Unit = {},
 ) {
     val colors = LocalAssistantColors.current
     val isFullAccess = remember(permissions.isFullAccessEnabled()) { permissions.isFullAccessEnabled() }
     val enabledCount = remember(permissions.enabledPackages()) { permissions.enabledPackages().size }
-    val lanAddresses = remember { bridgeServer.lanIpv4Addresses() }
     var isAppearanceMenuOpen by remember { mutableStateOf(false) }
     var isReasoningMenuOpen by remember { mutableStateOf(false) }
+    val phoneAccessSettingVisible = developerStatus.state !in setOf(
+        DeveloperConnectionState.READY,
+        DeveloperConnectionState.CONNECTING,
+        DeveloperConnectionState.CHECKING,
+    )
 
     Scaffold(
         containerColor = colors.background,
@@ -2301,7 +3626,10 @@ fun SettingsScreen(
                                     onDismissRequest = { isAppearanceMenuOpen = false },
                                     shape = RoundedCornerShape(16.dp),
                                     containerColor = if (colors.isDark) Color(0xFF262628) else Color(0xFFFFFFFF),
-                                    border = BorderStroke(1.dp, if (colors.isDark) Color(0xFF38383B) else Color(0xFFE5E7EB)),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (colors.isDark) Color(0xFF38383B) else Color(0xFFE5E7EB)
+                                    ),
                                     modifier = Modifier.width(220.dp),
                                 ) {
                                     ThemeMode.entries.forEach { mode ->
@@ -2383,7 +3711,10 @@ fun SettingsScreen(
                                     onDismissRequest = { isReasoningMenuOpen = false },
                                     shape = RoundedCornerShape(16.dp),
                                     containerColor = if (colors.isDark) Color(0xFF262628) else Color(0xFFFFFFFF),
-                                    border = BorderStroke(1.dp, if (colors.isDark) Color(0xFF38383B) else Color(0xFFE5E7EB)),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (colors.isDark) Color(0xFF38383B) else Color(0xFFE5E7EB)
+                                    ),
                                     modifier = Modifier.width(220.dp),
                                 ) {
                                     ReasoningEffort.entries.forEach { effort ->
@@ -2393,7 +3724,9 @@ fun SettingsScreen(
                                             text = {
                                                 Text(
                                                     text = effort.label,
-                                                    color = if (canToggle || isVisible) colors.textPrimary else colors.textSecondary.copy(alpha = 0.5f),
+                                                    color = if (canToggle || isVisible) colors.textPrimary else colors.textSecondary.copy(
+                                                        alpha = 0.5f
+                                                    ),
                                                     fontSize = 15.sp,
                                                     fontWeight = if (isVisible) FontWeight.SemiBold else FontWeight.Normal,
                                                 )
@@ -2477,18 +3810,17 @@ fun SettingsScreen(
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Column {
-                        // Desktop companion Row -> Opens dedicated screen
+                        // Display-over-other-apps overlay
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp))
-                                .clickable { onOpenCompanion() }
+                                .clickable { onSetOverlayEnabled(!overlayEnabled) }
                                 .padding(horizontal = 16.dp, vertical = 14.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Icon(
-                                painter = painterResource(R.drawable.ic_laptop),
-                                contentDescription = "Desktop companion",
+                                painter = painterResource(R.drawable.ic_bot),
+                                contentDescription = "Display over other apps",
                                 tint = colors.textPrimary,
                                 modifier = Modifier.size(22.dp),
                             )
@@ -2498,7 +3830,7 @@ fun SettingsScreen(
                                     .padding(start = 14.dp),
                             ) {
                                 Text(
-                                    text = "Desktop companion",
+                                    text = "Display over other apps",
                                     fontWeight = FontWeight.Medium,
                                     color = colors.textPrimary,
                                     fontSize = 15.sp,
@@ -2506,83 +3838,160 @@ fun SettingsScreen(
                                     overflow = TextOverflow.Ellipsis,
                                 )
                                 Text(
-                                    text = if (lanAddresses.isEmpty()) "Offline" else "Ready on Wi-Fi",
+                                    text = if (overlayPermissionGranted) {
+                                        "Floating DHD bubble is ${if (overlayEnabled) "available" else "off"}"
+                                    } else {
+                                        "Permission required"
+                                    },
                                     fontSize = 12.sp,
-                                    color = colors.textSecondary,
+                                    color = if (!overlayPermissionGranted) colors.accentBlue else colors.textSecondary,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
                                 )
                             }
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = if (lanAddresses.isEmpty()) "Offline" else "Ready",
-                                    color = colors.textSecondary,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    modifier = Modifier.padding(end = 4.dp),
-                                )
+                            Switch(
+                                checked = overlayEnabled,
+                                onCheckedChange = onSetOverlayEnabled,
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = Color.White,
+                                    checkedTrackColor = colors.accentBlue,
+                                ),
+                            )
+                        }
+
+                        // Connection instructions are only useful while the companion is offline.
+                        if (!companionConnected) {
+                            HorizontalDivider(thickness = 2.dp, color = colors.cardDivider)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onOpenCompanion() }
+                                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
                                 Icon(
-                                    painter = painterResource(R.drawable.ic_chevron_right),
-                                    contentDescription = "Open Companion settings",
-                                    tint = colors.textSecondary,
-                                    modifier = Modifier.size(18.dp),
+                                    painter = painterResource(R.drawable.ic_laptop),
+                                    contentDescription = "Desktop companion connection instructions",
+                                    tint = colors.textPrimary,
+                                    modifier = Modifier.size(22.dp),
                                 )
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(start = 14.dp),
+                                ) {
+                                    Text(
+                                        text = "Connect desktop companion",
+                                        fontWeight = FontWeight.Medium,
+                                        color = colors.textPrimary,
+                                        fontSize = 15.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    Text(
+                                        text = "View connection instructions",
+                                        fontSize = 12.sp,
+                                        color = colors.textSecondary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        text = "Set up",
+                                        color = colors.textSecondary,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        modifier = Modifier.padding(end = 4.dp),
+                                    )
+                                    Icon(
+                                        painter = painterResource(R.drawable.ic_chevron_right),
+                                        contentDescription = "Open connection instructions",
+                                        tint = colors.textSecondary,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                }
                             }
                         }
 
-                        HorizontalDivider(thickness = 2.dp, color = colors.cardDivider)
+                        if (phoneAccessSettingVisible) {
+                            HorizontalDivider(thickness = 2.dp, color = colors.cardDivider)
 
-                        // Shizuku Service Row (with terminal/service icon)
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(bottomStart = 20.dp, bottomEnd = 20.dp))
-                                .clickable(enabled = shizukuStatus.binderAvailable && !shizukuStatus.permissionGranted) {
-                                    onRequestShizukuPermission()
-                                }
-                                .padding(horizontal = 16.dp, vertical = 14.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_terminal),
-                                contentDescription = "Shizuku",
-                                tint = colors.textPrimary,
-                                modifier = Modifier.size(22.dp),
-                            )
-                            Column(
+                            // DHD local phone connection row
+                            Row(
                                 modifier = Modifier
-                                    .weight(1f)
-                                    .padding(start = 14.dp),
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(bottomStart = 20.dp, bottomEnd = 20.dp))
+                                    .clickable(enabled = developerStatus.state != DeveloperConnectionState.UNSUPPORTED) {
+                                        onOpenPairing()
+                                    }
+                                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                                verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                Text(
-                                    text = "Shizuku service",
-                                    fontWeight = FontWeight.Medium,
-                                    color = colors.textPrimary,
-                                    fontSize = 15.sp,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
+                                Icon(
+                                    painter = painterResource(R.drawable.ic_terminal),
+                                    contentDescription = "Wireless Debugging",
+                                    tint = colors.textPrimary,
+                                    modifier = Modifier.size(22.dp),
                                 )
-                                Text(
-                                    text = if (shizukuStatus.permissionGranted) {
-                                        "Shizuku is ready"
-                                    } else if (shizukuStatus.binderAvailable) {
-                                        "Permission required"
-                                    } else {
-                                        "Service unavailable"
-                                    },
-                                    fontSize = 12.sp,
-                                    color = colors.textSecondary,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(start = 14.dp),
+                                ) {
+                                    Text(
+                                        text = "DHD phone access",
+                                        fontWeight = FontWeight.Medium,
+                                        color = colors.textPrimary,
+                                        fontSize = 15.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    Text(
+                                        text = when (developerStatus.state) {
+                                            DeveloperConnectionState.READY -> "Phone access is active"
+                                            DeveloperConnectionState.CONNECTING,
+                                            DeveloperConnectionState.CHECKING -> "Connecting phone access automatically…"
+
+                                            DeveloperConnectionState.PAIRING_REQUIRED -> if (developerStatus.paired) {
+                                                "Phone access needed; view the steps to reconnect"
+                                            } else {
+                                                "Set up phone access once"
+                                            }
+
+                                            DeveloperConnectionState.PAIRING_SEARCHING -> "Listening for the pairing service…"
+                                            DeveloperConnectionState.PAIRING_SERVICE_FOUND -> "Check the DHD notification"
+                                            DeveloperConnectionState.WIRELESS_DEBUGGING_OFF -> "Phone access needed; view the steps to reconnect"
+                                            DeveloperConnectionState.UNSUPPORTED -> "DHD needs Android 11+ for phone access"
+                                            DeveloperConnectionState.ERROR -> if (developerStatus.paired) {
+                                                "Phone access needed; view the steps to reconnect"
+                                            } else {
+                                                "Set up phone access once"
+                                            }
+                                        },
+                                        fontSize = 12.sp,
+                                        color = colors.textSecondary,
+                                        maxLines = 2,
+                                        lineHeight = 17.sp,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        text = "Set up",
+                                        color = colors.textSecondary,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        modifier = Modifier.padding(end = 4.dp),
+                                    )
+                                    Icon(
+                                        painter = painterResource(R.drawable.ic_chevron_right),
+                                        contentDescription = "Open phone access instructions",
+                                        tint = colors.textSecondary,
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                }
                             }
-                            Text(
-                                text = if (shizukuStatus.permissionGranted) "Active" else "Action needed",
-                                color = if (shizukuStatus.permissionGranted) colors.textSecondary else colors.accentBlue,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Medium,
-                                modifier = Modifier.padding(start = 8.dp),
-                            )
                         }
                     }
                 }
@@ -2636,14 +4045,828 @@ fun SettingsScreen(
     }
 }
 
+/**
+ * Lists every display record currently known to the task-display registry.
+ * The composable intentionally receives immutable UI records and callbacks so
+ * the lifecycle/daemon implementation can remain outside the UI package.
+ */
 @Composable
-fun CompanionScreen(
-    bridgeServer: DevBridgeServer,
+fun TaskDisplaysScreen(
+    records: List<TaskDisplayUiRecord>,
+    onView: (TaskDisplayUiRecord) -> Unit,
+    onEnd: (TaskDisplayUiRecord) -> Unit,
     onBack: () -> Unit,
 ) {
     val colors = LocalAssistantColors.current
-    var lanAddresses by remember { mutableStateOf(bridgeServer.lanIpv4Addresses()) }
-    var pairingCode by remember { mutableStateOf(bridgeServer.pairingCode) }
+    var endCandidate by remember { mutableStateOf<TaskDisplayUiRecord?>(null) }
+    var actionCandidate by remember { mutableStateOf<TaskDisplayUiRecord?>(null) }
+    var nowEpochMs by remember { mutableStateOf(System.currentTimeMillis()) }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            nowEpochMs = System.currentTimeMillis()
+            delay(TASK_DISPLAY_MANAGER_REFRESH_MS)
+        }
+    }
+
+    // Ended records remain in the backend for lifecycle/history purposes, but
+    // the manager is for displays the user can still inspect or retain.
+    val visibleRecords = remember(records) {
+        records.filter {
+            it.lifecycle != TaskDisplayLifecycle.ENDED &&
+                    it.lifecycle != TaskDisplayLifecycle.EXPIRED
+        }
+    }
+    val sortedRecords = remember(visibleRecords) {
+        visibleRecords.sortedWith(
+            compareByDescending<TaskDisplayUiRecord> { it.lifecycle.isLive() }
+                .thenByDescending { it.createdAtEpochMs },
+        )
+    }
+
+    ModalBottomSheet(
+        onDismissRequest = onBack,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false),
+        // Keep the sheet visibly separate from the conversation in both
+        // themes, especially against the near-black dark-mode background.
+        containerColor = colors.surfaceCard,
+        contentColor = colors.textPrimary,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                // The empty state should size to its content so the sheet's
+                // partially-expanded anchor never cuts the message off. A
+                // populated manager only needs a compact icon strip.
+                .then(if (sortedRecords.isEmpty()) Modifier else Modifier.fillMaxHeight(0.52f))
+                .navigationBarsPadding(),
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Task displays",
+                    color = colors.textPrimary,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 18.sp,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+
+            if (sortedRecords.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp, vertical = 24.dp),
+                    contentAlignment = Alignment.TopCenter,
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_laptop),
+                            contentDescription = null,
+                            tint = colors.textSecondary,
+                            modifier = Modifier.size(42.dp),
+                        )
+                        Text(
+                            text = "No task displays",
+                            color = colors.textPrimary,
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(top = 12.dp),
+                        )
+                        Text(
+                            text = "Displays created by an agent will appear here.",
+                            color = colors.textSecondary,
+                            fontSize = 13.sp,
+                            modifier = Modifier.padding(top = 5.dp),
+                        )
+                    }
+                }
+            } else {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(horizontal = 18.dp),
+                ) {
+                    Text(
+                        text = "Tap an app to view it. Long-press an icon for actions.",
+                        color = colors.textSecondary,
+                        fontSize = 13.sp,
+                        lineHeight = 19.sp,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                    )
+                    LazyRow(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                    ) {
+                        items(sortedRecords, key = { it.sessionKey }) { record ->
+                            TaskDisplayIconTile(
+                                record = record,
+                                onView = { onView(record) },
+                                onLongPress = { actionCandidate = record },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    actionCandidate?.let { record ->
+        TaskDisplayActionsDialog(
+            record = record,
+            nowEpochMs = nowEpochMs,
+            onView = {
+                actionCandidate = null
+                onView(record)
+            },
+            onEnd = {
+                actionCandidate = null
+                endCandidate = record
+            },
+            onDismiss = { actionCandidate = null },
+        )
+    }
+
+    endCandidate?.let { record ->
+        AlertDialog(
+            onDismissRequest = { endCandidate = null },
+            containerColor = colors.surfaceCard,
+            titleContentColor = colors.textPrimary,
+            textContentColor = colors.textSecondary,
+            shape = RoundedCornerShape(20.dp),
+            title = { Text("End task display?", fontWeight = FontWeight.SemiBold) },
+            text = {
+                Text(
+                    "This closes the ${record.appLabel ?: record.packageName ?: "app"} display. " +
+                            "An active task will be stopped before the display is released.",
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        endCandidate = null
+                        onEnd(record)
+                    },
+                ) {
+                    Text("End display", color = colors.errorRed, fontWeight = FontWeight.SemiBold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { endCandidate = null }) {
+                    Text("Cancel", color = colors.textSecondary)
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun TaskDisplayIconTile(
+    record: TaskDisplayUiRecord,
+    onView: () -> Unit,
+    onLongPress: () -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    val appLabel = record.appLabel ?: record.packageName ?: "Task display"
+    val canView = record.lifecycle != TaskDisplayLifecycle.ENDED &&
+            record.lifecycle != TaskDisplayLifecycle.EXPIRED
+    val statusColor = when (record.lifecycle) {
+        TaskDisplayLifecycle.RUNNING -> colors.accentGreen
+        TaskDisplayLifecycle.PAUSED -> colors.accentBlue
+        TaskDisplayLifecycle.COMPLETED,
+        TaskDisplayLifecycle.STOPPED -> colors.textSecondary
+
+        TaskDisplayLifecycle.FAILED,
+        TaskDisplayLifecycle.UNAVAILABLE -> colors.warningAmber
+
+        TaskDisplayLifecycle.ENDED,
+        TaskDisplayLifecycle.EXPIRED -> colors.textSecondary.copy(alpha = 0.7f)
+    }
+    val description = "$appLabel task display, ${record.lifecycle.displayLabel()}. " +
+            "Tap to view. Long press for actions."
+
+    val tileShape = RoundedCornerShape(18.dp)
+    Surface(
+        shape = tileShape,
+        color = colors.settingsCard,
+        border = BorderStroke(1.dp, colors.borderColor),
+        modifier = Modifier
+            .size(78.dp)
+            .clip(tileShape)
+            .combinedClickable(
+                enabled = canView,
+                onClick = onView,
+                onLongClick = onLongPress,
+            )
+            .semantics {
+                contentDescription = description
+                role = Role.Button
+            },
+    ) {
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center,
+        ) {
+            TaskDisplayAppIcon(
+                packageName = record.packageName,
+                contentDescription = null,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(9.dp),
+            )
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(7.dp)
+                    .size(12.dp)
+                    .background(statusColor, CircleShape)
+                    .border(2.dp, colors.settingsCard, CircleShape),
+            )
+        }
+    }
+}
+
+@Composable
+private fun TaskDisplayAppIcon(
+    packageName: String?,
+    contentDescription: String?,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val icon = remember(packageName) {
+        packageName
+            ?.takeIf(String::isNotBlank)
+            ?.let { name -> runCatching { context.packageManager.getApplicationIcon(name) }.getOrNull() }
+    }
+    if (icon == null) {
+        Icon(
+            painter = painterResource(R.drawable.ic_apps),
+            contentDescription = contentDescription,
+            tint = LocalAssistantColors.current.textSecondary,
+            modifier = modifier,
+        )
+    } else {
+        AndroidView(
+            modifier = modifier,
+            factory = { viewContext ->
+                ImageView(viewContext).apply {
+                    scaleType = ImageView.ScaleType.CENTER_INSIDE
+                    this.contentDescription = contentDescription
+                }
+            },
+            update = { imageView ->
+                imageView.setImageDrawable(icon)
+                imageView.contentDescription = contentDescription
+            },
+        )
+    }
+}
+
+@Composable
+private fun TaskDisplayActionsDialog(
+    record: TaskDisplayUiRecord,
+    nowEpochMs: Long,
+    onView: () -> Unit,
+    onEnd: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    val packageName = record.packageName?.takeIf(String::isNotBlank)
+    val appLabel = record.appLabel ?: packageName ?: "this app"
+    val canView = record.lifecycle != TaskDisplayLifecycle.ENDED &&
+            record.lifecycle != TaskDisplayLifecycle.EXPIRED
+    val canEnd = canView
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = colors.surfaceCard,
+        titleContentColor = colors.textPrimary,
+        textContentColor = colors.textSecondary,
+        shape = RoundedCornerShape(20.dp),
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TaskDisplayAppIcon(
+                    packageName = packageName,
+                    contentDescription = null,
+                    modifier = Modifier.size(38.dp),
+                )
+                Text(
+                    text = appLabel,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(start = 12.dp),
+                )
+            }
+        },
+        text = {
+            Column {
+                Text(
+                    text = record.lifecycle.displayLabel(),
+                    color = colors.textSecondary,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+                record.expiresAtEpochMs?.let { expiry ->
+                    Text(
+                        text = "Auto-removes ${taskDisplayRemainingLabel(expiry, nowEpochMs)}",
+                        color = colors.textSecondary,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+                record.error?.takeIf(String::isNotBlank)?.let { error ->
+                    Text(
+                        text = error,
+                        color = colors.warningAmber,
+                        fontSize = 12.sp,
+                        lineHeight = 17.sp,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onView, enabled = canView) {
+                Text(
+                    text = "View",
+                    color = if (canView) colors.accentBlue else colors.textSecondary,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onEnd, enabled = canEnd) {
+                Text(
+                    text = "End",
+                    color = colors.textSecondary,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        },
+    )
+}
+
+@Composable
+private fun TaskDisplayManagerCard(
+    record: TaskDisplayUiRecord,
+    nowEpochMs: Long,
+    onView: () -> Unit,
+    onEnd: () -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    val statusColor = colors.textSecondary
+    val canView = record.lifecycle != TaskDisplayLifecycle.ENDED &&
+            record.lifecycle != TaskDisplayLifecycle.EXPIRED
+    val canEnd = record.lifecycle != TaskDisplayLifecycle.ENDED &&
+            record.lifecycle != TaskDisplayLifecycle.EXPIRED
+
+    Surface(
+        shape = RoundedCornerShape(20.dp),
+        color = colors.settingsCard,
+        border = BorderStroke(1.dp, colors.borderColor),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 15.dp)) {
+            Row(verticalAlignment = Alignment.Top) {
+                Box(
+                    modifier = Modifier
+                        .padding(top = 5.dp)
+                        .size(10.dp)
+                        .background(statusColor, CircleShape),
+                )
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(start = 12.dp),
+                ) {
+                    Text(
+                        text = record.appLabel ?: record.packageName ?: "Task display",
+                        color = colors.textPrimary,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = record.lifecycle.displayLabel(),
+                        color = statusColor,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.padding(top = 3.dp),
+                    )
+                }
+                record.expiresAtEpochMs?.let { expiry ->
+                    Text(
+                        text = taskDisplayRemainingLabel(expiry, nowEpochMs),
+                        color = colors.textSecondary,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(start = 8.dp),
+                    )
+                }
+            }
+
+            record.currentPurpose
+                ?.takeIf(String::isNotBlank)
+                ?.takeUnless { record.lifecycle == TaskDisplayLifecycle.COMPLETED }
+                ?.let { purpose ->
+                    Text(
+                        text = purpose,
+                        color = colors.textSecondary,
+                        fontSize = 13.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(start = 22.dp, top = 10.dp),
+                    )
+                }
+            record.error?.takeIf(String::isNotBlank)?.let { error ->
+                Text(
+                    text = error,
+                    color = colors.warningAmber,
+                    fontSize = 12.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(start = 22.dp, top = 5.dp),
+                )
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 12.dp),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = taskDisplayAgeLabel(record.createdAtEpochMs, nowEpochMs),
+                    color = colors.textSecondary,
+                    fontSize = 11.sp,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = onView, enabled = canView) {
+                    Text("View", color = if (canView) colors.accentBlue else colors.textSecondary)
+                }
+                TextButton(onClick = onEnd, enabled = canEnd) {
+                    Text("End", color = colors.textSecondary)
+                }
+            }
+        }
+    }
+}
+
+private const val TASK_DISPLAY_MANAGER_REFRESH_MS = 30_000L
+
+private fun TaskDisplayLifecycle.isLive(): Boolean = when (this) {
+    TaskDisplayLifecycle.RUNNING,
+    TaskDisplayLifecycle.PAUSED -> true
+
+    else -> false
+}
+
+private fun taskDisplayAgeLabel(createdAtEpochMs: Long, nowEpochMs: Long): String {
+    if (createdAtEpochMs <= 0L) return "Age unavailable"
+    val seconds = ((nowEpochMs - createdAtEpochMs).coerceAtLeast(0L)) / 1000L
+    return when {
+        seconds < 60L -> "Started just now"
+        seconds < 3600L -> "Started ${seconds / 60L}m ago"
+        else -> "Started ${seconds / 3600L}h ago"
+    }
+}
+
+private fun taskDisplayRemainingLabel(expiryEpochMs: Long, nowEpochMs: Long): String {
+    val seconds = ((expiryEpochMs - nowEpochMs).coerceAtLeast(0L)) / 1000L
+    return when {
+        seconds < 60L -> "<1m left"
+        seconds < 3600L -> "${seconds / 60L}m left"
+        else -> "${seconds / 3600L}h left"
+    }
+}
+
+@Composable
+fun PairingScreen(
+    status: DeveloperModeStatus,
+    onStartPairingNotification: () -> Boolean,
+    onOpenDeveloperOptions: () -> Unit,
+    onBack: () -> Unit,
+) {
+    val colors = LocalAssistantColors.current
+    var notificationUnavailable by rememberSaveable { mutableStateOf(false) }
+    var automaticStartAttempted by rememberSaveable { mutableStateOf(false) }
+
+    fun startPairingNotification() {
+        notificationUnavailable = !onStartPairingNotification()
+    }
+
+    val pairingInProgress = status.state in setOf(
+        DeveloperConnectionState.PAIRING_SEARCHING,
+        DeveloperConnectionState.PAIRING_SERVICE_FOUND,
+    )
+    val screenTitle = when {
+        status.state == DeveloperConnectionState.READY -> "Phone access"
+        status.paired -> "Reconnect phone"
+        else -> "Connect phone"
+    }
+
+    LaunchedEffect(status.state, status.paired) {
+        val needsPairing = !status.paired && status.state in setOf(
+            DeveloperConnectionState.PAIRING_REQUIRED,
+            DeveloperConnectionState.ERROR,
+        )
+        if (!automaticStartAttempted && needsPairing) {
+            automaticStartAttempted = true
+            startPairingNotification()
+        }
+    }
+
+    Scaffold(
+        containerColor = colors.background,
+        topBar = {
+            CenterAlignedTopAppBar(
+                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
+                    containerColor = colors.background,
+                    titleContentColor = colors.textPrimary,
+                    navigationIconContentColor = colors.textPrimary,
+                    actionIconContentColor = colors.textPrimary,
+                ),
+                title = { Text(screenTitle, fontWeight = FontWeight.SemiBold, fontSize = 17.sp) },
+                navigationIcon = {
+                    Surface(
+                        shape = CircleShape,
+                        color = colors.composerBackground,
+                        border = BorderStroke(1.dp, colors.borderColor),
+                        modifier = Modifier
+                            .padding(start = 12.dp)
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .clickable { onBack() },
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                painter = painterResource(R.drawable.ic_arrow_back),
+                                contentDescription = "Back",
+                                tint = colors.textPrimary,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                    }
+                },
+            )
+        },
+    ) { paddingValues ->
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(paddingValues)
+                .padding(horizontal = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(18.dp),
+            contentPadding = PaddingValues(top = 14.dp, bottom = 24.dp),
+        ) {
+            item {
+                PairingStatusCard(status = status)
+            }
+
+            if (notificationUnavailable && !status.paired) {
+                item {
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = colors.surfaceCard,
+                        border = BorderStroke(1.dp, colors.borderColor),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+                            Text(
+                                text = "DHD needs permission to show the pairing code from Android. Allow notifications, then try again.",
+                                color = colors.textSecondary,
+                                fontSize = 13.sp,
+                                lineHeight = 19.sp,
+                            )
+                            Button(
+                                onClick = { startPairingNotification() },
+                                modifier = Modifier.padding(top = 8.dp),
+                                shape = RoundedCornerShape(14.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = colors.accentBlue,
+                                    contentColor = Color.White,
+                                ),
+                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+                            ) {
+                                Icon(
+                                    painter = painterResource(R.drawable.ic_refresh),
+                                    contentDescription = null,
+                                    modifier = Modifier.size(17.dp),
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text("Retry pairing notification")
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (status.phoneAccessInterrupted) {
+                item {
+                    PairingInstruction(
+                        number = 1,
+                        text = "Turn on Wi-Fi and connect to a network.",
+                    )
+                }
+                item {
+                    PairingInstruction(
+                        number = 2,
+                        text = "Turn on Wireless debugging in Android Settings → Developer options.",
+                        actionLabel = "Open Android settings",
+                        onAction = onOpenDeveloperOptions,
+                    )
+                }
+                item {
+                    PairingInstruction(
+                        number = 3,
+                        text = "Return to DHD. We'll reconnect automatically.",
+                    )
+                }
+            } else if (!status.paired || pairingInProgress) {
+                item {
+                    PairingInstruction(
+                        number = 1,
+                        text = "Open Android Settings → Developer options → Wireless debugging. Choose Pair device with pairing code.",
+                        actionLabel = "Open Android settings",
+                        onAction = onOpenDeveloperOptions,
+                    )
+                }
+                item {
+                    PairingInstruction(
+                        number = 2,
+                        text = "Enter the six-digit code Android shows in the DHD notification.",
+                    )
+                }
+                item {
+                    PairingInstruction(
+                        number = 3,
+                        text = "Return to DHD. We'll finish connecting your phone automatically.",
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PairingStatusCard(status: DeveloperModeStatus) {
+    val colors = LocalAssistantColors.current
+    val statusColor = when (status.state) {
+        DeveloperConnectionState.READY -> colors.accentGreen
+        DeveloperConnectionState.PAIRING_SEARCHING,
+        DeveloperConnectionState.PAIRING_SERVICE_FOUND,
+        DeveloperConnectionState.CONNECTING,
+        DeveloperConnectionState.CHECKING -> colors.accentBlue
+
+        DeveloperConnectionState.PAIRING_REQUIRED -> if (status.paired) {
+            colors.warningAmber
+        } else {
+            colors.accentBlue
+        }
+
+        DeveloperConnectionState.WIRELESS_DEBUGGING_OFF,
+        DeveloperConnectionState.ERROR -> colors.warningAmber
+
+        DeveloperConnectionState.UNSUPPORTED -> colors.textSecondary
+    }
+    val statusTitle = when (status.state) {
+        DeveloperConnectionState.READY -> "Phone access is active"
+        DeveloperConnectionState.PAIRING_SEARCHING -> "Connecting your phone"
+        DeveloperConnectionState.PAIRING_SERVICE_FOUND -> "Pairing code ready"
+        DeveloperConnectionState.PAIRING_REQUIRED -> if (status.paired) {
+            "Phone access needed"
+        } else {
+            "Ready to connect your phone"
+        }
+
+        DeveloperConnectionState.CONNECTING -> "Reconnecting to your phone"
+        DeveloperConnectionState.CHECKING -> "Checking phone access"
+        DeveloperConnectionState.WIRELESS_DEBUGGING_OFF -> "Phone access needed"
+        DeveloperConnectionState.ERROR -> status.recoveryTitle
+        DeveloperConnectionState.UNSUPPORTED -> status.recoveryTitle
+    }
+    val statusDetail = when (status.state) {
+        DeveloperConnectionState.READY -> "DHD can use phone controls."
+        DeveloperConnectionState.PAIRING_SEARCHING -> "Follow the connection steps in the DHD notification."
+        DeveloperConnectionState.PAIRING_SERVICE_FOUND -> "Enter the six-digit code shown by Android in the DHD notification."
+        DeveloperConnectionState.CONNECTING -> "DHD is reconnecting automatically."
+        DeveloperConnectionState.CHECKING -> "DHD is checking whether phone access is available."
+        else -> status.recoveryDetail
+    }
+
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = statusColor.copy(alpha = if (colors.isDark) 0.18f else 0.10f),
+        border = BorderStroke(1.dp, statusColor.copy(alpha = 0.35f)),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Box(
+                modifier = Modifier
+                    .padding(top = 4.dp)
+                    .size(12.dp)
+                    .background(statusColor, CircleShape),
+            )
+            Column(modifier = Modifier.padding(start = 12.dp)) {
+                Text(
+                    text = statusTitle,
+                    color = colors.textPrimary,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = statusDetail,
+                    color = colors.textSecondary,
+                    fontSize = 13.sp,
+                    lineHeight = 19.sp,
+                    modifier = Modifier.padding(top = 3.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PairingInstruction(
+    number: Int,
+    text: String,
+    actionLabel: String? = null,
+    onAction: (() -> Unit)? = null,
+) {
+    val colors = LocalAssistantColors.current
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.Top,
+    ) {
+        Surface(
+            shape = CircleShape,
+            color = colors.accentBlue.copy(alpha = 0.18f),
+            modifier = Modifier.size(30.dp),
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Text(
+                    text = number.toString(),
+                    color = colors.accentBlue,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+        }
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(start = 14.dp),
+        ) {
+            Text(
+                text = text,
+                color = colors.textPrimary,
+                fontSize = 14.sp,
+                lineHeight = 21.sp,
+            )
+            if (actionLabel != null && onAction != null) {
+                Button(
+                    onClick = onAction,
+                    modifier = Modifier.padding(top = 10.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = colors.accentBlue,
+                        contentColor = Color.White,
+                    ),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_settings),
+                        contentDescription = null,
+                        modifier = Modifier.size(17.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(actionLabel)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun CompanionInstructionsScreen(
+    onBack: () -> Unit,
+) {
+    val colors = LocalAssistantColors.current
 
     Scaffold(
         containerColor = colors.background,
@@ -2654,7 +4877,7 @@ fun CompanionScreen(
                     titleContentColor = colors.textPrimary,
                     navigationIconContentColor = colors.textPrimary,
                 ),
-                title = { Text("Desktop Companion", fontWeight = FontWeight.SemiBold, fontSize = 17.sp) },
+                title = { Text("Connect desktop companion", fontWeight = FontWeight.SemiBold, fontSize = 17.sp) },
                 navigationIcon = {
                     Surface(
                         shape = CircleShape,
@@ -2688,100 +4911,70 @@ fun CompanionScreen(
             contentPadding = PaddingValues(top = 14.dp, bottom = 24.dp),
         ) {
             item {
-                SettingsSectionHeader("Connection")
-                Surface(
-                    shape = RoundedCornerShape(20.dp),
-                    color = colors.settingsCard,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Column {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 14.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_laptop),
-                                contentDescription = "Desktop companion",
-                                tint = colors.textPrimary,
-                                modifier = Modifier.size(22.dp),
-                            )
-                            Column(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .padding(start = 14.dp),
-                            ) {
-                                Text(
-                                    text = "Wireless bridge",
-                                    fontWeight = FontWeight.Medium,
-                                    color = colors.textPrimary,
-                                    fontSize = 15.sp,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                                Text(
-                                    text = if (lanAddresses.isEmpty()) "Offline" else "Connected on local Wi-Fi",
-                                    fontSize = 12.sp,
-                                    color = colors.textSecondary,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
-                            Text(
-                                text = if (lanAddresses.isEmpty()) "Offline" else "Ready",
-                                color = colors.textSecondary,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Medium,
-                                modifier = Modifier.padding(start = 8.dp),
-                            )
-                        }
-
-                        HorizontalDivider(thickness = 2.dp, color = colors.cardDivider)
-
-                        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Text(
-                                    text = "Pairing code",
-                                    fontSize = 12.sp,
-                                    color = colors.textSecondary,
-                                )
-                                TextButton(
-                                    onClick = {
-                                        pairingCode = bridgeServer.refreshPairingCode()
-                                        lanAddresses = bridgeServer.lanIpv4Addresses()
-                                    },
-                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                                ) {
-                                    Text("Refresh", color = colors.accentBlue, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                                }
-                            }
-                            Text(
-                                text = pairingCode.chunked(4).joinToString("-"),
-                                fontSize = 24.sp,
-                                fontWeight = FontWeight.Bold,
-                                letterSpacing = 2.sp,
-                                color = colors.textPrimary,
-                                modifier = Modifier.padding(vertical = 4.dp),
-                            )
-                            Text(
-                                text = "Enter code in desktop companion",
-                                fontSize = 12.sp,
-                                color = colors.textSecondary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                    }
-                }
-                SettingsSectionFooter("The companion coordinates requests with desktop Codex over your local Wi-Fi.")
+                PairingInstruction(
+                    number = 1,
+                    text = "Open DHD Companion on your computer and go to Connection.",
+                )
+            }
+            item {
+                PairingInstruction(
+                    number = 2,
+                    text = "Keep your phone and computer on the same Wi-Fi network.",
+                )
+            }
+            item {
+                PairingInstruction(
+                    number = 3,
+                    text = "On the computer, tap Find my phone, then tap Connect next to this phone.",
+                )
+            }
+            item {
+                PairingInstruction(
+                    number = 4,
+                    text = "When this phone asks, tap Approve. You're connected—there's no code to enter.",
+                )
+            }
+            item {
+                SettingsSectionFooter(
+                    "If the phone is not listed, check the local network and the computer's firewall, then use Refresh phones again.",
+                )
             }
         }
     }
+}
+
+@Composable
+fun CompanionPairingApprovalDialog(
+    pending: PendingCompanionPairing?,
+    bridgeServer: DevBridgeServer,
+) {
+    val colors = LocalAssistantColors.current
+    pending ?: return
+    AlertDialog(
+        onDismissRequest = { bridgeServer.rejectPendingCompanionPairing() },
+        containerColor = colors.surfaceCard,
+        titleContentColor = colors.textPrimary,
+        textContentColor = colors.textSecondary,
+        shape = RoundedCornerShape(20.dp),
+        title = { Text("Allow desktop companion?", fontWeight = FontWeight.SemiBold) },
+        text = {
+            Text(
+                text = "${pending.desktopName} wants to connect to DHD on this local network. Approve only if you recognize this computer.",
+                fontSize = 14.sp,
+                lineHeight = 20.sp,
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = { bridgeServer.approvePendingCompanionPairing() }) {
+                Text("Approve", color = colors.accentBlue, fontWeight = FontWeight.SemiBold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = { bridgeServer.rejectPendingCompanionPairing() }) {
+                Text("Reject", color = colors.textSecondary)
+            }
+        },
+    )
 }
 
 @Composable
@@ -2813,7 +5006,7 @@ fun ApprovedAppsScreen(
         if (searchQuery.isBlank()) apps
         else apps.filter {
             it.label.contains(searchQuery, ignoreCase = true) ||
-                it.packageName.contains(searchQuery, ignoreCase = true)
+                    it.packageName.contains(searchQuery, ignoreCase = true)
         }
     }
 
@@ -2995,8 +5188,8 @@ fun ApprovedAppsScreen(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Icon(
-                            painter = painterResource(R.drawable.ic_shield),
-                            contentDescription = "Full access",
+                            painter = painterResource(R.drawable.ic_apps),
+                            contentDescription = "Apps",
                             tint = colors.textPrimary,
                             modifier = Modifier.size(22.dp),
                         )
@@ -3039,7 +5232,7 @@ fun ApprovedAppsScreen(
 
             // Per-App List Section
             item {
-                SettingsSectionHeader(if (isFullAccess) "Apps allowlist (Full access active)" else "Allowed apps")
+                SettingsSectionHeader("Allowed apps")
                 if (filteredApps.isEmpty()) {
                     Text(
                         text = if (searchQuery.isBlank()) "No launchable user apps found." else "No matching apps found.",
@@ -3063,23 +5256,15 @@ fun ApprovedAppsScreen(
                                         .padding(horizontal = 16.dp, vertical = 12.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = app.label,
-                                            fontWeight = FontWeight.Medium,
-                                            color = colors.textPrimary,
-                                            fontSize = 14.sp,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                        Text(
-                                            text = app.packageName,
-                                            fontSize = 12.sp,
-                                            color = colors.textSecondary,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                    }
+                                    Text(
+                                        text = app.label,
+                                        modifier = Modifier.weight(1f),
+                                        fontWeight = FontWeight.Medium,
+                                        color = colors.textPrimary,
+                                        fontSize = 14.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
                                     Switch(
                                         checked = enabled,
                                         enabled = !isFullAccess,
@@ -3112,7 +5297,7 @@ fun ApprovedAppsScreen(
             text = {
                 Text(
                     "Full Access allows DHD to open, inspect, and operate any application installed on this device.\n\n" +
-                        "This bypasses the per-app allowlist and lets DHD carry out tasks across all your apps.",
+                            "This bypasses the per-app allowlist and lets DHD carry out tasks across all your apps.",
                     fontSize = 14.sp,
                     lineHeight = 20.sp,
                 )
@@ -3147,8 +5332,12 @@ fun assistantSwitchColors(colors: AssistantColorScheme) = SwitchDefaults.colors(
     uncheckedBorderColor = Color.Transparent,
     disabledCheckedThumbColor = if (colors.isDark) Color.Black.copy(alpha = 0.6f) else Color.White.copy(alpha = 0.6f),
     disabledCheckedTrackColor = if (colors.isDark) Color.White.copy(alpha = 0.5f) else Color.Black.copy(alpha = 0.5f),
-    disabledUncheckedThumbColor = if (colors.isDark) Color(0xFF8E8E93).copy(alpha = 0.4f) else Color(0xFF9CA3AF).copy(alpha = 0.4f),
-    disabledUncheckedTrackColor = if (colors.isDark) Color(0xFF212124).copy(alpha = 0.4f) else Color(0xFFE5E7EB).copy(alpha = 0.4f),
+    disabledUncheckedThumbColor = if (colors.isDark) Color(0xFF8E8E93).copy(alpha = 0.4f) else Color(0xFF9CA3AF).copy(
+        alpha = 0.4f
+    ),
+    disabledUncheckedTrackColor = if (colors.isDark) Color(0xFF212124).copy(alpha = 0.4f) else Color(0xFFE5E7EB).copy(
+        alpha = 0.4f
+    ),
 )
 
 @Composable
@@ -3175,7 +5364,53 @@ private fun SettingsSectionFooter(text: String) {
     )
 }
 
+private fun LiveDisplayPreviewState.belongsToRun(runSessionKey: String?): Boolean =
+    runSessionKey != null && (sessionKey == runSessionKey || this.runSessionKey == runSessionKey)
+
+/**
+ * Conversation cards are keyed by coordinator run, not by the retained
+ * native display owner. A later run can claim the same display, so accepting
+ * both identities here would mount one live preview in both the old and new
+ * task cards. Keep the display-key fallback for callers that do not have a
+ * run binding yet.
+ */
+internal fun LiveDisplayPreviewState.belongsToGroup(groupId: String): Boolean =
+    if (runSessionKey != null) {
+        runSessionKey == groupId
+    } else {
+        sessionKey == groupId
+    }
+
+private fun LiveDisplayPreviewState.isExpanded(expandedSessionKey: String?): Boolean =
+    expandedSessionKey != null &&
+            (sessionKey == expandedSessionKey || runSessionKey == expandedSessionKey)
+
 private fun SessionState.isActive(): Boolean = this is SessionState.Running || this is SessionState.Paused
+
+internal fun shouldCombineRecoveryBanners(
+    state: SessionState,
+    developerStatus: DeveloperModeStatus,
+    companionConnected: Boolean,
+): Boolean =
+    (developerStatus.requiresUserAction || state.showsPhoneAccessRecovery()) && !companionConnected
+
+internal fun shouldShowTopRecoveryBanner(
+    state: SessionState,
+    developerStatus: DeveloperModeStatus,
+    companionConnected: Boolean,
+): Boolean = developerStatus.requiresUserAction ||
+        state.showsPhoneAccessRecovery() ||
+        !companionConnected
+
+private fun SessionState.showsPhoneAccessRecovery(): Boolean = when (this) {
+    is SessionState.Running -> currentPurpose.equals("Needs your attention", ignoreCase = true) &&
+            attentionActionLabel.equals("View instructions", ignoreCase = true)
+
+    is SessionState.Paused -> attentionReason != null &&
+            attentionActionLabel.equals("View instructions", ignoreCase = true)
+
+    else -> false
+}
 
 private fun SessionState.sessionIdOrNullForUi(): String? = when (this) {
     SessionState.Idle -> null
@@ -3185,9 +5420,21 @@ private fun SessionState.sessionIdOrNullForUi(): String? = when (this) {
     is SessionState.Completed -> sessionId
 }
 
-private fun TimelineItem.belongsTo(runId: String?): Boolean = when (this) {
-    is TimelineItem.Message -> this.runId == runId
-    is TimelineItem.Activity -> this.runId == runId
+private fun TimelineItem.belongsTo(runIds: Set<String>): Boolean = when (this) {
+    is TimelineItem.Message -> this.runId?.let(runIds::contains) == true
+    is TimelineItem.Activity -> this.runId in runIds
+}
+
+private fun SessionState.continuationSessionIdOrNullForUi(): String? = when (this) {
+    is SessionState.Running -> sessionId.takeIf { isContinuation }
+    is SessionState.Paused -> sessionId.takeIf { isContinuation }
+    else -> null
+}
+
+private fun SessionState.workedDurationMsOrNullForUi(): Long? = when (this) {
+    is SessionState.Stopped -> workedDurationMs
+    is SessionState.Completed -> workedDurationMs
+    else -> null
 }
 
 private const val RECENT_HISTORY_WINDOW_MS = 24L * 60L * 60L * 1000L

@@ -3,6 +3,8 @@ import net from "node:net";
 export const DEFAULT_BRIDGE_HOST = "127.0.0.1";
 export const DEFAULT_BRIDGE_PORT = 8765;
 export const DEFAULT_BRIDGE_TIMEOUT_MS = 45_000;
+/** Initial connection grace period for requests that may wait after acceptance. */
+export const BLOCKING_BRIDGE_TIMEOUT_MS = DEFAULT_BRIDGE_TIMEOUT_MS;
 export const MAX_BRIDGE_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 export interface BridgeMessage {
@@ -14,11 +16,15 @@ export interface BridgeMessage {
 export interface BridgeRequest {
   type: string;
   requestId: string;
+  /** Canonical DHD tool name used for safe phone-side activity display. */
+  tool?: string;
   [key: string]: unknown;
 }
 
 export interface BridgeRequestOptions {
   timeoutMs?: number;
+  /** Keep waiting after the phone has accepted a user-dependent request. */
+  keepOpenAfterAccepted?: boolean;
   host?: string;
   port?: number;
   token?: string;
@@ -34,6 +40,8 @@ const TERMINAL_MESSAGE_TYPES = new Set([
   "status",
   "pending_request",
   "pending_steer",
+  "heartbeat",
+  "companion_disconnected",
   "request_claimed",
   "request_released",
   "steer_claimed",
@@ -42,10 +50,15 @@ const TERMINAL_MESSAGE_TYPES = new Set([
   "codex_thread_bound",
   "agent_message_streamed",
   "attention_requested",
+  "attention_resolved",
+  "attention_cancelled",
   "session_completed",
   "session_failed",
   "allowed_apps",
   "browse_apps",
+  "app_display_layout_updated",
+  "displays",
+  "display_closed",
   "foreground_app",
   "observation",
   "completed",
@@ -100,18 +113,29 @@ export function requestBridge(
     let buffer = "";
     let responseBytes = 0;
     let settled = false;
+    let timeoutTimer: NodeJS.Timeout | undefined;
 
     const finish = (error?: Error, message?: BridgeMessage) => {
       if (settled) return;
       settled = true;
+      if (timeoutTimer) clearTimeout(timeoutTimer);
       socket.destroy();
       if (error) reject(error);
       else resolve(message!);
     };
 
-    socket.setTimeout(options.timeoutMs ?? DEFAULT_BRIDGE_TIMEOUT_MS, () => {
-      finish(new Error("Timed out waiting for the phone assistant bridge."));
-    });
+    const timeoutMs = options.timeoutMs ?? DEFAULT_BRIDGE_TIMEOUT_MS;
+    if (timeoutMs > 0) {
+      // Socket inactivity timeouts do not consistently cover a TCP connect
+      // that is stuck in SYN-SENT. Keep a wall-clock deadline as well so a
+      // filtered or unreachable phone cannot leave callers in CHECKING forever.
+      timeoutTimer = setTimeout(() => {
+        finish(new Error("Timed out waiting for the phone assistant bridge."));
+      }, timeoutMs);
+      socket.setTimeout(timeoutMs, () => {
+        finish(new Error("Timed out waiting for the phone assistant bridge."));
+      });
+    }
     socket.once("error", (error) => {
       finish(new Error(`Could not connect to the phone assistant bridge at ${host}:${port}: ${error.message}`));
     });
@@ -143,6 +167,20 @@ export function requestBridge(
         }
         // The phone sends an accepted progress line first. Resolve only on a
         // terminal response so callers can safely read the complete result.
+        // A request that has been accepted is now being processed by the
+        // phone. User-dependent operations may remain open until Wireless
+        // debugging is restored, but connection failures before acceptance
+        // still use the normal bounded timeout.
+        if (message.type === "accepted") {
+          if (options.keepOpenAfterAccepted) {
+            if (timeoutTimer) {
+              clearTimeout(timeoutTimer);
+              timeoutTimer = undefined;
+            }
+            socket.setTimeout(0);
+          }
+          continue;
+        }
         if (typeof message.type === "string" && TERMINAL_MESSAGE_TYPES.has(message.type)) {
           finish(undefined, message);
           return;

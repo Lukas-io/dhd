@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -12,8 +12,12 @@ import {
   type PhoneAssistantToolResult,
 } from "./dhd-tools.js";
 import {
+  emitCompanionPlanEvent,
+  emitCompanionTokenUsageEvent,
   emitCompanionToolCallEvent,
   type CompanionJsonValue,
+  type CompanionPlanUpdatedEvent,
+  type CompanionTokenUsageEvent,
   type CompanionToolCallEvent,
 } from "./companion-events.js";
 import {
@@ -25,8 +29,6 @@ import {
   DHD_MAX_TEXT_CHARS,
   DHD_MAX_TYPE_TEXT_CHARS,
   DHD_MAX_WAIT_DURATION_MS,
-  DHD_SCROLL_AMOUNTS,
-  DHD_SCROLL_DIRECTIONS,
   dhdToolDescription,
   isDhdToolName,
   isGuardRegionsEnabled,
@@ -42,6 +44,8 @@ import {
 
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 const BRIDGE_POLL_TIMEOUT_MS = 5_000;
+const COMPANION_HEARTBEAT_INTERVAL_MS = 2_500;
+const COMPANION_HEARTBEAT_TIMEOUT_MS = 4_000;
 const APP_SERVER_REQUEST_TIMEOUT_MS = 30_000;
 const STREAM_BRIDGE_TIMEOUT_MS = 5_000;
 const MAX_AGENT_FEEDBACK_CHARS = 4_000;
@@ -75,8 +79,8 @@ const PREWARM_ATTEMPTS = 2;
 const PREWARM_RETRY_DELAY_MS = 500;
 // DHD owns its App Server conversation settings. These defaults deliberately
 // do not depend on the user's interactive Codex chat or global config.
-const DEFAULT_CODEX_MODEL = "gpt-5.6-luna";
-const DEFAULT_CODEX_EFFORT = "max";
+const DEFAULT_CODEX_MODEL = "gpt-6-luna";
+const DEFAULT_CODEX_EFFORT = "high";
 const DEFAULT_CODEX_SERVICE_TIER = "default";
 const FAST_CODEX_SERVICE_TIER = "priority";
 const CODEX_REASONING_EFFORTS = new Set([
@@ -194,17 +198,24 @@ export class CodexAppServerClient {
   } | null = null;
   private activeThreadId: string | null = null;
   private activeDhdThreadId: string | null = null;
-  // A thread loaded from an older companion process may carry an obsolete
-  // dynamic-tool contract. Establish one current DHD thread before allowing
-  // thread reuse or resume.
+  // Only trust the loaded-thread cache after this companion has established
+  // the current DHD tool contract. Persisted ids from a previous process must
+  // still go through thread/resume below.
   private hasCurrentDhdThread = false;
   private activeTurnId: string | null = null;
+  private interruptRequested = false;
+  private turnRequested = false;
   private activeTiming: PhaseTimer | null = null;
   private userMessageLogged = false;
+  private activeModel = resolveCodexModel();
+  private activeServiceTier = DEFAULT_CODEX_SERVICE_TIER;
 
   /** True while this client still owns an in-flight App Server turn. */
   get isTurnInFlight(): boolean {
-    return this.turnCompletion !== null;
+    // A turn is also in flight while initialize/resume/thread-start is still
+    // running. The completion promise is created only after initialize, so
+    // relying on it alone loses a phone-side Stop during that handoff.
+    return this.turnRequested || this.turnCompletion !== null;
   }
 
   /** True when the active thread and turn ids are available for steering. */
@@ -268,16 +279,35 @@ export class CodexAppServerClient {
     reasoningEffort: string = resolveCodexEffort(),
     fastMode = false,
     onAgentMessageDelta?: (update: AgentMessageStreamUpdate) => void,
+    onThreadReady?: (threadId: string) => Promise<void>,
+    isContinuation = false,
   ): Promise<TurnResult> {
     const logger = timing ?? new PhaseTimer("codex-turn");
+    this.turnRequested = true;
+    emitCompanionPlanEvent({ type: "dhd_plan", phase: "reset" });
     this.activeTiming = logger;
     this.userMessageLogged = false;
+    this.interruptRequested = false;
     try {
       await this.start(logger);
+      const completion = new Promise<TurnResult>((resolve, reject) => {
+        this.turnCompletion = {
+          resolve,
+          reject,
+          agentMessages: new Map(),
+          nextAgentMessageOrder: 0,
+          phoneToolFailures: [],
+          onAgentMessageDelta,
+        };
+      });
 
+      const model = resolveCodexModel();
+      const serviceTier = serviceTierForFastMode(fastMode);
+      this.activeModel = model;
+      this.activeServiceTier = serviceTier;
       const threadParams: Record<string, unknown> = {
         dynamicTools: buildDhdDynamicTools(),
-        model: resolveCodexModel(),
+        model,
         cwd: this.runtimeCwd,
       };
 
@@ -288,25 +318,35 @@ export class CodexAppServerClient {
       ) {
         await this.unsubscribeThread(this.activeDhdThreadId, logger);
       }
-      const mayReuseExistingThread = Boolean(
-        existingThreadId && this.hasCurrentDhdThread,
-      );
       if (
-        mayReuseExistingThread &&
         existingThreadId &&
+        this.hasCurrentDhdThread &&
         this.loadedThreadIds.has(existingThreadId)
       ) {
         threadId = existingThreadId;
         logger.log("thread:reuse_loaded", `threadId=${threadId}`);
-      } else if (mayReuseExistingThread && existingThreadId) {
+      } else if (existingThreadId) {
         logger.log("resume:start", `threadId=${existingThreadId}`);
-        const threadResponse = await this.request("thread/resume", {
-          ...threadParams,
-          threadId: existingThreadId,
-        });
-        threadId = extractThreadId(threadResponse.result) || existingThreadId;
-        logger.log("resume:complete", `threadId=${threadId}`);
-      } else {
+        try {
+          const threadResponse = await this.request("thread/resume", {
+            ...threadParams,
+            threadId: existingThreadId,
+          });
+          threadId = extractThreadId(threadResponse.result) || existingThreadId;
+          logger.log("resume:complete", `threadId=${threadId}`);
+        } catch (error) {
+          // A persisted thread may have been deleted or may belong to an
+          // older App Server contract. Only an explicit resume failure is
+          // allowed to rotate the thread; a new companion process must not
+          // discard a valid stored context merely because it has no local
+          // loaded-thread cache.
+          console.error(
+            `[codex-app-server] could not resume stored thread ${existingThreadId}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          logger.log("resume:failed", `threadId=${existingThreadId}`);
+        }
+      }
+      if (!threadId) {
         if (existingThreadId) {
           logger.log(
             "thread:fresh_contract",
@@ -323,6 +363,8 @@ export class CodexAppServerClient {
       this.activeThreadId = threadId;
       this.activeDhdThreadId = threadId;
       this.loadedThreadIds.add(threadId);
+      this.hasCurrentDhdThread = true;
+      await onThreadReady?.(threadId);
       if (!existingThreadId && threadTitle?.trim()) {
         // Naming is best-effort: older App Server builds may not expose this
         // convenience method, but a failed name update must not lose a turn.
@@ -338,25 +380,24 @@ export class CodexAppServerClient {
         }
       }
 
-      const completion = new Promise<TurnResult>((resolve, reject) => {
-        this.turnCompletion = {
-          resolve,
-          reject,
-          agentMessages: new Map(),
-          nextAgentMessageOrder: 0,
-          phoneToolFailures: [],
-          onAgentMessageDelta,
-        };
-      });
       try {
+        if (this.interruptRequested) {
+          throw new Error("Codex App Server turn was interrupted.");
+        }
         logger.log("turn/start:start", `threadId=${threadId}`);
         const turnStartResponse = await this.request("turn/start", {
           threadId,
-          model: resolveCodexModel(),
+          model,
           effort: normalizeCodexEffort(reasoningEffort),
-          serviceTier: serviceTierForFastMode(fastMode),
+          serviceTier,
           cwd: this.runtimeCwd,
-          input: [{ type: "text", text: phoneRequest }],
+          // A continuation is a real, minimal user turn so the model can
+          // advance from the persisted tool responses and errors in the
+          // resumed thread. The phone-side continuation run remains hidden
+          // from DHD's local timeline; this text is only the App Server input.
+          input: isContinuation
+            ? [{ type: "text", text: "continue" }]
+            : [{ type: "text", text: phoneRequest }],
         });
         // `turn/start` returns the initial turn object. The notification is
         // also tracked below, but capturing this response makes user-driven
@@ -368,6 +409,10 @@ export class CodexAppServerClient {
           "turn/start.response",
         );
         logger.log("turn/start:complete", `turnId=${this.activeTurnId ?? "?"}`);
+        if (this.interruptRequested) {
+          await this.interrupt();
+          throw new Error("Codex App Server turn was interrupted.");
+        }
       } catch (error) {
         this.turnCompletion?.reject(
           error instanceof Error ? error : new Error(String(error)),
@@ -379,7 +424,6 @@ export class CodexAppServerClient {
       // completion under App Server/user control; only individual RPC and
       // bridge requests retain bounded transport timeouts.
       const result = await completion;
-      this.hasCurrentDhdThread = true;
       return result;
     } catch (error) {
       // A failed/interrupted turn may still be active inside App Server. Restart
@@ -388,8 +432,10 @@ export class CodexAppServerClient {
       await this.stopProcess();
       throw error;
     } finally {
+      this.turnRequested = false;
       this.activeThreadId = null;
       this.activeTurnId = null;
+      this.interruptRequested = false;
       this.activeTiming = null;
       this.userMessageLogged = false;
       if (this.turnCompletion) {
@@ -432,7 +478,9 @@ export class CodexAppServerClient {
   /** Interrupt the active turn, for example after the phone-side Stop action. */
   async interrupt(): Promise<void> {
     const threadId = this.activeThreadId;
-    if (!threadId || !this.isTurnInFlight) return;
+    if (!this.isTurnInFlight) return;
+    this.interruptRequested = true;
+    if (!threadId) return;
     const turnId = this.activeTurnId;
     await this.request("turn/interrupt", {
       threadId,
@@ -445,7 +493,7 @@ export class CodexAppServerClient {
       throw new Error("Codex App Server client is already running.");
     mkdirSync(this.codexHome, { recursive: true });
     mkdirSync(this.runtimeCwd, { recursive: true });
-    const command = process.env.PHONE_ASSISTANT_CODEX_BIN?.trim() || "codex";
+    const command = resolveCodexBin();
     const args = ["app-server", "--listen", "stdio://"];
     for (const override of [
       ...MINIMAL_CODEX_CONFIG_OVERRIDES,
@@ -499,19 +547,30 @@ export class CodexAppServerClient {
         new Error(`Could not start Codex App Server: ${error.message}`),
       ),
     );
-    child.once("close", (code, signal) => {
-      if (this.child === child) {
-        this.child = null;
-        this.reader = null;
-        this.initialized = false;
-        this.loadedThreadIds.clear();
-      }
-      this.failPending(
-        new Error(
-          `Codex App Server exited before completing the turn (code=${code ?? "?"}, signal=${signal ?? "?"}).`,
-        ),
-      );
-    });
+    child.once("close", (code, signal) =>
+      this.handleChildClose(child, code, signal),
+    );
+  }
+
+  private handleChildClose(
+    child: ChildProcessWithoutNullStreams,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): void {
+    // stopProcess() detaches the old child before starting its replacement,
+    // but Windows can deliver the old child's close event after that
+    // replacement has already begun initialize. Never let a stale close
+    // reject the replacement child's pending RPCs.
+    if (this.child !== child) return;
+    this.child = null;
+    this.reader = null;
+    this.initialized = false;
+    this.loadedThreadIds.clear();
+    this.failPending(
+      new Error(
+        `Codex App Server exited before completing the turn (code=${code ?? "?"}, signal=${signal ?? "?"}).`,
+      ),
+    );
   }
 
   private handleLine(line: string): void {
@@ -555,6 +614,15 @@ export class CodexAppServerClient {
       return;
     }
 
+    const tokenUsageEvent = extractCompanionTokenUsageEvent(message);
+    if (tokenUsageEvent) {
+      emitCompanionTokenUsageEvent({
+        ...tokenUsageEvent,
+        model: this.activeModel,
+        serviceTier: this.activeServiceTier,
+      });
+    }
+
     if (message.method === "thread/started") {
       const threadId = extractThreadId(message.params);
       if (threadId) this.loadedThreadIds.add(threadId);
@@ -562,7 +630,10 @@ export class CodexAppServerClient {
       const threadId = extractThreadId(message.params);
       if (threadId) {
         this.loadedThreadIds.delete(threadId);
-        if (this.activeDhdThreadId === threadId) this.activeDhdThreadId = null;
+        if (this.activeDhdThreadId === threadId) {
+          this.activeDhdThreadId = null;
+          this.hasCurrentDhdThread = false;
+        }
       }
     } else if (message.method === "thread/status/changed") {
       const params = extractRecord(message.params);
@@ -571,8 +642,10 @@ export class CodexAppServerClient {
         const threadId = extractThreadId(message.params);
         if (threadId) {
           this.loadedThreadIds.delete(threadId);
-          if (this.activeDhdThreadId === threadId)
+          if (this.activeDhdThreadId === threadId) {
             this.activeDhdThreadId = null;
+            this.hasCurrentDhdThread = false;
+          }
         }
       }
     }
@@ -580,6 +653,16 @@ export class CodexAppServerClient {
     const completion = this.turnCompletion;
     if (!completion || !message.method) return;
     logServerNotification(message);
+    if (message.method === "thread/tokenUsage/updated") return;
+    if (message.method === "turn/plan/updated") {
+      const planEvent = extractCompanionPlanUpdatedEvent(
+        message,
+        this.activeDhdThreadId ?? this.activeThreadId,
+        this.activeTurnId,
+      );
+      if (planEvent) emitCompanionPlanEvent(planEvent);
+      return;
+    }
     if (message.method === "turn/started") {
       this.activeTurnId = extractTurnId(message.params) || this.activeTurnId;
       this.activeTiming?.log(
@@ -699,7 +782,10 @@ export class CodexAppServerClient {
     timing: PhaseTimer,
   ): Promise<void> {
     if (!this.loadedThreadIds.has(threadId)) {
-      if (this.activeDhdThreadId === threadId) this.activeDhdThreadId = null;
+      if (this.activeDhdThreadId === threadId) {
+        this.activeDhdThreadId = null;
+        this.hasCurrentDhdThread = false;
+      }
       return;
     }
     timing.log("thread/unsubscribe:start", `threadId=${threadId}`);
@@ -714,7 +800,10 @@ export class CodexAppServerClient {
       );
     } finally {
       this.loadedThreadIds.delete(threadId);
-      if (this.activeDhdThreadId === threadId) this.activeDhdThreadId = null;
+      if (this.activeDhdThreadId === threadId) {
+        this.activeDhdThreadId = null;
+        this.hasCurrentDhdThread = false;
+      }
     }
   }
 
@@ -814,7 +903,17 @@ export class CodexAppServerClient {
   }
 
   private respondError(id: JsonRpcId, code: number, message: string): void {
-    this.send({ id, error: { code, message } });
+    try {
+      this.send({ id, error: { code, message } });
+    } catch (error) {
+      // The App Server can interrupt and close its stdin while an async
+      // server request handler is still unwinding. A best-effort JSON-RPC
+      // error must not become an unhandled rejection that kills the phone
+      // companion worker during an otherwise expected shutdown.
+      console.error(
+        `[codex-app-server] could not send server-request error: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   private request(
@@ -957,8 +1056,11 @@ export function buildDhdDynamicTools(
   };
   const openAppMetadata = {
     type: "object",
-    properties: baseMetadataProperties,
-    required: ["purpose", "targetDescription", "observationId"],
+    properties: {
+      purpose: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
+      targetDescription: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
+    },
+    required: ["purpose", "targetDescription"],
     additionalProperties: false,
   };
   const actionObject = (
@@ -998,14 +1100,6 @@ export function buildDhdDynamicTools(
       },
       required: ["type", "startX", "startY", "endX", "endY"],
     },
-    {
-      properties: {
-        type: { const: DHD_ACTION_TYPES.scroll },
-        direction: { type: "string", enum: [...DHD_SCROLL_DIRECTIONS] },
-        amount: { type: "string", enum: [...DHD_SCROLL_AMOUNTS] },
-      },
-      required: ["type", "direction", "amount"],
-    },
     { properties: { type: { const: DHD_ACTION_TYPES.back } }, required: ["type"] },
     {
       properties: {
@@ -1029,18 +1123,14 @@ export function buildDhdDynamicTools(
   });
   const action = createActionSchema(metadata);
   const sequenceAction = createActionSchema(sequenceMetadata);
+  const displayTargetProperties: Record<string, unknown> = {
+    displayRef: { type: "string", pattern: "^dsp_[a-f0-9]{14}$" },
+  };
   const observeProperties: Record<string, unknown> = {
-    expectedPackageName: { type: "string", minLength: 1 },
     purpose: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
     targetDescription: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
+    ...displayTargetProperties,
   };
-  if (enableGuardRegions) {
-    observeProperties.guardRegions = {
-      type: "array",
-      maxItems: DHD_MAX_GUARD_REGIONS,
-      items: guardRegion,
-    };
-  }
 
   return [
     dynamicTool(
@@ -1063,9 +1153,47 @@ export function buildDhdDynamicTools(
       },
     ),
     dynamicTool(
+      "dhd_set_app_display_layout",
+      dhdToolDescription("dhd_set_app_display_layout", enableGuardRegions),
+      {
+        type: "object",
+        properties: {
+          packageName: {
+            type: "string",
+            minLength: 1,
+            pattern: "^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+$",
+          },
+          layout: { type: "string", enum: ["standard", "full_size"] },
+        },
+        required: ["packageName", "layout"],
+        additionalProperties: false,
+      },
+    ),
+    dynamicTool(
+      "dhd_list_displays",
+      dhdToolDescription("dhd_list_displays", enableGuardRegions),
+      emptySchema(),
+    ),
+    dynamicTool(
+      "dhd_close_display",
+      dhdToolDescription("dhd_close_display", enableGuardRegions),
+      {
+        type: "object",
+        properties: {
+          ...displayTargetProperties,
+        },
+        required: ["displayRef"],
+        additionalProperties: false,
+      },
+    ),
+    dynamicTool(
       "dhd_get_foreground_app",
       dhdToolDescription("dhd_get_foreground_app", enableGuardRegions),
-      emptySchema(),
+      {
+        type: "object",
+        properties: displayTargetProperties,
+        additionalProperties: false,
+      },
     ),
     dynamicTool(
       "dhd_observe",
@@ -1082,6 +1210,7 @@ export function buildDhdDynamicTools(
       {
         type: "object",
         properties: {
+          ...displayTargetProperties,
           packageName: { type: "string", minLength: 1 },
           metadata: openAppMetadata,
         },
@@ -1094,7 +1223,7 @@ export function buildDhdDynamicTools(
       dhdToolDescription("dhd_execute", enableGuardRegions),
       {
         type: "object",
-        properties: { action },
+        properties: { ...displayTargetProperties, action },
         required: ["action"],
         additionalProperties: false,
       },
@@ -1105,6 +1234,7 @@ export function buildDhdDynamicTools(
       {
         type: "object",
         properties: {
+          ...displayTargetProperties,
           observationId: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
           actions: {
             type: "array",
@@ -1124,6 +1254,7 @@ export function buildDhdDynamicTools(
         type: "object",
         properties: {
           reason: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
+          ...displayTargetProperties,
         },
         required: ["reason"],
         additionalProperties: false,
@@ -1184,7 +1315,9 @@ export async function handleDynamicToolCall(
 
   let result: PhoneAssistantToolResult | undefined;
   try {
-    result = await invoke(mappedName, normalizedArguments.value);
+    result = options.invoke
+      ? await invoke(mappedName, normalizedArguments.value)
+      : await invokeDhdTool(mappedName, normalizedArguments.value, { includeDebugImages: true });
     const response = toDynamicToolResponse(result);
     emit({
       type: "dhd_tool_call",
@@ -1422,6 +1555,40 @@ interface ActiveCodexTurn {
  */
 let activeCodexTurn: ActiveCodexTurn | null = null;
 
+/** Keep phone-side companion presence alive independently of task polling. */
+async function maintainCompanionHeartbeat(
+  isStopping: () => boolean,
+): Promise<void> {
+  let lastHealthy: boolean | undefined;
+  while (!isStopping()) {
+    try {
+      const response = await requestBridge(
+        { type: "heartbeat", requestId: randomUUID() },
+        { timeoutMs: COMPANION_HEARTBEAT_TIMEOUT_MS },
+      );
+      if (response.ok !== true) {
+        throw new Error(
+          typeof response.message === "string"
+            ? response.message
+            : "The phone bridge rejected the companion heartbeat.",
+        );
+      }
+      if (lastHealthy === false) {
+        console.error("[phone-assistant-companion] phone bridge heartbeat restored");
+      }
+      lastHealthy = true;
+    } catch (error) {
+      if (lastHealthy !== false) {
+        console.error(
+          `[phone-assistant-companion] phone bridge heartbeat unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      lastHealthy = false;
+    }
+    if (!isStopping()) await delay(COMPANION_HEARTBEAT_INTERVAL_MS);
+  }
+}
+
 export async function runAssistantCompanion(): Promise<void> {
   const pollIntervalMs = parsePollInterval(process.env.PHONE_ASSISTANT_POLL_MS);
   let stopping = false;
@@ -1440,6 +1607,26 @@ export async function runAssistantCompanion(): Promise<void> {
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
+
+  let codexWarmup: Promise<boolean> | null = null;
+  const scheduleCodexWarmup = (scope: string): void => {
+    // Codex startup can take longer than the phone presence lease. Keep the
+    // bridge poll loop alive while warming the App Server in the background.
+    if (codexWarmup) return;
+    const operation = prewarmCodexClient(codexClient, scope);
+    codexWarmup = operation;
+    void operation.then(
+      () => {
+        if (codexWarmup === operation) codexWarmup = null;
+      },
+      (error) => {
+        console.error(
+          `[phone-assistant-companion] Codex warmup runner failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        if (codexWarmup === operation) codexWarmup = null;
+      },
+    );
+  };
 
   console.error(
     "[phone-assistant-companion] waiting for a request typed in the Android app",
@@ -1460,8 +1647,9 @@ export async function runAssistantCompanion(): Promise<void> {
     "[phone-assistant-companion] a logged-in Codex CLI must be available on this companion host",
   );
 
+  const heartbeatPromise = maintainCompanionHeartbeat(() => stopping);
   try {
-    await prewarmCodexClient(codexClient, "codex-prewarm");
+    scheduleCodexWarmup("codex-prewarm");
     while (!stopping) {
       const pollStartedAt = performance.now();
       if (debugTimingEnabled()) logCompanionPhase("poll:start");
@@ -1479,7 +1667,7 @@ export async function runAssistantCompanion(): Promise<void> {
           }
           if (pending.warmupRequested === true) {
             logCompanionPhase("codex:warmup_requested");
-            await prewarmCodexClient(codexClient, "codex-app-open-warmup");
+            scheduleCodexWarmup("codex-app-open-warmup");
           }
           if (pending.ok === true && pending.available === true) {
             logCompanionPhase(
@@ -1517,7 +1705,9 @@ export async function runAssistantCompanion(): Promise<void> {
       if (!stopping) await delay(pollIntervalMs);
     }
   } finally {
+    stopping = true;
     if (pendingRun) await pendingRun;
+    await heartbeatPromise;
     await codexClient.close();
   }
 }
@@ -1586,7 +1776,8 @@ async function processPendingRequest(
   }
 
   const request = typeof claimed.request === "string" ? claimed.request : "";
-  if (!request) {
+  const isContinuation = claimed.continuation === true;
+  if (!request && !isContinuation) {
     console.error(
       "[phone-assistant-companion] claimed request was empty; releasing it",
     );
@@ -1594,7 +1785,9 @@ async function processPendingRequest(
     return;
   }
 
-  console.error(`[phone-assistant-companion] claimed ${sessionId}: ${request}`);
+  console.error(
+    `[phone-assistant-companion] claimed ${sessionId}: ${isContinuation ? "continuation" : request}`,
+  );
   activeCodexTurn = { sessionId, client: codexClient };
   const agentMessageStreamer = new AgentMessageStreamer(
     sessionId,
@@ -1624,43 +1817,38 @@ async function processPendingRequest(
       reasoningEffort,
       fastMode,
       (update) => agentMessageStreamer.push(update),
+      async (threadId) => {
+        // Bind a newly created thread before the first turn can finish. If
+        // the user stops mid-task, the interrupted turn still leaves enough
+        // durable identity for Continue to resume the same Codex context.
+        if (!conversationId || (existingThreadId && threadId === existingThreadId)) {
+          return;
+        }
+        const bound = await requestBridge({
+          type: "bind_codex_thread",
+          requestId: randomUUID(),
+          conversationId,
+          codexThreadId: threadId,
+        });
+        if (bound.ok !== true) {
+          throw new Error(
+            `The phone did not bind Codex thread ${threadId}: ${String(bound.message ?? "unknown error")}`,
+          );
+        }
+      },
+      isContinuation,
     );
-    const phoneToolFailure = result.phoneToolFailures.at(-1);
-    if (phoneToolFailure) {
-      const reason = formatPhoneToolFailure(phoneToolFailure);
-      timing.log("phone-tool:failed", `tool=${phoneToolFailure.tool}`);
-      console.error(
-        `[phone-assistant-companion] phone tool failed; refusing to report success: ${reason}`,
+    if (result.phoneToolFailures.length > 0) {
+      const failedTools = [
+        ...new Set(result.phoneToolFailures.map((failure) => failure.tool)),
+      ].join(", ");
+      timing.log(
+        "phone-tool:reported_failure",
+        `count=${result.phoneToolFailures.length} tools=${failedTools || "unknown"}`,
       );
-      const failed = await requestBridge({
-        type: "fail_session",
-        requestId: randomUUID(),
-        sessionId,
-        reason,
-      });
-      if (failed.ok !== true) {
-        console.error(
-          `[phone-assistant-companion] could not mark the phone session failed: ${String(failed.message ?? "unknown error")}`,
-        );
-      }
-      return;
-    }
-    if (
-      conversationId &&
-      result.threadId &&
-      result.threadId !== existingThreadId
-    ) {
-      const bound = await requestBridge({
-        type: "bind_codex_thread",
-        requestId: randomUUID(),
-        conversationId,
-        codexThreadId: result.threadId,
-      });
-      if (bound.ok !== true) {
-        throw new Error(
-          `The phone did not bind Codex thread ${result.threadId}: ${String(bound.message ?? "unknown error")}`,
-        );
-      }
+      console.error(
+        `[phone-assistant-companion] ${result.phoneToolFailures.length} phone tool call(s) reported an error; preserving the Codex response and conversation context`,
+      );
     }
     console.error(
       `[phone-assistant-companion] Codex turn reached terminal status; closing phone session` +
@@ -1704,8 +1892,6 @@ async function processPendingRequest(
 }
 
 async function processPendingSteer(active: ActiveCodexTurn): Promise<void> {
-  if (!active.client.isTurnInFlight) return;
-
   const pending = await requestBridge(
     {
       type: "pending_steer",
@@ -1726,7 +1912,7 @@ async function processPendingSteer(active: ActiveCodexTurn): Promise<void> {
   // A phone-side Stop changes the coordinator state before the next poll. In
   // that case interrupt Codex as well so the desktop turn cannot continue
   // operating the phone after the user has stopped it.
-  if (pending.active === false && active.client.isTurnInFlight) {
+  if (shouldInterruptForPhoneStop(pending) && active.client.isTurnInFlight) {
     await active.client.interrupt().catch((error) => {
       console.error(
         `[phone-assistant-companion] could not interrupt stopped phone session: ${error instanceof Error ? error.message : String(error)}`,
@@ -1820,19 +2006,13 @@ async function releaseRequest(sessionId: string): Promise<void> {
   }
 }
 
-function normalizeAgentFeedback(text: string): string {
-  return text.replace(/\r\n?/g, "\n").trim().slice(0, MAX_AGENT_FEEDBACK_CHARS);
+/** Attention waiting is active-session state, not a phone-side Stop. */
+export function shouldInterruptForPhoneStop(pending: BridgeMessage): boolean {
+  return pending.attentionPending !== true && pending.active === false;
 }
 
-function formatPhoneToolFailure(failure: PhoneToolFailure): string {
-  const code = failure.code ? ` (${failure.code})` : "";
-  const outcome =
-    failure.outcome?.toLowerCase() === "unknown"
-      ? "could not be verified"
-      : "failed";
-  return `${failure.tool} ${outcome}${code}: ${failure.message}`
-    .trim()
-    .slice(0, MAX_AGENT_FEEDBACK_CHARS);
+function normalizeAgentFeedback(text: string): string {
+  return text.replace(/\r\n?/g, "\n").trim().slice(0, MAX_AGENT_FEEDBACK_CHARS);
 }
 
 function extractThreadId(value: unknown): string | null {
@@ -1854,6 +2034,66 @@ function extractTurnId(value: unknown): string | null {
   const turn = extractRecord(record.turn);
   if (turn && typeof turn.id === "string" && turn.id) return turn.id;
   return typeof record.id === "string" && record.id ? record.id : null;
+}
+
+function readTokenCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+export function extractCompanionTokenUsageEvent(
+  value: unknown,
+  timestamp = Date.now(),
+): CompanionTokenUsageEvent | null {
+  const message = extractRecord(value);
+  if (message?.method !== "thread/tokenUsage/updated") return null;
+
+  const params = extractRecord(message.params);
+  const tokenUsage = extractRecord(params?.tokenUsage);
+  const last = extractRecord(tokenUsage?.last);
+  const threadId = typeof params?.threadId === "string" ? params.threadId : "";
+  const turnId = typeof params?.turnId === "string" ? params.turnId : "";
+  if (!threadId || !turnId || !last) return null;
+
+  const inputTokens = readTokenCount(last.inputTokens);
+  const outputTokens = readTokenCount(last.outputTokens);
+  const cachedInputTokens = readTokenCount(last.cachedInputTokens);
+  const reasoningOutputTokens = readTokenCount(last.reasoningOutputTokens);
+  const totalTokens = readTokenCount(last.totalTokens);
+  if (
+    inputTokens === null ||
+    outputTokens === null ||
+    cachedInputTokens === null ||
+    reasoningOutputTokens === null ||
+    totalTokens === null
+  ) {
+    return null;
+  }
+
+  const rawContextWindow = tokenUsage?.modelContextWindow;
+  const modelContextWindow =
+    rawContextWindow === undefined || rawContextWindow === null
+      ? null
+      : readTokenCount(rawContextWindow);
+  if (rawContextWindow !== undefined && rawContextWindow !== null && modelContextWindow === null) {
+    return null;
+  }
+
+  return {
+    type: "dhd_token_usage",
+    threadId,
+    turnId,
+    usage: {
+      inputTokens,
+      outputTokens,
+      cachedInputTokens,
+      reasoningOutputTokens,
+      totalTokens,
+    },
+    modelContextWindow,
+    timestamp,
+  };
 }
 
 function extractText(value: unknown): string {
@@ -2023,6 +2263,77 @@ function extractTurnError(value: unknown): string {
   const turnError = extractRecord(turn?.error);
   if (typeof turnError?.message === "string") return turnError.message;
   return typeof record?.message === "string" ? record.message : "";
+}
+
+function resolveCodexBin(): string {
+  const configured = process.env.PHONE_ASSISTANT_CODEX_BIN?.trim();
+  if (configured) return configured;
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+    const binDirectory = join(localAppData, "OpenAI", "Codex", "bin");
+    try {
+      const installed = readdirSync(binDirectory, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => join(binDirectory, entry.name, "codex.exe"))
+        .flatMap((path) => {
+          try {
+            return [{ path, modified: statSync(path).mtimeMs }];
+          } catch {
+            return [];
+          }
+        })
+        .sort((left, right) => right.modified - left.modified);
+      if (installed[0]) return installed[0].path;
+    } catch {
+      // Standalone CLI installs are still resolved through PATH below.
+    }
+  }
+  // The unversioned desktop-app binary can lag behind the active CLI.
+  return "codex";
+}
+
+export function extractCompanionPlanUpdatedEvent(
+  value: unknown,
+  threadId: string | null,
+  expectedTurnId: string | null,
+  timestamp = Date.now(),
+): CompanionPlanUpdatedEvent | null {
+  const message = extractRecord(value);
+  if (message?.method !== "turn/plan/updated" || !threadId) return null;
+
+  const params = extractRecord(message.params);
+  const turnId = typeof params?.turnId === "string" ? params.turnId : "";
+  if (!turnId || (expectedTurnId && expectedTurnId !== turnId)) return null;
+  if (!Array.isArray(params?.plan)) return null;
+
+  const steps: CompanionPlanUpdatedEvent["steps"] = [];
+  for (const rawStep of params.plan) {
+    const step = extractRecord(rawStep);
+    const text = typeof step?.step === "string" ? step.step : null;
+    const rawStatus = step?.status;
+    const status =
+      rawStatus === "pending"
+        ? "pending"
+        : rawStatus === "inProgress" || rawStatus === "in_progress"
+          ? "in_progress"
+          : rawStatus === "completed"
+            ? "completed"
+            : null;
+    if (text === null || status === null) return null;
+    steps.push({ step: text, status });
+  }
+
+  const explanation =
+    typeof params.explanation === "string" ? params.explanation : undefined;
+  return {
+    type: "dhd_plan",
+    phase: "updated",
+    threadId,
+    turnId,
+    ...(explanation ? { explanation } : {}),
+    steps,
+    timestamp,
+  };
 }
 
 function resolveCodexHome(): string {

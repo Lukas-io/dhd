@@ -3,32 +3,53 @@ package com.phonecontrol.assistant.bridge
 import android.util.Base64
 import android.content.Context
 import android.content.Intent
+import android.os.Build
+import android.os.SystemClock
 import com.phonecontrol.assistant.apps.InstalledAppsRepository
 import com.phonecontrol.assistant.apps.InstalledUserApp
+import com.phonecontrol.assistant.PhoneControlApplication
+import com.phonecontrol.assistant.data.DHD_BROWSE_APP_TOOL
+import com.phonecontrol.assistant.data.DHD_EXECUTE_TOOL
+import com.phonecontrol.assistant.data.DHD_FOREGROUND_APP_TOOL
+import com.phonecontrol.assistant.data.DHD_EXECUTE_SEQUENCE_TOOL
+import com.phonecontrol.assistant.data.DHD_LIST_ALLOWED_APPS_TOOL
+import com.phonecontrol.assistant.data.DHD_OBSERVE_TOOL
+import com.phonecontrol.assistant.data.DHD_OPEN_APP_TOOL
+import com.phonecontrol.assistant.data.DHD_SET_APP_DISPLAY_LAYOUT_TOOL
 import com.phonecontrol.assistant.domain.ActionMetadata
 import com.phonecontrol.assistant.domain.BackAction
 import com.phonecontrol.assistant.domain.GuardRegion
 import com.phonecontrol.assistant.domain.KeypressAction
 import com.phonecontrol.assistant.domain.KeypressKey
 import com.phonecontrol.assistant.domain.OpenAppAction
+import com.phonecontrol.assistant.domain.ObservationSize
 import com.phonecontrol.assistant.domain.ObservationSnapshot
 import com.phonecontrol.assistant.domain.PhoneAction
 import com.phonecontrol.assistant.domain.ReasoningEffort
-import com.phonecontrol.assistant.domain.ScrollAction
-import com.phonecontrol.assistant.domain.ScrollAmount
-import com.phonecontrol.assistant.domain.ScrollDirection
+import com.phonecontrol.assistant.domain.StaleObservationDiagnostics
+import com.phonecontrol.assistant.domain.StaleObservationReason
 import com.phonecontrol.assistant.domain.SwipeAction
 import com.phonecontrol.assistant.domain.TapAction
 import com.phonecontrol.assistant.domain.TypeAction
 import com.phonecontrol.assistant.domain.WaitAction
+import com.phonecontrol.assistant.overlay.OverlayHideReason
 import com.phonecontrol.assistant.session.ActionExecutionResult
 import com.phonecontrol.assistant.session.AssistantForegroundService
+import com.phonecontrol.assistant.session.AttentionResolution
+import com.phonecontrol.assistant.session.DhdToolCallStatus
 import com.phonecontrol.assistant.session.SessionCoordinator
 import com.phonecontrol.assistant.session.SessionState
-import com.phonecontrol.assistant.shizuku.ForegroundAppResult
-import com.phonecontrol.assistant.shizuku.ObservationCaptureResult
-import com.phonecontrol.assistant.shizuku.ShizukuObservationProvider
-import com.phonecontrol.assistant.shizuku.TransportResult
+import com.phonecontrol.assistant.session.defaultDhdToolPurpose
+import com.phonecontrol.assistant.execution.ForegroundAppResult
+import com.phonecontrol.assistant.execution.ObservationCaptureResult
+import com.phonecontrol.assistant.execution.PhoneObservationProvider
+import com.phonecontrol.assistant.execution.TransportResult
+import com.phonecontrol.assistant.execution.TaskDisplayBackend
+import com.phonecontrol.assistant.execution.TaskDisplayCloseResult
+import com.phonecontrol.assistant.execution.TaskDisplayLayoutPreferences
+import com.phonecontrol.assistant.execution.TaskDisplayResolution
+import com.phonecontrol.assistant.execution.TaskDisplayStatus
+import com.phonecontrol.assistant.execution.taskDisplayReference
 import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.InputStreamReader
@@ -42,11 +63,12 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
 import java.security.MessageDigest
-import java.security.SecureRandom
 import java.util.UUID
 import java.util.Collections
 import java.util.LinkedHashMap
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -64,6 +86,13 @@ import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
 
+data class PendingCompanionPairing(
+    val requestId: String,
+    val deviceId: String,
+    val desktopName: String,
+    val expiresAtEpochMs: Long,
+)
+
 /**
  * Authenticated LAN NDJSON bridge used by the development desktop companion.
  *
@@ -77,13 +106,17 @@ import org.json.JSONObject
 class DevBridgeServer(
     private val context: Context,
     private val coordinator: SessionCoordinator,
-    private val observationProvider: ShizukuObservationProvider,
+    private val observationProvider: PhoneObservationProvider,
     private val allowedPackagesProvider: () -> Set<String>,
     private val port: Int = DEFAULT_PORT,
     private val fullAccessProvider: () -> Boolean = { false },
+    /** Production DHD keeps every model observation/action on a task display. */
+    private val taskDisplayRequiredProvider: () -> Boolean = { false },
+    private val taskDisplayBackend: TaskDisplayBackend? = null,
 ) {
     private val preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
     private val installedAppsRepository = InstalledAppsRepository(context)
+    private val taskDisplayLayoutPreferences = TaskDisplayLayoutPreferences(context)
     val authenticationToken: String = preferences.getString(KEY_AUTH_TOKEN, null)
         ?.trim()
         ?.takeIf(String::isNotEmpty)
@@ -101,12 +134,17 @@ class DevBridgeServer(
     @Volatile private var serverSocket: ServerSocket? = null
     @Volatile private var pairingSocket: DatagramSocket? = null
     @Volatile private var started = false
-    @Volatile private var lastCompanionSeenEpochMs: Long = 0L
-    private val _companionConnected = MutableStateFlow(false)
-    private val pairingCodeLock = Any()
-    @Volatile private var pairingCodeValue: String = loadOrCreatePairingCode()
-    private val codexWarmupRequested = AtomicBoolean(false)
+  @Volatile private var lastCompanionSeenElapsedMs: Long = 0L
+  private val _companionConnected = MutableStateFlow(false)
+  private val pairingStateLock = Any()
+    private val discoveryNonces = LinkedHashMap<String, Long>()
+  private val completedPairingResponses = LinkedHashMap<String, CompletedCompanionPairingResponse>()
+  @Volatile private var pendingCompanionPairingRequest: PendingCompanionPairingRequest? = null
+  private val _pendingCompanionPairing = MutableStateFlow<PendingCompanionPairing?>(null)
+  private val codexWarmupRequested = AtomicBoolean(false)
     private val phoneActionMutex = Mutex()
+    private val overlayVisibilityGate
+        get() = (context.applicationContext as? PhoneControlApplication)?.overlayVisibilityGate
     private val observations = Collections.synchronizedMap(
         object : LinkedHashMap<String, ObservationSnapshot>(MAX_OBSERVATIONS + 1, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ObservationSnapshot>?): Boolean =
@@ -114,45 +152,30 @@ class DevBridgeServer(
         },
     )
 
-    val pairingCode: String
-        get() = pairingCodeValue
+    private data class PendingCompanionPairingRequest(
+        val publicRequest: PendingCompanionPairing,
+        val pairingNonce: String,
+        val address: InetAddress,
+        val port: Int,
+        val socket: DatagramSocket,
+    )
+
+    private data class CompletedCompanionPairingResponse(
+        val pairingNonce: String,
+        val expiresAtEpochMs: Long,
+        val response: JSONObject,
+    )
 
     val companionConnected: StateFlow<Boolean> = _companionConnected.asStateFlow()
 
-    fun refreshPairingCode(): String = synchronized(pairingCodeLock) {
-        rotatePairingCodeLocked()
-    }
+    val pendingCompanionPairing: StateFlow<PendingCompanionPairing?> =
+        _pendingCompanionPairing.asStateFlow()
 
-    private fun loadOrCreatePairingCode(): String {
-        val stored = preferences.getString(KEY_PAIRING_CODE, null)?.trim()?.uppercase()
-        return if (stored != null && isValidPairingCode(stored)) {
-            stored
-        } else {
-            val next = generatePairingCode()
-            preferences.edit()
-                .putString(KEY_PAIRING_CODE, next)
-                .apply()
-            next
-        }
-    }
+    /** Approve the pending desktop request and release the LAN auth token once. */
+    fun approvePendingCompanionPairing(): Boolean = respondToPendingCompanionPairing(approved = true)
 
-    private fun rotatePairingCodeLocked(): String {
-        val next = generatePairingCode()
-        pairingCodeValue = next
-        preferences.edit()
-            .putString(KEY_PAIRING_CODE, next)
-            .apply()
-        return next
-    }
-
-    private fun generatePairingCode(): String = buildString(PAIRING_CODE_LENGTH) {
-        repeat(PAIRING_CODE_LENGTH) {
-            append(PAIRING_CODE_ALPHABET[secureRandom.nextInt(PAIRING_CODE_ALPHABET.length)])
-        }
-    }
-
-    private fun isValidPairingCode(value: String): Boolean = value.length == PAIRING_CODE_LENGTH &&
-        value.all { character -> character in PAIRING_CODE_ALPHABET }
+    /** Reject the pending desktop request without revealing the LAN auth token. */
+    fun rejectPendingCompanionPairing(): Boolean = respondToPendingCompanionPairing(approved = false)
 
     fun start() {
         if (started) return
@@ -161,7 +184,7 @@ class DevBridgeServer(
             try {
                 val socket = ServerSocket(
                     port,
-                    1,
+                    16,
                     InetAddress.getByName(LAN_BIND_HOST),
                 )
                 serverSocket = socket
@@ -185,16 +208,17 @@ class DevBridgeServer(
         serverSocket = null
         pairingSocket?.close()
         pairingSocket = null
-        lastCompanionSeenEpochMs = 0L
+        clearPendingCompanionPairing()
+        lastCompanionSeenElapsedMs = 0L
         _companionConnected.value = false
         scope.coroutineContext[Job]?.cancel()
     }
 
     private suspend fun monitorCompanionPresence() {
         while (currentCoroutineContext().isActive) {
-            val lastSeen = lastCompanionSeenEpochMs
+            val lastSeen = lastCompanionSeenElapsedMs
             val connected = lastSeen > 0L &&
-                System.currentTimeMillis() - lastSeen <= COMPANION_PRESENCE_TIMEOUT_MS
+                SystemClock.elapsedRealtime() - lastSeen <= COMPANION_PRESENCE_TIMEOUT_MS
             if (_companionConnected.value != connected) {
                 _companionConnected.value = connected
             }
@@ -203,7 +227,7 @@ class DevBridgeServer(
     }
 
     private fun markCompanionSeen() {
-        lastCompanionSeenEpochMs = System.currentTimeMillis()
+        lastCompanionSeenElapsedMs = SystemClock.elapsedRealtime()
         _companionConnected.value = true
     }
 
@@ -215,7 +239,12 @@ class DevBridgeServer(
             while (!socket.isClosed) {
                 val packet = DatagramPacket(buffer, buffer.size)
                 socket.receive(packet)
-                handlePairingRequest(socket, packet)
+                runCatching { handlePairingRequest(socket, packet) }
+                    .onFailure { error ->
+                        if (!socket.isClosed) {
+                            android.util.Log.w(TAG, "Could not handle a pairing discovery packet", error)
+                        }
+                    }
             }
         } catch (_: SocketException) {
             // Closing the pairing socket is the normal shutdown path.
@@ -234,28 +263,251 @@ class DevBridgeServer(
         } catch (_: Throwable) {
             return
         }
-        if (request.optString("type") != "dhd_pair_request" ||
-            request.optInt("version", -1) != PAIRING_PROTOCOL_VERSION
-        ) {
-            return
+        if (request.optInt("version", -1) != PAIRING_PROTOCOL_VERSION) return
+        when (request.optString("type")) {
+            "dhd_discover_request" -> handlePhoneDiscoveryRequest(socket, packet, request)
+            "dhd_pair_approval_request" -> handlePairingApprovalRequest(socket, packet, request)
         }
-        val requestId = request.optString("requestId").trim()
-        val candidateCode = request.optString("code").trim().uppercase()
-        if (requestId.isBlank() || candidateCode != pairingCode) return
+    }
 
+    private fun handlePhoneDiscoveryRequest(
+        socket: DatagramSocket,
+        packet: DatagramPacket,
+        request: JSONObject,
+    ) {
+        val requestId = request.optString("requestId").trim()
+        if (requestId.isBlank()) return
+
+        val pairingNonce = UUID.randomUUID().toString().replace("-", "")
+        rememberDiscoveryNonce(pairingNonce)
         val response = JSONObject()
-            .put("type", "dhd_pair_offer")
+            .put("type", "dhd_discover_offer")
             .put("version", PAIRING_PROTOCOL_VERSION)
             .put("requestId", requestId)
             .put("deviceId", deviceId)
+            .put("deviceName", companionDeviceName())
+            .put("model", Build.MODEL.trim())
             .put("port", listeningPort)
-            .put("token", authenticationToken)
+            .put("pairingNonce", pairingNonce)
+        addLanAddresses(response)
+        sendPairingResponse(socket, packet, response)
+    }
+
+    private fun handlePairingApprovalRequest(
+        socket: DatagramSocket,
+        packet: DatagramPacket,
+        request: JSONObject,
+    ) {
+        val requestId = request.optString("requestId").trim()
+        val candidateDeviceId = request.optString("deviceId").trim()
+        val pairingNonce = request.optString("pairingNonce").trim()
+        if (requestId.isBlank() || candidateDeviceId != deviceId || pairingNonce.isBlank()) return
+
+        val completedResponse = synchronized(pairingStateLock) {
+            val now = System.currentTimeMillis()
+            completedPairingResponses.entries.removeIf { (_, value) -> value.expiresAtEpochMs <= now }
+            completedPairingResponses[requestId]
+                ?.takeIf { it.pairingNonce == pairingNonce }
+        }
+        if (completedResponse != null) {
+            sendPairingResponse(socket, packet, completedResponse.response)
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        val expiresAt = now + PAIRING_APPROVAL_TIMEOUT_MS
+        val desktopName = request.optString("desktopName").trim()
+            .ifBlank { "DHD Companion" }
+            .take(MAX_DESKTOP_NAME_CHARS)
+        val publicRequest = PendingCompanionPairing(
+            requestId = requestId,
+            deviceId = deviceId,
+            desktopName = desktopName,
+            expiresAtEpochMs = expiresAt,
+        )
+        val pending = PendingCompanionPairingRequest(
+            publicRequest = publicRequest,
+            pairingNonce = pairingNonce,
+            address = packet.address,
+            port = packet.port,
+            socket = socket,
+        )
+
+        val existing = synchronized(pairingStateLock) { pendingCompanionPairingRequest }
+        if (existing != null && existing.publicRequest.expiresAtEpochMs > now) {
+            if (existing.publicRequest.requestId == requestId && existing.pairingNonce == pairingNonce) {
+                // UDP retries from the same desktop are expected. Re-send the
+                // acknowledgement instead of turning a lost packet into a
+                // false pairing rejection.
+                sendPairingResponse(
+                    socket,
+                    packet,
+                    JSONObject()
+                        .put("type", "dhd_pair_approval_pending")
+                        .put("version", PAIRING_PROTOCOL_VERSION)
+                        .put("requestId", requestId)
+                        .put("deviceId", deviceId)
+                        .put("expiresAtEpochMs", existing.publicRequest.expiresAtEpochMs),
+                )
+                return
+            }
+            sendPairingResponse(
+                socket,
+                packet,
+                approvalRejection(requestId, "Another desktop pairing request is already waiting for approval."),
+            )
+            return
+        }
+
+        if (!consumeDiscoveryNonce(pairingNonce)) {
+            sendPairingResponse(
+                socket,
+                packet,
+                approvalRejection(requestId, "This discovery request has expired. Refresh the phone list and try again."),
+            )
+            return
+        }
+
+        synchronized(pairingStateLock) {
+            pendingCompanionPairingRequest = pending
+            _pendingCompanionPairing.value = publicRequest
+        }
+
+        sendPairingResponse(
+            socket,
+            packet,
+            JSONObject()
+                .put("type", "dhd_pair_approval_pending")
+                .put("version", PAIRING_PROTOCOL_VERSION)
+                .put("requestId", requestId)
+                .put("deviceId", deviceId)
+                .put("expiresAtEpochMs", expiresAt),
+        )
+        scope.launch {
+            delay(PAIRING_APPROVAL_TIMEOUT_MS)
+            synchronized(pairingStateLock) {
+                if (pendingCompanionPairingRequest?.publicRequest?.requestId == requestId) {
+                    pendingCompanionPairingRequest = null
+                    _pendingCompanionPairing.value = null
+                }
+            }
+        }
+    }
+
+    private fun addLanAddresses(response: JSONObject) {
         val addresses = JSONArray()
         lanIpv4Addresses().forEach(addresses::put)
         response.put("addresses", addresses)
+    }
 
+    private fun sendPairingResponse(
+        socket: DatagramSocket,
+        packet: DatagramPacket,
+        response: JSONObject,
+    ) {
         val bytes = response.toString().toByteArray(Charsets.UTF_8)
         socket.send(DatagramPacket(bytes, bytes.size, packet.address, packet.port))
+    }
+
+    private fun approvalRejection(requestId: String, message: String): JSONObject = JSONObject()
+        .put("type", "dhd_pair_approval_rejected")
+        .put("version", PAIRING_PROTOCOL_VERSION)
+        .put("requestId", requestId)
+        .put("deviceId", deviceId)
+        .put("message", message)
+
+    private fun rememberDiscoveryNonce(nonce: String) {
+        val now = System.currentTimeMillis()
+        synchronized(pairingStateLock) {
+            discoveryNonces.entries.removeIf { (_, expiresAt) -> expiresAt <= now }
+            discoveryNonces[nonce] = now + DISCOVERY_NONCE_TTL_MS
+            while (discoveryNonces.size > MAX_DISCOVERY_NONCES) {
+                discoveryNonces.remove(discoveryNonces.keys.first())
+            }
+        }
+    }
+
+    private fun consumeDiscoveryNonce(nonce: String): Boolean {
+        val now = System.currentTimeMillis()
+        synchronized(pairingStateLock) {
+            discoveryNonces.entries.removeIf { (_, expiresAt) -> expiresAt <= now }
+            return discoveryNonces.remove(nonce)?.let { it > now } == true
+        }
+    }
+
+    private fun clearPendingCompanionPairing() {
+        synchronized(pairingStateLock) {
+            pendingCompanionPairingRequest = null
+            _pendingCompanionPairing.value = null
+            discoveryNonces.clear()
+            completedPairingResponses.clear()
+        }
+    }
+
+    private fun respondToPendingCompanionPairing(approved: Boolean): Boolean {
+        val pending = synchronized(pairingStateLock) {
+            val current = pendingCompanionPairingRequest
+            if (current == null || current.publicRequest.expiresAtEpochMs <= System.currentTimeMillis()) {
+                pendingCompanionPairingRequest = null
+                _pendingCompanionPairing.value = null
+                null
+            } else {
+                pendingCompanionPairingRequest = null
+                _pendingCompanionPairing.value = null
+                current
+            }
+        } ?: return false
+
+        val response = if (approved) {
+            JSONObject()
+                .put("type", "dhd_pair_approval_offer")
+                .put("version", PAIRING_PROTOCOL_VERSION)
+                .put("requestId", pending.publicRequest.requestId)
+                .put("deviceId", deviceId)
+                .put("port", listeningPort)
+                .put("token", authenticationToken)
+                .also(::addLanAddresses)
+        } else {
+            approvalRejection(
+                pending.publicRequest.requestId,
+                "The phone declined the desktop companion pairing request.",
+            )
+        }
+        synchronized(pairingStateLock) {
+            completedPairingResponses[pending.publicRequest.requestId] = CompletedCompanionPairingResponse(
+                pairingNonce = pending.pairingNonce,
+                expiresAtEpochMs = System.currentTimeMillis() + COMPLETED_PAIRING_RESPONSE_TTL_MS,
+                response = response,
+            )
+            while (completedPairingResponses.size > MAX_COMPLETED_PAIRING_RESPONSES) {
+                completedPairingResponses.remove(completedPairingResponses.keys.first())
+            }
+        }
+        // The approval callback is invoked by Compose on the main thread;
+        // keep the UDP write on the bridge's IO scope so Android never blocks
+        // or rejects it as network work on the UI thread.
+        scope.launch {
+            runCatching {
+                sendPairingResponse(
+                    pending.socket,
+                    DatagramPacket(ByteArray(0), 0, pending.address, pending.port),
+                    response,
+                )
+            }.onFailure { error ->
+                android.util.Log.w(TAG, "Could not send the companion pairing response", error)
+            }
+        }
+        return true
+    }
+
+    private fun companionDeviceName(): String {
+        val manufacturer = Build.MANUFACTURER.trim()
+        val model = Build.MODEL.trim()
+        return listOf(manufacturer, model)
+            .filter(String::isNotBlank)
+            .distinct()
+            .joinToString(" ")
+            .ifBlank { "DHD phone" }
     }
 
     /**
@@ -300,18 +552,28 @@ class DevBridgeServer(
                 return
             }
 
+            // Dashboard status checks are read-only health probes and must not
+            // keep the worker's liveness lease alive after the worker stops.
+            // Worker traffic still refreshes presence independently of the
+            // current task or Codex polling phase.
+            val requestType = json.optString("type")
+            if (requestType != "status" && requestType != "companion_disconnected") {
+                markCompanionSeen()
+            }
             write(
                 writer,
                 JSONObject()
                     .put("type", "accepted")
                     .put("requestId", requestId)
-                    .put("message", "${json.optString("type", "bridge")} accepted by the phone."),
+                    .put("message", "${requestType.ifBlank { "bridge" }} accepted by the phone."),
             )
             try {
-                when (json.optString("type")) {
+                when (requestType) {
                     "demo_run" -> phoneActionMutex.withLock { runDemo(parseRequest(json), writer) }
                     "start_session" -> startSession(requestId, json, writer)
                     "status" -> status(requestId, writer)
+                    "heartbeat" -> heartbeat(requestId, writer)
+                    "companion_disconnected" -> companionDisconnected(requestId, writer)
                     "pending_request" -> pendingRequest(requestId, writer)
                     "claim_request" -> claimRequest(requestId, json, writer)
                     "pending_steer" -> pendingSteer(requestId, json, writer)
@@ -323,13 +585,45 @@ class DevBridgeServer(
                     "stream_agent_message" -> streamAgentMessage(requestId, json, writer)
                     "complete_session" -> completeSession(requestId, json, writer)
                     "fail_session" -> failSession(requestId, json, writer)
-                    "allowed_apps" -> allowedApps(requestId, json, writer)
-                    "browse_apps" -> browseApps(requestId, json, writer)
-                    "foreground_app" -> foregroundApp(requestId, writer)
-                    "observe" -> observe(requestId, json, writer)
-                    "execute_action" -> phoneActionMutex.withLock { executeAction(requestId, json, writer) }
-                    "execute_sequence" -> phoneActionMutex.withLock { executeSequence(requestId, json, writer) }
-                    "request_attention" -> requestAttention(requestId, json, writer)
+                    "allowed_apps" -> withDhdTool(json, DHD_LIST_ALLOWED_APPS_TOOL) {
+                        allowedApps(requestId, json, writer)
+                    }
+                    "browse_apps" -> withDhdTool(json, DHD_BROWSE_APP_TOOL) {
+                        browseApps(requestId, json, writer)
+                    }
+                    "set_app_display_layout" -> withDhdTool(json, DHD_SET_APP_DISPLAY_LAYOUT_TOOL) {
+                        setAppDisplayLayout(requestId, json, writer)
+                    }
+                    "list_displays" -> listDisplays(requestId, writer)
+                    "close_display" -> closeDisplay(requestId, json, writer)
+                    "foreground_app" -> withDhdTool(json, DHD_FOREGROUND_APP_TOOL) {
+                        foregroundApp(requestId, json, writer)
+                    }
+                    "observe" -> withDhdTool(
+                        json = json,
+                        fallbackToolName = DHD_OBSERVE_TOOL,
+                    ) {
+                        observe(requestId, json, writer)
+                    }
+                    "execute_action" -> withDhdTool(
+                        json = json,
+                        fallbackToolName = fallbackActionToolName(json),
+                    ) {
+                        phoneActionMutex.withLock { executeAction(requestId, json, writer) }
+                    }
+                    "execute_sequence" -> withDhdTool(
+                        json = json,
+                        fallbackToolName = "dhd_execute_sequence",
+                    ) {
+                        phoneActionMutex.withLock { executeSequence(requestId, json, writer) }
+                    }
+                    "request_attention" -> withDhdTool(
+                        json = json,
+                        fallbackToolName = "dhd_request_attention",
+                        terminalStatus = DhdToolCallStatus.ATTENTION,
+                    ) {
+                        requestAttention(requestId, json, writer)
+                    }
                     "stop_session" -> stopSession(requestId, json, writer)
                     else -> write(writer, errorResponse(requestId, "Unsupported bridge request type."))
                 }
@@ -338,6 +632,109 @@ class DevBridgeServer(
                 android.util.Log.e(TAG, "Bridge request failed", error)
                 write(writer, errorResponse(requestId, "The phone bridge failed: $message"))
             }
+        }
+    }
+
+    private suspend fun withDhdTool(
+        json: JSONObject,
+        fallbackToolName: String,
+        hideDuringObservation: Boolean = false,
+        terminalStatus: DhdToolCallStatus = DhdToolCallStatus.COMPLETED,
+        block: suspend () -> Unit,
+    ) {
+        val toolName = json.optString("tool").trim().ifBlank { fallbackToolName }
+        val callId = coordinator.beginToolCall(toolName, toolPurpose(toolName, json))
+        val visibilityToken = if (hideDuringObservation) {
+            overlayVisibilityGate?.acquire(OverlayHideReason.OBSERVATION)
+        } else {
+            null
+        }
+        try {
+            block()
+            coordinator.finishToolCall(callId, terminalStatus)
+        } catch (error: Throwable) {
+            coordinator.finishToolCall(callId, DhdToolCallStatus.FAILED)
+            throw error
+        } finally {
+            visibilityToken?.close()
+        }
+    }
+
+    private fun fallbackActionToolName(json: JSONObject): String {
+        val actionType = json.optJSONObject("action")?.optString("type")?.lowercase()
+        return if (actionType == "open_app") DHD_OPEN_APP_TOOL else DHD_EXECUTE_TOOL
+    }
+
+    private fun toolPurpose(toolName: String, json: JSONObject): String =
+        metadataPurpose(json) ?: when (toolName) {
+            DHD_OBSERVE_TOOL -> json.optString("purpose").trim().takeIf(String::isNotBlank)
+                ?: defaultDhdToolPurpose(toolName)
+            DHD_OPEN_APP_TOOL -> openingAppPurpose(json)
+            DHD_SET_APP_DISPLAY_LAYOUT_TOOL -> appDisplayLayoutPurpose(json)
+            DHD_EXECUTE_TOOL -> {
+                val action = json.optJSONObject("action")
+                if (action?.optString("type")?.equals("open_app", ignoreCase = true) == true) {
+                    openingAppPurpose(json)
+                } else {
+                    defaultDhdToolPurpose(toolName)
+                }
+            }
+            "dhd_request_attention" -> defaultDhdToolPurpose(toolName)
+            else -> defaultDhdToolPurpose(toolName)
+        }
+
+    /** Read the user-visible purpose from each tool's metadata shape. */
+    private fun metadataPurpose(json: JSONObject): String? {
+        val directPurpose = json.optJSONObject("metadata")
+            ?.optString("purpose")
+            ?.trim()
+            ?.takeIf(String::isNotBlank)
+        if (directPurpose != null) return directPurpose
+
+        val actionPurpose = json.optJSONObject("action")
+            ?.optJSONObject("metadata")
+            ?.optString("purpose")
+            ?.trim()
+            ?.takeIf(String::isNotBlank)
+        if (actionPurpose != null) return actionPurpose
+
+        val actions = json.optJSONArray("actions")
+        for (index in 0 until (actions?.length() ?: 0)) {
+            val purpose = actions
+                ?.optJSONObject(index)
+                ?.optJSONObject("metadata")
+                ?.optString("purpose")
+                ?.trim()
+                ?.takeIf(String::isNotBlank)
+            if (purpose != null) return purpose
+        }
+        return null
+    }
+
+    private fun openingAppPurpose(json: JSONObject): String {
+        val packageName = json.optJSONObject("action")
+            ?.optString("packageName")
+            ?.trim()
+            ?.takeIf(String::isNotBlank)
+        val label = packageName
+            ?.let(::appLabel)
+            ?.takeIf { it.isNotBlank() && !it.equals(packageName, ignoreCase = true) }
+        return label?.let { "Opening $it" } ?: defaultDhdToolPurpose(DHD_OPEN_APP_TOOL)
+    }
+
+    private fun appDisplayLayoutPurpose(json: JSONObject): String {
+        val packageName = json.optString("packageName")
+            .trim()
+            .takeIf(String::isNotBlank)
+        val label = packageName
+            ?.let(::appLabel)
+            ?.takeIf { it.isNotBlank() && !it.equals(packageName, ignoreCase = true) }
+        return when (json.optString("layout").trim().lowercase(Locale.ROOT)) {
+            "full_size" -> label?.let { "Fitting $it to the task display" }
+                ?: "Fitting the app to the task display"
+            "standard" -> label?.let { "Restoring ${it}'s standard task layout" }
+                ?: "Restoring the standard task layout"
+            else -> defaultDhdToolPurpose(DHD_SET_APP_DISPLAY_LAYOUT_TOOL)
         }
     }
 
@@ -425,6 +822,39 @@ class DevBridgeServer(
         write(writer, response)
     }
 
+    private fun heartbeat(
+        requestId: String,
+        writer: BufferedWriter,
+    ) {
+        // Keep the phone-side companion lease independent from pending work,
+        // Codex startup, or a long-running task request.
+        markCompanionSeen()
+        write(
+            writer,
+            JSONObject()
+                .put("type", "heartbeat")
+                .put("requestId", requestId)
+                .put("ok", true)
+                .put("message", "Desktop companion heartbeat acknowledged."),
+        )
+    }
+
+    private fun companionDisconnected(
+        requestId: String,
+        writer: BufferedWriter,
+    ) {
+        lastCompanionSeenElapsedMs = 0L
+        _companionConnected.value = false
+        write(
+            writer,
+            JSONObject()
+                .put("type", "companion_disconnected")
+                .put("requestId", requestId)
+                .put("ok", true)
+                .put("message", "Desktop companion presence released."),
+        )
+    }
+
     private fun pendingRequest(
         requestId: String,
         writer: BufferedWriter,
@@ -447,6 +877,7 @@ class DevBridgeServer(
                 .put("codexThreadId", pending.codexThreadId ?: JSONObject.NULL)
                 .put("reasoningEffort", pending.reasoningEffort)
                 .put("fastMode", pending.fastMode)
+                .put("continuation", pending.isContinuation)
                 .put("request", pending.request)
         }
         write(writer, response)
@@ -478,6 +909,7 @@ class DevBridgeServer(
                 .put("codexThreadId", claimed.codexThreadId ?: JSONObject.NULL)
                 .put("reasoningEffort", claimed.reasoningEffort)
                 .put("fastMode", claimed.fastMode)
+                .put("continuation", claimed.isContinuation)
                 .put("request", claimed.request)
                 .put("message", "Phone request claimed by the desktop Codex companion."),
         )
@@ -497,7 +929,8 @@ class DevBridgeServer(
             .put("requestId", requestId)
             .put("ok", true)
             .put("active", state is SessionState.Running)
-            .put("available", pending != null)
+            .put("attentionPending", coordinator.attentionPending())
+            .put("available", pending != null && !coordinator.attentionPending())
         if (pending != null) {
             response
                 .put("steerId", pending.steerId)
@@ -647,8 +1080,7 @@ class DevBridgeServer(
                 coordinator.state.value.conversationIdOrNullForBridge(),
             )
         }
-        context.stopService(Intent(context, AssistantForegroundService::class.java))
-        AssistantForegroundService.removeSessionNotification(context)
+        AssistantForegroundService.reconcileLifetime(context)
         write(
             writer,
             JSONObject()
@@ -732,8 +1164,8 @@ class DevBridgeServer(
         if (completed) {
             AssistantForegroundService.showCompletionNotification(context, completionMessage, coordinator.state.value.conversationIdOrNullForBridge())
         }
-        context.stopService(Intent(context, AssistantForegroundService::class.java))
-        AssistantForegroundService.removeSessionNotification(context)
+        AssistantForegroundService.removeAttentionNotification(context)
+        AssistantForegroundService.reconcileLifetime(context)
         write(
             writer,
             JSONObject()
@@ -747,7 +1179,7 @@ class DevBridgeServer(
         )
     }
 
-    private fun requestAttention(
+    private suspend fun requestAttention(
         requestId: String,
         json: JSONObject,
         writer: BufferedWriter,
@@ -756,7 +1188,8 @@ class DevBridgeServer(
             .trim()
             .ifBlank { "The phone assistant needs your attention." }
             .take(MAX_TEXT_CHARS)
-        if (!coordinator.requestAttention(reason)) {
+        val sessionId = coordinator.activeSessionId()
+        if (sessionId == null) {
             write(
                 writer,
                 errorResponse(requestId, "The phone assistant has no active session to interrupt.")
@@ -764,15 +1197,73 @@ class DevBridgeServer(
             )
             return
         }
+        val requestedDisplayRef = optionalDisplayRef(json)
+        val target = if (taskDisplayRequiredProvider() || requestedDisplayRef != null) {
+            when (val resolution = resolveDisplayTarget(displayRef = requestedDisplayRef)) {
+                is TaskDisplayResolution.Ready -> resolution.target
+                is TaskDisplayResolution.Unavailable -> {
+                    write(
+                        writer,
+                        errorResponse(requestId, resolution.message).put("code", resolution.code),
+                    )
+                    return
+                }
+            }
+        } else {
+            null
+        }
+        val attention = coordinator.requestAttentionWaiter(reason)
+        if (attention == null) {
+            write(
+                writer,
+                errorResponse(requestId, "The phone assistant is already waiting for the user's attention.")
+                    .put("code", "ATTENTION_ALREADY_PENDING"),
+            )
+            return
+        }
         AssistantForegroundService.showAttentionNotification(context, reason, coordinator.state.value.conversationIdOrNullForBridge())
-        write(
-            writer,
-            JSONObject()
-                .put("type", "attention_requested")
-                .put("requestId", requestId)
-                .put("ok", true)
-                .put("message", reason),
-        )
+        when (attention.await()) {
+            AttentionResolution.Cancelled -> write(
+                writer,
+                JSONObject()
+                    .put("type", "attention_cancelled")
+                    .put("requestId", requestId)
+                    .put("ok", false)
+                    .put("sessionId", sessionId)
+                    .put("code", "SESSION_STOPPED")
+                    .put("message", "The attention step was cancelled because the phone session stopped."),
+            )
+
+            AttentionResolution.Acknowledged -> {
+                AssistantForegroundService.removeAttentionNotification(context)
+                val response = JSONObject()
+                    .put("type", "attention_resolved")
+                    .put("requestId", requestId)
+                    .put("ok", true)
+                    .put("sessionId", sessionId)
+                    .put("acknowledged", true)
+                    .put("message", "The user confirmed that the attention step is complete. Observe the phone before taking the next action.")
+                when (val captured = captureWithRetry(
+                    expectedPackageName = null,
+                    guardRegions = emptyList(),
+                    taskSessionKey = target?.session?.sessionKey ?: sessionId,
+                    displayId = target?.session?.displayId,
+                    expectedDisplayRef = target?.displayRef,
+                )) {
+                    is ObservationCaptureResult.Failed -> response
+                        .put("observationError", captured.message)
+                        .put("observationErrorCode", captured.code)
+                    is ObservationCaptureResult.Succeeded -> {
+                        remember(captured.snapshot)
+                        response
+                            .put("observation", snapshotJson(captured.snapshot))
+                            .put("screenshotBase64", Base64.encodeToString(captured.screenshot, Base64.NO_WRAP))
+                            .put("screenshotMimeType", "image/png")
+                    }
+                }
+                write(writer, response)
+            }
+        }
     }
 
     private fun allowedApps(
@@ -782,25 +1273,28 @@ class DevBridgeServer(
     ) {
         val fullAccess = fullAccessProvider()
         val includeAll = json.optBoolean("includeAll", false)
-        if (includeAll && !fullAccess) {
-            write(
-                writer,
-                errorResponse(requestId, "Full Access is required to enumerate all launchable apps.")
-                    .put("code", "FULL_ACCESS_REQUIRED")
-                    .put("fullAccess", false)
-                    .put("accessMode", "allowlist")
-                    .put("canListAllApps", false),
-            )
-            return
-        }
+        val allowedPackages = if (fullAccess) emptySet() else allowedPackagesProvider()
+        coordinator.recordPurpose(
+            purpose = when {
+                includeAll && fullAccess -> "Listing all launchable apps"
+                includeAll -> "Listing all allowed launchable apps"
+                else -> "Listing allowed apps"
+            },
+            toolName = DHD_LIST_ALLOWED_APPS_TOOL,
+        )
         write(
             writer,
             buildAllowedAppsResponse(
                 requestId = requestId,
                 fullAccess = fullAccess,
                 includeAll = includeAll,
-                allowedPackages = if (fullAccess) emptySet() else allowedPackagesProvider(),
-                apps = if (includeAll) installedAppsRepository.listLaunchableApps() else emptyList(),
+                allowedPackages = allowedPackages,
+                apps = if (includeAll) {
+                    installedAppsRepository.listLaunchableApps()
+                        .filter { fullAccess || it.packageName in allowedPackages }
+                } else {
+                    emptyList()
+                },
             ),
         )
     }
@@ -820,11 +1314,16 @@ class DevBridgeServer(
             return
         }
 
+        coordinator.recordPurpose(
+            purpose = "Browsing installed apps",
+            targetDescription = query,
+            toolName = DHD_BROWSE_APP_TOOL,
+        )
+
         val fullAccess = fullAccessProvider()
         val allowedPackages = if (fullAccess) emptySet() else allowedPackagesProvider()
         val candidates = installedAppsRepository.listLaunchableApps()
             .asSequence()
-            .filter { fullAccess || it.packageName in allowedPackages }
             .filter {
                 it.label.contains(query, ignoreCase = true) ||
                     it.packageName.contains(query, ignoreCase = true)
@@ -837,10 +1336,290 @@ class DevBridgeServer(
                 requestId = requestId,
                 query = query,
                 fullAccess = fullAccess,
+                allowedPackages = allowedPackages,
                 apps = returnedApps,
                 truncated = candidates.size > returnedApps.size,
             ),
         )
+    }
+
+    private fun setAppDisplayLayout(
+        requestId: String,
+        json: JSONObject,
+        writer: BufferedWriter,
+    ) {
+        val packageName = json.optString("packageName").trim()
+        if (!PACKAGE_PATTERN.matches(packageName)) {
+            write(
+                writer,
+                errorResponse(requestId, "packageName is not a valid Android package name.")
+                    .put("code", "INVALID_PACKAGE"),
+            )
+            return
+        }
+
+        val layout = json.optString("layout").trim().lowercase(Locale.ROOT)
+        val enabled = when (layout) {
+            "full_size" -> true
+            "standard" -> false
+            else -> {
+                write(
+                    writer,
+                    errorResponse(requestId, "layout must be either full_size or standard.")
+                        .put("code", "INVALID_APP_DISPLAY_LAYOUT"),
+                )
+                return
+            }
+        }
+
+        val app = installedAppsRepository.listLaunchableApps()
+            .firstOrNull { it.packageName == packageName }
+        if (app == null) {
+            write(
+                writer,
+                errorResponse(requestId, "No launchable app matches packageName=$packageName.")
+                    .put("code", "APP_NOT_FOUND"),
+            )
+            return
+        }
+
+        val fullAccess = fullAccessProvider()
+        val allowed = fullAccess || packageName in allowedPackagesProvider()
+        if (!allowed) {
+            write(
+                writer,
+                errorResponse(requestId, "The app is not allowed for the current DHD access mode.")
+                    .put("code", "APP_NOT_ALLOWED"),
+            )
+            return
+        }
+
+        coordinator.recordPurpose(
+            purpose = if (enabled) "Saving full-size app layout" else "Restoring standard app layout",
+            targetDescription = app.label,
+            toolName = DHD_SET_APP_DISPLAY_LAYOUT_TOOL,
+        )
+        val changed = taskDisplayLayoutPreferences.isFullSizeLayoutEnabled(packageName) != enabled
+        taskDisplayLayoutPreferences.setFullSizeLayoutEnabled(packageName, enabled)
+        write(
+            writer,
+            buildAppDisplayLayoutResponse(
+                requestId = requestId,
+                packageName = packageName,
+                appLabel = app.label,
+                layout = layout,
+                changed = changed,
+            ),
+        )
+    }
+
+    private suspend fun listDisplays(
+        requestId: String,
+        writer: BufferedWriter,
+    ) {
+        val backend = taskDisplayBackend
+        if (backend == null) {
+            write(
+                writer,
+                errorResponse(requestId, "The task display registry is unavailable.")
+                    .put("code", "TASK_DISPLAY_UNAVAILABLE"),
+            )
+            return
+        }
+        val displays = currentDisplayJson(backend)
+        write(
+            writer,
+            JSONObject()
+                .put("type", "displays")
+                .put("requestId", requestId)
+                .put("ok", true)
+                .put("displays", JSONArray(displays))
+                .put("count", displays.size)
+                .put("message", if (displays.isEmpty()) "No task displays are available." else "Returned active and retained task displays."),
+        )
+    }
+
+    private suspend fun closeDisplay(
+        requestId: String,
+        json: JSONObject,
+        writer: BufferedWriter,
+    ) {
+        val backend = taskDisplayBackend
+        if (backend == null) {
+            write(
+                writer,
+                errorResponse(requestId, "The task display registry is unavailable.")
+                    .put("code", "TASK_DISPLAY_UNAVAILABLE"),
+            )
+            return
+        }
+        val displayRef = try {
+            optionalDisplayRef(json)
+        } catch (error: IllegalArgumentException) {
+            write(writer, errorResponse(requestId, error.message ?: "displayRef is invalid.").put("code", "INVALID_DISPLAY_REF"))
+            return
+        }
+        if (displayRef == null) {
+            write(
+                writer,
+                errorResponse(requestId, "displayRef is required to close a display safely. Call dhd_list_displays first and use the matching displayRef.")
+                    .put("code", "DISPLAY_REFERENCE_REQUIRED"),
+            )
+            return
+        }
+        backend.activeDisplaySessions()
+        val record = backend.displayRecords.value.firstOrNull { it.displayRef == displayRef }
+        if (record == null) {
+            write(
+                writer,
+                errorResponse(requestId, "No task display matches the supplied displayRef. Call dhd_list_displays to see the available displays.")
+                    .put("code", "DISPLAY_NOT_FOUND"),
+            )
+            return
+        }
+        val activeRunKey = coordinator.activeSessionId()
+        if (activeRunKey != null && backend.isDisplayClaimedByRun(record.displayId, activeRunKey)) {
+            write(
+                writer,
+                errorResponse(requestId, "The selected task display is being used by an active DHD run. Stop the active run first, then close the display.")
+                    .put("code", "DISPLAY_IN_USE"),
+            )
+            return
+        }
+        when (val result = backend.closeTaskDisplay(record.displayId, displayRef)) {
+            is TaskDisplayCloseResult.Rejected -> write(
+                writer,
+                errorResponse(requestId, result.message).put("code", result.code),
+            )
+
+            is TaskDisplayCloseResult.Closed -> write(
+                writer,
+                JSONObject()
+                    .put("type", "display_closed")
+                    .put("requestId", requestId)
+                    .put("ok", true)
+                    .put("displayRef", result.record.displayRef)
+                    .put("appLabel", appLabel(result.record.packageName))
+                    .put("status", result.record.status.name.lowercase())
+                    .put("message", "The selected task display was ended."),
+            )
+        }
+    }
+
+    /**
+     * Return the same actionable inventory as dhd_list_displays. Keeping this
+     * in one path means a model can use a displayRef from a recovery response
+     * without first making another list call.
+     */
+    private suspend fun currentDisplayJson(
+        backend: TaskDisplayBackend,
+    ): List<JSONObject> {
+        // Joining the registry's reconciliation job here ensures a freshly
+        // started app does not report stale persisted records before native
+        // sessions have been adopted or marked unavailable.
+        backend.activeDisplaySessions()
+        val now = System.currentTimeMillis()
+        return backend.displayRecords.value
+            .asSequence()
+            .filter { record ->
+                record.status != TaskDisplayStatus.ENDED &&
+                    record.status != TaskDisplayStatus.EXPIRED &&
+                    (record.expiresAtEpochMs == null || record.expiresAtEpochMs > now)
+            }
+            .map { record -> displayJson(record, now) }
+            .toList()
+    }
+
+    private suspend fun displayInventoryForRecovery(
+        backend: TaskDisplayBackend,
+    ): List<JSONObject> = try {
+        currentDisplayJson(backend)
+    } catch (error: CancellationException) {
+        throw error
+    } catch (_: Throwable) {
+        // The limit response is still useful when reconciliation is briefly
+        // unavailable; return an empty, well-formed inventory instead of
+        // replacing the actionable allocator error with a registry error.
+        emptyList()
+    }
+
+    private fun displayJson(
+        record: com.phonecontrol.assistant.execution.TaskDisplayRecord,
+        now: Long = System.currentTimeMillis(),
+    ): JSONObject = JSONObject()
+        .put("displayRef", record.displayRef)
+        .put("appLabel", appLabel(record.packageName))
+        .put("packageName", record.packageName)
+        .put("status", record.status.name.lowercase())
+        .put("width", record.width)
+        .put("height", record.height)
+        .put("densityDpi", record.densityDpi)
+        .put("createdAtEpochMs", record.createdAtEpochMs)
+        .put("terminalAtEpochMs", record.terminalAtEpochMs ?: JSONObject.NULL)
+        .put("expiresAtEpochMs", record.expiresAtEpochMs ?: JSONObject.NULL)
+        .put(
+            "remainingRetentionMs",
+            record.expiresAtEpochMs?.let { expiresAt -> (expiresAt - now).coerceAtLeast(0L) }
+                ?: JSONObject.NULL,
+        )
+        .put("lastPurpose", record.lastPurpose)
+        .put("error", record.error ?: JSONObject.NULL)
+
+    private fun appLabel(packageName: String): String = runCatching {
+        context.packageManager.getApplicationLabel(
+            context.packageManager.getApplicationInfo(packageName, 0),
+        ).toString()
+    }.getOrDefault(packageName)
+
+    private fun optionalDisplayRef(json: JSONObject): String? {
+        val ref = json.optString("displayRef").trim().takeIf(String::isNotEmpty) ?: return null
+        require(DISPLAY_REF_PATTERN.matches(ref)) {
+            "displayRef must match dsp_ followed by 14 lowercase hexadecimal characters."
+        }
+        return ref
+    }
+
+    private suspend fun resolveDisplayTarget(
+        displayRef: String?,
+        fallbackDisplayId: Int? = null,
+        fallbackDisplayRef: String? = null,
+        claimForRun: Boolean = true,
+    ): TaskDisplayResolution {
+        val backend = taskDisplayBackend
+            ?: return TaskDisplayResolution.Unavailable(
+                code = "TASK_DISPLAY_UNAVAILABLE",
+                message = "The task display registry is unavailable; call dhd_open_app to create a task display.",
+            )
+        val runSessionKey = coordinator.activeSessionId()
+        if (claimForRun && taskDisplayRequiredProvider() && runSessionKey == null) {
+            return TaskDisplayResolution.Unavailable(
+                code = "TASK_DISPLAY_UNAVAILABLE",
+                message = "No active task display run is available. Call dhd_open_app from an active DHD task first.",
+            )
+        }
+        val selectedDisplayRef = displayRef ?: fallbackDisplayRef
+        return if (selectedDisplayRef != null) {
+            backend.activeDisplaySessions()
+            val record = backend.displayRecords.value.firstOrNull { it.displayRef == selectedDisplayRef }
+                ?: return TaskDisplayResolution.Unavailable(
+                    code = "DISPLAY_NOT_FOUND",
+                    message = "No task display matches the supplied displayRef. Call dhd_list_displays to see the available displays.",
+                )
+            backend.resolveDisplay(
+                displayId = record.displayId,
+                claimForSessionKey = if (claimForRun) runSessionKey else null,
+                expectedDisplayRef = selectedDisplayRef,
+            )
+        } else if (fallbackDisplayId != null) {
+            backend.resolveDisplay(
+                displayId = fallbackDisplayId,
+                claimForSessionKey = if (claimForRun) runSessionKey else null,
+            )
+        } else {
+            backend.resolveDefaultDisplay(
+                claimForSessionKey = if (claimForRun) runSessionKey else null,
+            )
+        }
     }
 
     private suspend fun observe(
@@ -848,22 +1627,46 @@ class DevBridgeServer(
         json: JSONObject,
         writer: BufferedWriter,
     ) {
-        val expectedPackage = json.optString("expectedPackageName").trim().ifBlank { null }
-        if (expectedPackage != null) {
-            require(PACKAGE_PATTERN.matches(expectedPackage)) {
-                "expectedPackageName is not a valid Android package name."
-            }
-        }
-        val purpose = json.optString("purpose").trim().take(MAX_TEXT_CHARS).ifBlank { null }
-        if (purpose != null) {
-            coordinator.recordPurpose(
-                purpose = purpose,
-                targetDescription = json.optString("targetDescription").trim().take(MAX_TEXT_CHARS).ifBlank { expectedPackage },
+        val purpose = json.optString("purpose").trim().take(MAX_TEXT_CHARS)
+            .ifBlank { "Observing current screen" }
+        coordinator.recordPurpose(
+            purpose = purpose,
+            targetDescription = json.optString("targetDescription").trim().take(MAX_TEXT_CHARS).ifBlank { null },
+            toolName = DHD_OBSERVE_TOOL,
+        )
+        if (!coordinator.awaitPhoneAccessForTool()) {
+            write(
+                writer,
+                errorResponse(requestId, "Phone access is no longer available; DHD could not observe the phone.")
+                    .put("code", "DEVELOPER_MODE_UNAVAILABLE"),
             )
+            return
         }
-        val guardRegions = parseGuardRegions(json.optJSONArray("guardRegions"))
-        when (val captured = captureWithRetry(expectedPackage, guardRegions)) {
-            is ObservationCaptureResult.Failed -> write(writer, errorResponse(requestId, captured.message))
+        val requestedDisplayRef = optionalDisplayRef(json)
+        val target = if (taskDisplayRequiredProvider() || requestedDisplayRef != null) {
+            when (val resolution = resolveDisplayTarget(
+                displayRef = requestedDisplayRef,
+            )) {
+                is TaskDisplayResolution.Ready -> resolution.target
+                is TaskDisplayResolution.Unavailable -> {
+                    write(writer, errorResponse(requestId, resolution.message).put("code", resolution.code))
+                    return
+                }
+            }
+        } else {
+            null
+        }
+        when (val captured = captureWithRetry(
+            expectedPackageName = null,
+            guardRegions = emptyList(),
+            taskSessionKey = target?.session?.sessionKey ?: coordinator.activeSessionId(),
+            displayId = target?.session?.displayId,
+            expectedDisplayRef = target?.displayRef,
+        )) {
+            is ObservationCaptureResult.Failed -> write(
+                writer,
+                errorResponse(requestId, captured.message).put("code", captured.code),
+            )
             is ObservationCaptureResult.Succeeded -> {
                 remember(captured.snapshot)
                 writeObservation(writer, requestId, captured.snapshot, captured.screenshot)
@@ -873,9 +1676,40 @@ class DevBridgeServer(
 
     private suspend fun foregroundApp(
         requestId: String,
+        json: JSONObject,
         writer: BufferedWriter,
     ) {
-        when (val result = observationProvider.getForegroundApp()) {
+        coordinator.recordPurpose(
+            purpose = "Checking foreground app",
+            toolName = DHD_FOREGROUND_APP_TOOL,
+        )
+        if (!coordinator.awaitPhoneAccessForTool()) {
+            write(
+                writer,
+                errorResponse(requestId, "Phone access is no longer available; DHD could not check the phone.")
+                    .put("code", "DEVELOPER_MODE_UNAVAILABLE"),
+            )
+            return
+        }
+        val requestedDisplayRef = optionalDisplayRef(json)
+        val target = if (taskDisplayRequiredProvider() || requestedDisplayRef != null) {
+            when (val resolution = resolveDisplayTarget(
+                displayRef = requestedDisplayRef,
+            )) {
+                is TaskDisplayResolution.Ready -> resolution.target
+                is TaskDisplayResolution.Unavailable -> {
+                    write(writer, errorResponse(requestId, resolution.message).put("code", resolution.code))
+                    return
+                }
+            }
+        } else {
+            null
+        }
+        when (val result = observationProvider.getForegroundApp(
+            taskSessionKey = target?.session?.sessionKey ?: coordinator.activeSessionId(),
+            displayId = target?.session?.displayId,
+            expectedDisplayRef = target?.displayRef,
+        )) {
             is ForegroundAppResult.Failed -> write(
                 writer,
                 errorResponse(requestId, result.message).put("code", result.code),
@@ -889,11 +1723,19 @@ class DevBridgeServer(
                     .put("ok", true)
                     .put("packageName", result.app.packageName)
                     .put("activityName", result.app.activityName)
-                    .put("displayId", result.app.displayId)
                     .put("rotation", result.app.rotation)
                     .put("width", result.app.width)
                     .put("height", result.app.height)
-                    .put("message", "The current foreground app is ${result.app.packageName}."),
+                    .put(
+                        "screenProtection",
+                        JSONObject()
+                            .put("status", result.app.screenProtection.status.name.lowercase())
+                            .put("requiresUserAttention", result.app.screenProtection.requiresUserAttention)
+                            .put("signals", JSONArray(result.app.screenProtection.signals))
+                            .put("reason", result.app.screenProtection.reason ?: JSONObject.NULL),
+                    )
+                    .put("message", "The current foreground app is ${result.app.packageName}.")
+                    .also { response -> target?.displayRef?.let { response.put("displayRef", it) } },
             )
         }
     }
@@ -905,19 +1747,136 @@ class DevBridgeServer(
     ) {
         val actionJson = json.optJSONObject("action")
             ?: throw IllegalArgumentException("action must be an object.")
-        val action = parsePhoneAction(actionJson)
-        val observationId = action.metadata.observationId.trim()
-        val observation = synchronized(observations) {
+        val parsedAction = parsePhoneAction(actionJson)
+        val observationId = parsedAction.metadata.observationId.trim()
+        val suppliedObservation = synchronized(observations) {
             observationId.takeIf(String::isNotBlank)?.let { observations[it] }
         }
-        if (observation == null) {
+        val runSessionKey = coordinator.activeSessionId()
+        if (taskDisplayRequiredProvider() && runSessionKey == null) {
             write(
                 writer,
                 JSONObject()
                     .put("type", "completed")
                     .put("requestId", requestId)
                     .put("ok", false)
-                    .put("action", wireActionName(action))
+                    .put("action", wireActionName(parsedAction))
+                    .put("outcome", "failed")
+                    .put("executed", false)
+                    .put("code", "TASK_DISPLAY_UNAVAILABLE")
+                    .put("message", "No active task display is available; the physical display was not touched."),
+            )
+            return
+        }
+        val requestedDisplayRef = optionalDisplayRef(json)
+        val targetResolution = if (requestedDisplayRef != null ||
+            suppliedObservation != null ||
+            parsedAction !is OpenAppAction
+        ) {
+            resolveDisplayTarget(
+                displayRef = requestedDisplayRef,
+                fallbackDisplayId = suppliedObservation?.displayId,
+                fallbackDisplayRef = suppliedObservation?.taskSessionKey?.let { taskSessionKey ->
+                    taskDisplayReference(taskSessionKey, suppliedObservation.displayId)
+                },
+            )
+        } else {
+            null
+        }
+        val target = when (targetResolution) {
+            null -> null
+            is TaskDisplayResolution.Ready -> targetResolution.target
+            is TaskDisplayResolution.Unavailable -> {
+                // If there is no retained display, open_app is allowed to
+                // create a fresh one under the current run. Any other
+                // resolution failure is actionable and must reach the model.
+                if (parsedAction is OpenAppAction &&
+                    requestedDisplayRef == null &&
+                    targetResolution.code == "TASK_DISPLAY_UNAVAILABLE"
+                ) {
+                    null
+                } else {
+                    write(
+                        writer,
+                        JSONObject()
+                            .put("type", "completed")
+                            .put("requestId", requestId)
+                            .put("ok", false)
+                            .put("action", wireActionName(parsedAction))
+                            .put("outcome", "failed")
+                            .put("executed", false)
+                            .put("code", targetResolution.code)
+                            .put("message", targetResolution.message),
+                    )
+                    return
+                }
+            }
+        }
+        if (target != null && suppliedObservation != null &&
+            (suppliedObservation.displayId != target.session.displayId ||
+                suppliedObservation.taskSessionKey != target.session.sessionKey)
+        ) {
+            write(
+                writer,
+                JSONObject()
+                    .put("type", "completed")
+                    .put("requestId", requestId)
+                    .put("ok", false)
+                    .put("action", wireActionName(parsedAction))
+                    .put("outcome", "failed")
+                    .put("executed", false)
+                    .put("code", "DISPLAY_CHANGED")
+                    .put("message", "The supplied observation belongs to a different task display; call dhd_observe with the selected display before retrying."),
+            )
+            return
+        }
+        val taskSessionKey = target?.session?.sessionKey ?: runSessionKey
+        val observation = if (suppliedObservation != null) {
+            suppliedObservation
+        } else if (parsedAction is OpenAppAction && observationId.isBlank()) {
+            // Launch is setup rather than an input against a model-selected
+            // screen. A task display does not have a meaningful pre-launch
+            // physical baseline: the task backend creates the virtual display
+            // and launches the allowlisted package atomically. Legacy calls
+            // without a task session retain the physical baseline behavior.
+            if (taskSessionKey != null) {
+                null
+            } else when (val captured = captureWithRetry(null, emptyList(), null)) {
+                is ObservationCaptureResult.Failed -> {
+                    write(
+                        writer,
+                        JSONObject()
+                            .put("type", "completed")
+                            .put("requestId", requestId)
+                            .put("ok", false)
+                            .put("action", "open_app")
+                            .put("outcome", "failed")
+                            .put("executed", false)
+                            .put("code", "OBSERVATION_FAILED")
+                            .put(
+                                "message",
+                                "Could not establish a launch baseline; the app was not opened: ${captured.message}",
+                            ),
+                    )
+                    return
+                }
+
+                is ObservationCaptureResult.Succeeded -> {
+                    remember(captured.snapshot)
+                    captured.snapshot
+                }
+            }
+        } else {
+            null
+        }
+        if (observation == null && parsedAction !is OpenAppAction) {
+            write(
+                writer,
+                JSONObject()
+                    .put("type", "completed")
+                    .put("requestId", requestId)
+                    .put("ok", false)
+                    .put("action", wireActionName(parsedAction))
                     .put("outcome", "failed")
                     .put("executed", false)
                     .put("code", "OBSERVATION_MISSING")
@@ -925,16 +1884,58 @@ class DevBridgeServer(
             )
             return
         }
-        val result = coordinator.executeAction(action, observation)
+        val action = if (
+            parsedAction is OpenAppAction &&
+            observationId.isBlank() &&
+            observation != null
+        ) {
+            parsedAction.copy(
+                metadata = parsedAction.metadata.copy(observationId = observation.id),
+            )
+        } else {
+            parsedAction
+        }
+        // Preserve the bridge tool identity on the activity event so the live
+        // tool call and its lifecycle row can be rendered as one entry.
+        val activityToolName = json.optString("tool")
+            .trim()
+            .takeIf(String::isNotBlank)
+            ?: fallbackActionToolName(json)
+        val result = coordinator.executeAction(
+            action = action,
+            observation = observation,
+            toolName = activityToolName,
+            targetDisplay = target?.session,
+        )
         writeActionResult(writer, requestId, wireActionName(action), result)
         if (!result.isSuccessful()) {
+            val failureCode = result.failureCode()
             val response = JSONObject()
                 .put("type", "completed")
                 .put("requestId", requestId)
                 .put("ok", false)
                 .put("action", wireActionName(action))
                 .put("message", result.failureMessage())
-            result.failureCode()?.let { response.put("code", it) }
+            failureCode?.let { response.put("code", it) }
+            addBeforeDebug(
+                response,
+                observation,
+                result.beforeScreenshotOrNull(),
+            )
+            result.staleDetailsOrNull()?.let { details -> addStaleDiagnostics(response, details) }
+            if (failureCode == "DISPLAY_LIMIT_REACHED") {
+                val backend = taskDisplayBackend
+                val displays = if (backend == null) {
+                    emptyList()
+                } else {
+                    displayInventoryForRecovery(backend)
+                }
+                addDisplayLimitRecovery(
+                    response = response,
+                    packageName = (action as? OpenAppAction)?.packageName,
+                    displays = displays,
+                )
+            }
             write(writer, response)
             return
         }
@@ -943,7 +1944,20 @@ class DevBridgeServer(
         // A successful action may intentionally navigate to another activity,
         // system surface, or package. Capture what is actually on screen and
         // let the model decide what the new observation means.
-        when (val captured = captureWithRetry(null, emptyList())) {
+        // An app-layout change can retire the target display while the open
+        // action is executing. Resolve the post-action session again so the
+        // response observes the replacement generation instead of the stale
+        // pre-open session.
+        val postSession = taskSessionKey?.let { key ->
+            taskDisplayBackend?.current(key)
+        } ?: target?.session
+        when (val captured = captureWithRetry(
+            expectedPackageName = null,
+            guardRegions = emptyList(),
+            taskSessionKey = postSession?.sessionKey ?: taskSessionKey,
+            displayId = postSession?.displayId,
+            expectedDisplayRef = postSession?.let { taskDisplayReference(it.sessionKey, it.displayId) },
+        )) {
             is ObservationCaptureResult.Failed -> {
                 write(
                     writer,
@@ -954,25 +1968,41 @@ class DevBridgeServer(
                         .put("action", wireActionName(action))
                         .put("outcome", "unknown")
                         .put("executed", "unknown")
-                        .put("code", "POST_OBSERVATION_FAILED")
+                        .put("code", if (captured.code == "OBSERVATION_FAILED") "POST_OBSERVATION_FAILED" else captured.code)
                         .put("message", "The action may have run, but the phone could not produce a post-action observation: ${captured.message}"),
                 )
             }
 
             is ObservationCaptureResult.Succeeded -> {
+                val initialPointer = if (action is OpenAppAction) {
+                    coordinator.publishCalibrationPointerEvent(captured.snapshot)
+                } else {
+                    null
+                }
                 remember(captured.snapshot)
-                write(
-                    writer,
-                    JSONObject()
-                        .put("type", "completed")
-                        .put("requestId", requestId)
-                        .put("ok", true)
-                        .put("action", wireActionName(action))
-                        .put("message", result.successMessage())
-                        .put("observation", snapshotJson(captured.snapshot))
-                        .put("screenshotBase64", Base64.encodeToString(captured.screenshot, Base64.NO_WRAP))
-                        .put("screenshotMimeType", "image/png"),
+                val response = JSONObject()
+                    .put("type", "completed")
+                    .put("requestId", requestId)
+                    .put("ok", true)
+                    .put("action", wireActionName(action))
+                    .put("message", result.successMessage())
+                    .put("observation", snapshotJson(captured.snapshot))
+                    .put("screenshotBase64", Base64.encodeToString(captured.screenshot, Base64.NO_WRAP))
+                    .put("screenshotMimeType", "image/png")
+                initialPointer?.let { pointer ->
+                    response.put(
+                        "initialPointer",
+                        JSONObject()
+                            .put("x", pointer.x)
+                            .put("y", pointer.y),
+                    )
+                }
+                addBeforeDebug(
+                    response,
+                    observation,
+                    result.beforeScreenshotOrNull(),
                 )
+                write(writer, response)
             }
         }
     }
@@ -1013,14 +2043,134 @@ class DevBridgeServer(
             )
             return
         }
+        val runSessionKey = coordinator.activeSessionId()
+        if (taskDisplayRequiredProvider() && runSessionKey == null) {
+            val firstAction = request.actions.first()
+            val failure = SequenceStepResult(
+                index = 0,
+                action = wireActionName(firstAction),
+                status = SequenceStepResult.Status.FAILED,
+                message = "No active task display is available; the physical display was not touched.",
+                code = "TASK_DISPLAY_UNAVAILABLE",
+                outcome = "failed",
+                executed = false,
+            )
+            writeSequenceResult(
+                writer,
+                requestId,
+                SequenceExecutionResult(
+                    requestedSteps = request.actions.size,
+                    steps = listOf(failure),
+                    failure = failure,
+                ),
+            )
+            return
+        }
+        if (!coordinator.awaitPhoneAccessForTool()) {
+            val firstAction = request.actions.first()
+            val failure = SequenceStepResult(
+                index = 0,
+                action = wireActionName(firstAction),
+                status = SequenceStepResult.Status.FAILED,
+                message = "Phone access is no longer available; the sequence was not executed.",
+                code = "DEVELOPER_MODE_UNAVAILABLE",
+                outcome = "failed",
+                executed = false,
+            )
+            writeSequenceResult(
+                writer,
+                requestId,
+                SequenceExecutionResult(
+                    requestedSteps = request.actions.size,
+                    steps = listOf(failure),
+                    failure = failure,
+                ),
+            )
+            return
+        }
+        val target = if (taskDisplayRequiredProvider() || request.displayRef != null || observation.taskSessionKey != null) {
+            when (val resolution = resolveDisplayTarget(
+                displayRef = request.displayRef,
+                fallbackDisplayId = observation.displayId,
+                fallbackDisplayRef = observation.taskSessionKey?.let { taskSessionKey ->
+                    taskDisplayReference(taskSessionKey, observation.displayId)
+                },
+            )) {
+                is TaskDisplayResolution.Ready -> resolution.target
+                is TaskDisplayResolution.Unavailable -> {
+                    val firstAction = request.actions.first()
+                    val failure = SequenceStepResult(
+                        index = 0,
+                        action = wireActionName(firstAction),
+                        status = SequenceStepResult.Status.FAILED,
+                        message = resolution.message,
+                        code = resolution.code,
+                        outcome = "failed",
+                        executed = false,
+                    )
+                    writeSequenceResult(
+                        writer,
+                        requestId,
+                        SequenceExecutionResult(
+                            requestedSteps = request.actions.size,
+                            steps = listOf(failure),
+                            failure = failure,
+                        ),
+                    )
+                    return
+                }
+            }
+        } else {
+            null
+        }
+        if (target != null &&
+            (observation.taskSessionKey != target.session.sessionKey ||
+                observation.displayId != target.session.displayId)
+        ) {
+            val firstAction = request.actions.first()
+            val failure = SequenceStepResult(
+                index = 0,
+                action = wireActionName(firstAction),
+                status = SequenceStepResult.Status.FAILED,
+                message = "The observation belongs to a different task display; no input was sent.",
+                code = "DISPLAY_CHANGED",
+                outcome = "failed",
+                executed = false,
+            )
+            writeSequenceResult(
+                writer,
+                requestId,
+                SequenceExecutionResult(
+                    requestedSteps = request.actions.size,
+                    steps = listOf(failure),
+                    failure = failure,
+                ),
+            )
+            return
+        }
 
         val result = SequenceExecutor(
-            executeAction = { action, baseline -> coordinator.executeAction(action, baseline) },
-            captureAfterAction = { guardRegions -> captureWithRetry(null, guardRegions) },
+            executeAction = { action, baseline ->
+                coordinator.executeAction(
+                    action = action,
+                    observation = baseline,
+                    toolName = DHD_EXECUTE_SEQUENCE_TOOL,
+                    targetDisplay = target?.session,
+                )
+            },
+            captureAfterAction = { guardRegions ->
+                captureWithRetry(
+                    expectedPackageName = null,
+                    guardRegions = guardRegions,
+                    taskSessionKey = target?.session?.sessionKey ?: runSessionKey,
+                    displayId = target?.session?.displayId,
+                    expectedDisplayRef = target?.displayRef,
+                )
+            },
             rememberObservation = ::remember,
             settleAfterAction = ::settleAfterAction,
         ).execute(observation, request.actions)
-        writeSequenceResult(writer, requestId, result)
+        writeSequenceResult(writer, requestId, result, observation)
     }
 
     private suspend fun settleAfterAction(action: PhoneAction) {
@@ -1041,7 +2191,8 @@ class DevBridgeServer(
             .ifBlank { "Stopped by the desktop assistant." }
             .take(MAX_TEXT_CHARS)
         val stopped = coordinator.stop(reason)
-        context.stopService(Intent(context, AssistantForegroundService::class.java))
+        AssistantForegroundService.removeAttentionNotification(context)
+        AssistantForegroundService.reconcileLifetime(context)
         write(
             writer,
             JSONObject()
@@ -1100,7 +2251,11 @@ class DevBridgeServer(
                 add(action)
             }
         }
-        return SequenceRequest(observationId = observationId, actions = actions)
+        return SequenceRequest(
+            observationId = observationId,
+            actions = actions,
+            displayRef = optionalDisplayRef(json),
+        )
     }
 
     private fun writeInvalidSequenceResult(
@@ -1171,12 +2326,6 @@ class DevBridgeServer(
                 metadata = metadata,
             )
 
-            "scroll" -> ScrollAction(
-                direction = enumValue<ScrollDirection>(json.getString("direction")),
-                amount = enumValue<ScrollAmount>(json.getString("amount")),
-                metadata = metadata,
-            )
-
             "back" -> BackAction(metadata)
 
             "keypress" -> KeypressAction(
@@ -1187,7 +2336,7 @@ class DevBridgeServer(
             "wait" -> WaitAction(json.getLong("durationMs"), metadata)
 
             else -> throw IllegalArgumentException(
-                "Unsupported action type. Use open_app, tap, type, swipe, scroll, back, keypress, or wait.",
+                "Unsupported action type. Use open_app, tap, type, swipe, back, keypress, or wait.",
             )
         }
     }
@@ -1225,7 +2374,6 @@ class DevBridgeServer(
         is TapAction -> "tap"
         is TypeAction -> "type"
         is SwipeAction -> "swipe"
-        is ScrollAction -> "scroll"
         is BackAction -> "back"
         is KeypressAction -> "keypress"
         is WaitAction -> "wait"
@@ -1235,6 +2383,59 @@ class DevBridgeServer(
         synchronized(observations) {
             observations[snapshot.id] = snapshot
         }
+    }
+
+    private fun addBeforeDebug(
+        response: JSONObject,
+        observation: ObservationSnapshot?,
+        screenshot: ByteArray?,
+    ) {
+        if (observation == null || screenshot == null) return
+        response
+            .put("beforeObservation", snapshotJson(observation))
+            .put("beforeScreenshotBase64", Base64.encodeToString(screenshot, Base64.NO_WRAP))
+            .put("beforeScreenshotMimeType", "image/png")
+    }
+
+    /** Attach machine-readable freshness diagnostics without changing the
+     * action's safe rejection semantics. */
+    private fun addStaleDiagnostics(
+        response: JSONObject,
+        details: StaleObservationDiagnostics,
+    ) {
+        response
+            .put("inputSent", false)
+            .put("approvedObservationId", details.approvedObservationId)
+        details.currentObservationId?.let { response.put("currentObservationId", it) }
+        response.put(
+            "reasons",
+            JSONArray(details.reasons.map(::staleReasonJson)),
+        )
+    }
+
+    private fun staleReasonJson(reason: StaleObservationReason): JSONObject = JSONObject()
+        .put("code", reason.code.name)
+        .put("approved", staleReasonValue(reason.approved))
+        .put("current", staleReasonValue(reason.current))
+        .also { json ->
+            reason.guardRegion?.let { region ->
+                json.put(
+                    "guardRegion",
+                    JSONObject()
+                        .put("left", region.left)
+                        .put("top", region.top)
+                        .put("right", region.right)
+                        .put("bottom", region.bottom),
+                )
+            }
+        }
+
+    private fun staleReasonValue(value: Any?): Any = when (value) {
+        null -> JSONObject.NULL
+        is ObservationSize -> JSONObject()
+            .put("width", value.width)
+            .put("height", value.height)
+        else -> value
     }
 
     private fun writeObservation(
@@ -1259,6 +2460,7 @@ class DevBridgeServer(
         writer: BufferedWriter,
         requestId: String,
         result: SequenceExecutionResult,
+        beforeObservation: ObservationSnapshot? = null,
     ) {
         val response = JSONObject()
             .put("type", "completed")
@@ -1286,6 +2488,7 @@ class DevBridgeServer(
             step.code?.let { stepJson.put("code", it) }
             step.outcome?.let { stepJson.put("outcome", it) }
             step.executed?.let { stepJson.put("executed", it) }
+            step.details?.let { addStaleDiagnostics(stepJson, it) }
             steps.put(stepJson)
         }
         response.put("steps", steps)
@@ -1295,12 +2498,16 @@ class DevBridgeServer(
                 .put("code", failure.code ?: "SEQUENCE_FAILED")
                 .put("outcome", failure.outcome ?: "failed")
                 .put("executed", failure.executed ?: "unknown")
+            failure.details?.let { addStaleDiagnostics(response, it) }
         }
         result.finalObservation?.let { captured ->
             response
                 .put("observation", snapshotJson(captured.snapshot))
                 .put("screenshotBase64", Base64.encodeToString(captured.screenshot, Base64.NO_WRAP))
                 .put("screenshotMimeType", "image/png")
+            if (beforeObservation != null) {
+                addBeforeDebug(response, beforeObservation, result.beforeScreenshot)
+            }
         }
         write(writer, response)
     }
@@ -1309,11 +2516,23 @@ class DevBridgeServer(
         .put("id", snapshot.id)
         .put("packageName", snapshot.packageName)
         .put("activityName", snapshot.activityName ?: JSONObject.NULL)
-        .put("displayId", snapshot.displayId)
         .put("rotation", snapshot.rotation)
         .put("width", snapshot.width)
         .put("height", snapshot.height)
         .put("screenshotFingerprint", snapshot.screenshotFingerprint)
+        .put(
+            "screenProtection",
+            JSONObject()
+                .put("status", snapshot.screenProtection.status.name.lowercase())
+                .put("requiresUserAttention", snapshot.screenProtection.requiresUserAttention)
+                .put("signals", JSONArray(snapshot.screenProtection.signals))
+                .put("reason", snapshot.screenProtection.reason ?: JSONObject.NULL),
+        )
+        .also { json ->
+            snapshot.taskSessionKey?.let { sessionKey ->
+                json.put("displayRef", taskDisplayReference(sessionKey, snapshot.displayId))
+            }
+        }
 
     private fun stateName(state: SessionState): String = when (state) {
         SessionState.Idle -> "idle"
@@ -1330,24 +2549,15 @@ class DevBridgeServer(
             return
         }
 
-        val beforeOpen = observationProvider.capture()
-        val preOpenSnapshot = when (beforeOpen) {
-            is ObservationCaptureResult.Failed -> {
-                failSession(writer, request, beforeOpen.message)
-                return
-            }
-
-            is ObservationCaptureResult.Succeeded -> beforeOpen.snapshot
-        }
         val open = OpenAppAction(
             packageName = request.packageName,
             metadata = ActionMetadata(
                 purpose = "Opening ${request.packageName}",
-                observationId = preOpenSnapshot.id,
+                observationId = "",
                 targetDescription = request.packageName,
             ),
         )
-        val openResult = coordinator.executeAction(open, preOpenSnapshot)
+        val openResult = coordinator.executeAction(open, null)
         writeActionResult(writer, request.requestId, "open_app", openResult)
         if (!openResult.isSuccessful()) {
             failSession(writer, request, openResult.failureMessage())
@@ -1355,7 +2565,11 @@ class DevBridgeServer(
         }
 
         delay(OPEN_SETTLE_DELAY_MS)
-        val afterOpen = captureWithRetry(request.packageName, request.guardRegions)
+        val afterOpen = captureWithRetry(
+            request.packageName,
+            request.guardRegions,
+            coordinator.activeSessionId(),
+        )
         val tapSnapshot = when (afterOpen) {
             is ObservationCaptureResult.Failed -> {
                 failSession(writer, request, afterOpen.message)
@@ -1382,7 +2596,7 @@ class DevBridgeServer(
         }
 
         delay(POST_ACTION_SETTLE_DELAY_MS)
-        val afterTap = captureWithRetry(null, emptyList())
+        val afterTap = captureWithRetry(null, emptyList(), coordinator.activeSessionId())
         when (afterTap) {
             is ObservationCaptureResult.Failed -> {
                 failSession(writer, request, "Tap completed, but the post-action observation failed: ${afterTap.message}")
@@ -1408,10 +2622,31 @@ class DevBridgeServer(
     private suspend fun captureWithRetry(
         expectedPackageName: String?,
         guardRegions: List<GuardRegion>,
+        taskSessionKey: String? = coordinator.activeSessionId(),
+        displayId: Int? = null,
+        expectedDisplayRef: String? = null,
     ): ObservationCaptureResult {
+        if (taskDisplayRequiredProvider() && taskSessionKey == null) {
+            return ObservationCaptureResult.Failed(
+                message = "No active task display is available; refusing to use the physical display.",
+                code = "TASK_DISPLAY_UNAVAILABLE",
+            )
+        }
+        if (!coordinator.awaitPhoneAccessForTool()) {
+            return ObservationCaptureResult.Failed(
+                message = "Phone access is no longer available; the observation was not captured.",
+                code = "DEVELOPER_MODE_UNAVAILABLE",
+            )
+        }
         var last: ObservationCaptureResult = ObservationCaptureResult.Failed("No capture attempted.")
         repeat(CAPTURE_ATTEMPTS) {
-            last = observationProvider.capture(expectedPackageName, guardRegions)
+            last = observationProvider.capture(
+                expectedPackageName = expectedPackageName,
+                guardRegions = guardRegions,
+                taskSessionKey = taskSessionKey,
+                displayId = displayId,
+                expectedDisplayRef = expectedDisplayRef,
+            )
             if (last is ObservationCaptureResult.Succeeded) return last
             delay(CAPTURE_RETRY_DELAY_MS)
         }
@@ -1442,6 +2677,7 @@ class DevBridgeServer(
                     is TransportResult.Rejected -> response
                         .put("code", transportResult.code.name)
                         .put("message", transportResult.message)
+                        .also { transportResult.details?.let { details -> addStaleDiagnostics(it, details) } }
                     is TransportResult.Unsupported -> response.put("message", transportResult.message)
                 }
             }
@@ -1449,6 +2685,7 @@ class DevBridgeServer(
             is ActionExecutionResult.PolicyRejected -> response
                 .put("code", "POLICY_REJECTED")
                 .put("message", result.message)
+                .also { result.details?.let { details -> addStaleDiagnostics(it, details) } }
             ActionExecutionResult.SessionNotRunning -> response
                 .put("code", "SESSION_NOT_RUNNING")
                 .put("message", "The phone session is no longer running.")
@@ -1508,10 +2745,10 @@ class DevBridgeServer(
         .put("message", message)
 
     private fun observationFailureCode(message: String): String =
-        if (message.contains("Shizuku", ignoreCase = true) &&
-            message.contains("unavailable", ignoreCase = true)
+        if (message.contains("Wireless Debugging", ignoreCase = true) ||
+            message.contains("DHD could not execute", ignoreCase = true)
         ) {
-            "SHIZUKU_UNAVAILABLE"
+            "DEVELOPER_MODE_UNAVAILABLE"
         } else {
             "OBSERVATION_FAILED"
         }
@@ -1562,6 +2799,7 @@ class DevBridgeServer(
     private data class SequenceRequest(
         val observationId: String,
         val actions: List<PhoneAction>,
+        val displayRef: String? = null,
     )
 
     private class InvalidSequencePayloadException(
@@ -1575,13 +2813,19 @@ class DevBridgeServer(
         const val DEFAULT_PORT = 8765
         const val PAIRING_DISCOVERY_PORT = 8766
         const val PAIRING_PROTOCOL_VERSION = 1
+        const val PAIRING_APPROVAL_TIMEOUT_MS = 60_000L
+        const val DISCOVERY_NONCE_TTL_MS = 90_000L
+        const val MAX_DISCOVERY_NONCES = 32
+        const val COMPLETED_PAIRING_RESPONSE_TTL_MS = 10_000L
+        const val MAX_COMPLETED_PAIRING_RESPONSES = 16
+        const val MAX_DESKTOP_NAME_CHARS = 80
         const val PREFERENCES_NAME = "dhd_companion_link"
         const val KEY_AUTH_TOKEN = "bridge_auth_token"
         const val KEY_DEVICE_ID = "device_id"
-        const val KEY_PAIRING_CODE = "pairing_code"
-        const val PAIRING_CODE_LENGTH = 8
-        const val PAIRING_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-        const val COMPANION_PRESENCE_TIMEOUT_MS = 5_000L
+        // The companion uses short-lived TCP polls. Allow several missed
+        // polls before showing a disconnect so one Wi-Fi/scheduler hiccup
+        // does not flap the phone UI offline.
+        const val COMPANION_PRESENCE_TIMEOUT_MS = 15_000L
         const val COMPANION_PRESENCE_CHECK_INTERVAL_MS = 1_000L
         const val MAX_REQUEST_CHARS = 16_384
         const val MAX_TEXT_CHARS = 240
@@ -1596,7 +2840,7 @@ class DevBridgeServer(
         const val CAPTURE_ATTEMPTS = 5
         const val CAPTURE_RETRY_DELAY_MS = 250L
         val PACKAGE_PATTERN = Regex("[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+")
-        val secureRandom = SecureRandom()
+        val DISPLAY_REF_PATTERN = Regex("dsp_[a-f0-9]{14}")
     }
 }
 
@@ -1615,11 +2859,18 @@ internal fun buildAllowedAppsResponse(
         .put("accessMode", if (fullAccess) "full_access" else "allowlist")
         .put("canListAllApps", fullAccess)
 
-    if (fullAccess && includeAll) {
+    if (includeAll) {
         response
             .put("apps", JSONArray(apps.map(::buildAppResponse)))
             .put("count", apps.size)
-            .put("message", "Full Access is enabled. Returned all launchable apps on the phone.")
+            .put(
+                "message",
+                if (fullAccess) {
+                    "Full Access is enabled. Returned all launchable apps on the phone."
+                } else {
+                    "Restricted access is enabled. Returned all launchable apps in the allowlist."
+                },
+            )
     } else if (fullAccess) {
         response.put("message", "Full Access is enabled. You can use any launchable app on the phone.")
     } else {
@@ -1636,6 +2887,7 @@ internal fun buildBrowseAppsResponse(
     requestId: String,
     query: String,
     fullAccess: Boolean,
+    allowedPackages: Set<String> = emptySet(),
     apps: List<InstalledUserApp>,
     truncated: Boolean,
 ): JSONObject = JSONObject()
@@ -1645,16 +2897,100 @@ internal fun buildBrowseAppsResponse(
     .put("query", query)
     .put("fullAccess", fullAccess)
     .put("accessMode", if (fullAccess) "full_access" else "allowlist")
-    .put("apps", JSONArray(apps.map(::buildAppResponse)))
+    .put(
+        "apps",
+        JSONArray(
+            apps.map { app ->
+                buildAppResponse(
+                    app = app,
+                    canUse = fullAccess || app.packageName in allowedPackages,
+                )
+            },
+        ),
+    )
     .put("count", apps.size)
     .put("truncated", truncated)
 
-private fun buildAppResponse(app: InstalledUserApp): JSONObject = JSONObject()
-    .put("appLabel", app.label)
-    .put("packageName", app.packageName)
+internal fun buildAppDisplayLayoutResponse(
+    requestId: String,
+    packageName: String,
+    appLabel: String,
+    layout: String,
+    changed: Boolean,
+): JSONObject {
+    val fullSize = layout == "full_size"
+    val layoutDescription = if (fullSize) "full-size" else "standard"
+    return JSONObject()
+        .put("type", "app_display_layout_updated")
+        .put("requestId", requestId)
+        .put("ok", true)
+        .put("appLabel", appLabel)
+        .put("packageName", packageName)
+        .put("layout", layout)
+        .put("fullSizeLayoutEnabled", fullSize)
+        .put("changed", changed)
+        .put("appliesNextOpen", true)
+        .put("requiresFreshDisplay", changed)
+        .put("currentDisplayUnchanged", true)
+        .put("displayGeometryUnchanged", true)
+        .put(
+            "message",
+            if (changed) {
+                "$layoutDescription app layout saved for $appLabel. The next dhd_open_app call without displayRef will use a fresh DHD task display with this layout."
+            } else {
+                "$layoutDescription app layout is already active for $appLabel. Future compatible opens may reuse the current DHD task display."
+            },
+        )
+}
+
+/**
+ * Add an actionable display inventory to a session-limit failure. The list
+ * intentionally contains only displayRefs and user-facing metadata so the
+ * agent can close or reuse a display without receiving native display IDs or
+ * coordinator/session keys.
+ */
+internal fun addDisplayLimitRecovery(
+    response: JSONObject,
+    packageName: String?,
+    displays: List<JSONObject>,
+): JSONObject {
+    val target = packageName?.trim()?.takeIf(String::isNotEmpty) ?: "the requested app"
+    return response
+        .put(
+            "message",
+            "The DHD virtual-display session limit was reached while opening $target. " +
+                "The displays array lists the active and retained displays. " +
+                "Close an unused display with dhd_close_display using its exact displayRef " +
+                "(stop its active run first if needed), then retry dhd_open_app. " +
+                "To reuse a retained display instead, pass its displayRef to dhd_open_app.",
+        )
+        .put("displays", JSONArray(displays))
+        .put("count", displays.size)
+}
+
+private fun buildAppResponse(app: InstalledUserApp, canUse: Boolean? = null): JSONObject {
+    val response = JSONObject()
+        .put("appLabel", app.label)
+        .put("packageName", app.packageName)
+    if (canUse != null) response.put("canUse", canUse)
+    return response
+}
 
 private fun ActionExecutionResult.isSuccessful(): Boolean = this is ActionExecutionResult.TransportFinished &&
     this.result is TransportResult.Succeeded
+
+private fun ActionExecutionResult.beforeScreenshotOrNull(): ByteArray? = when (this) {
+    is ActionExecutionResult.TransportFinished ->
+        (result as? TransportResult.Succeeded)?.beforeScreenshot
+    is ActionExecutionResult.PolicyRejected,
+    ActionExecutionResult.SessionNotRunning -> null
+}
+
+private fun ActionExecutionResult.staleDetailsOrNull(): StaleObservationDiagnostics? = when (this) {
+    is ActionExecutionResult.TransportFinished -> (result as? TransportResult.Rejected)?.details
+    is ActionExecutionResult.PolicyRejected -> details
+    ActionExecutionResult.SessionNotRunning -> null
+}
 
 private fun ActionExecutionResult.failureMessage(): String = when (this) {
     is ActionExecutionResult.TransportFinished -> when (val result = result) {
@@ -1682,7 +3018,7 @@ private fun ActionExecutionResult.failureCode(): String? = when (this) {
         is TransportResult.Unsupported -> "UNSUPPORTED_ACTION"
         is TransportResult.Succeeded -> null
     }
-    is ActionExecutionResult.PolicyRejected -> "POLICY_REJECTED"
+    is ActionExecutionResult.PolicyRejected -> code
     ActionExecutionResult.SessionNotRunning -> "SESSION_NOT_RUNNING"
 }
 

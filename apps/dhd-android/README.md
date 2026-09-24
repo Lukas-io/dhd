@@ -23,19 +23,22 @@ notifications, request handoff, and observation/action execution.
 - Foreground service with a persistent notification showing the current
   purpose, Pause/Resume and Stop actions. Opening the notification returns to
   the DHD assistant timeline.
-- Typed action models for `open_app`, `tap`, `type`, `swipe`, `scroll`,
+- Typed action models for `open_app`, `tap`, `type`, `swipe`,
   `keypress`, `back` and `wait`.
-  Each action carries a purpose, target description, and observation ID.
+  Input actions carry a purpose, target description, and observation ID;
+  `open_app` establishes its launch baseline internally and returns a fresh
+  observation for the next input action.
   The DHD companion can also submit up to 16 non-`open_app` typed actions as
   one observation-safe sequence; the phone advances only through verified
   post-action observations.
 - Phone-authoritative `PolicyEngine` for app allowlisting and confirmation
   categories: send, purchase, transfer, delete and submit.
-- Official Shizuku API lifecycle and capability detection, plus a typed
+- DHD-owned Android 11+ Wireless Debugging ADB lifecycle, one-time pairing,
+  encrypted device identity storage, automatic reconnect, and a typed
   transport for `am start`, `input tap`, `input text`, `input swipe`, and
   `input keyevent`. The app builds those argv arrays itself; no raw
   provider/model shell command is accepted. Before an input action, the phone
-  captures a current shell screenshot for foreground binding and coordinate
+  captures a current ADB screenshot for foreground binding and coordinate
   bounds. Structural observation fields are compared before input.
 
 Run now creates a phone-owned request that the desktop Codex companion can
@@ -44,6 +47,12 @@ typed execution path: the companion starts a Codex App Server turn, while the
 configured MCP adapter sends allowlist, foreground-context, observation,
 single-action, and sequence requests back to this app over NDJSON. The legacy
 `demo_run` request remains available for the open -> observe -> tap smoke test.
+
+When an action is refused because its observation is stale, the bridge response
+sets `inputSent: false` and includes the approved/current observation IDs plus
+one reason for each detected delta. `GUARD_REGION_CHANGED` identifies a
+configured guard fingerprint difference; rotation, display identity/size,
+package, activity, and observation replacement have separate reason codes.
 
 DHD keeps one local assistant conversation. The stored Codex thread is reused
 when a new request arrives within three hours of the last activity. After three
@@ -81,34 +90,37 @@ Docker's layer cache.
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Install and start the [Shizuku app](https://github.com/RikkaApps/Shizuku),
-start its service using the device-supported wireless-debugging or ADB path,
-launch DHD, and open Settings. The app reports binder
-availability and permission state and can request the Shizuku API permission.
+On Android 11 and newer, DHD connects directly to the phone's Wireless
+Debugging ADB service. DHD cannot silently enable that protected setting. Do
+this once:
 
-The typed open -> observe -> tap path has been physically smoke-tested on a
-Samsung S23 with Shizuku using the Coordinate Benchmark package. A Shizuku
-service being detected is not evidence that all input types work on a
-particular One UI/device build; the benchmark smoke path should be rerun after
-transport changes.
+1. Open Android Developer options and turn on **Wireless debugging**.
+2. In DHD, open **Settings → DHD phone access → Pair DHD once**.
+3. In Android Wireless debugging, choose **Pair device with pairing code**.
+4. Enter Android's six-digit code in DHD and tap **Pair**.
+
+After pairing, DHD reconnects by itself whenever Wireless debugging is turned
+on. You do not need a second app or a separate **Start** button. If Android
+stops DHD's process, open DHD once so its controller can restart; it will then
+continue reconnecting automatically. The direct path still needs a physical
+Samsung S23/One UI smoke test before it is considered device-validated.
 
 ## Dummy desktop bridge (open -> observe -> tap)
 
 The Android app starts an authenticated NDJSON listener on TCP port `8765` and
-a short-code discovery listener on UDP port `8766` while its process is alive.
-For the wireless path, keep the phone and development machine on the same
-reachable Wi-Fi, open DHD Settings → Companion connection, and copy the short
-pairing code into the companion dashboard:
+a phone-discovery listener on UDP port `8766` while its process is alive. For
+the wireless path, keep the phone and development machine on the same
+reachable Wi-Fi, then use the companion dashboard to discover and select the
+phone:
 
 ```powershell
 pnpm companion:dashboard
 ```
 
-Open `http://127.0.0.1:8766`, enter the code, and choose **Pair phone**. The
-companion broadcasts the code locally; this phone bridge answers with its
-current address, port, and credential. The dashboard stores those details so
-you do not have to copy them individually. The code remains valid until you
-refresh it in DHD Settings.
+Open `http://127.0.0.1:8766`, choose **Refresh phones**, select the intended
+phone, and approve the one-time request in DHD Settings → Companion connection.
+The phone bridge then releases its current address, port, and credential. The
+dashboard stores those details so you do not have to copy them individually.
 
 `adb forward` remains a loopback fallback for local development:
 
@@ -126,7 +138,7 @@ pnpm companion:bridge-demo -- --package com.phonecontrol.coordinatebenchmark --x
 
 Optional flags are `--host`, `--port`, `--token`, `--purpose`, and `--target`.
 For wireless use, prefer `PHONE_ASSISTANT_BRIDGE_TOKEN` so the token is not
-stored in shell history. The phone is still the authority: it checks Shizuku state, the per-app allowlist,
+stored in shell history. The phone is still the authority: it checks DHD's Wireless Debugging connection, the per-app allowlist,
 foreground binding, and coordinate bounds
 before it sends `input tap`. Use the Coordinate Benchmark app for repeatable
 tests; it is the only package enabled in the current physical smoke setup.
@@ -147,7 +159,7 @@ Phone typed request
         -> authenticated phone link
         -> this app's SessionCoordinator and PolicyEngine
         -> screenshot context and foreground/bounds validation
-        -> Shizuku transport
+        -> DHD-owned Wireless Debugging ADB transport
 ```
 
 The desktop side uses the Codex CLI's existing authentication and subscription

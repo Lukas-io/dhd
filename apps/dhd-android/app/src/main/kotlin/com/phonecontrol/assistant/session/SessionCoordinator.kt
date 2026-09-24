@@ -2,23 +2,46 @@ package com.phonecontrol.assistant.session
 
 import com.phonecontrol.assistant.domain.ActivityEvent
 import com.phonecontrol.assistant.domain.ActivityEventKind
+import com.phonecontrol.assistant.domain.ClickPhase
 import com.phonecontrol.assistant.domain.ObservationSnapshot
 import com.phonecontrol.assistant.domain.PhoneAction
 import com.phonecontrol.assistant.domain.ReasoningEffort
+import com.phonecontrol.assistant.domain.SwipeAction
+import com.phonecontrol.assistant.domain.TapAction
+import com.phonecontrol.assistant.domain.TaskPointerEvent
+import com.phonecontrol.assistant.domain.StaleObservationDiagnostics
 import com.phonecontrol.assistant.domain.userFacingActivityLabel
 import com.phonecontrol.assistant.data.ConversationStore
 import com.phonecontrol.assistant.data.RunStatus
 import com.phonecontrol.assistant.policy.PolicyContext
 import com.phonecontrol.assistant.policy.PolicyDecision
 import com.phonecontrol.assistant.policy.PolicyEngine
-import com.phonecontrol.assistant.shizuku.PhoneActionTransport
-import com.phonecontrol.assistant.shizuku.TransportResult
+import com.phonecontrol.assistant.execution.PhoneActionTransport
+import com.phonecontrol.assistant.execution.RejectionCode
+import com.phonecontrol.assistant.execution.TaskDisplayBackend
+import com.phonecontrol.assistant.execution.TaskDisplaySession
+import com.phonecontrol.assistant.execution.TaskDisplayStatus
+import com.phonecontrol.assistant.execution.TransportResult
 import java.util.UUID
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlin.math.roundToInt
+import kotlin.random.Random
+
+private val CALIBRATION_ANCHORS = arrayOf(
+    0.18f to 0.16f,
+    0.82f to 0.16f,
+    0.18f to 0.84f,
+    0.82f to 0.84f,
+)
 
 sealed interface SessionState {
     data object Idle : SessionState
@@ -27,38 +50,61 @@ sealed interface SessionState {
         val sessionId: String,
         val request: String,
         val currentPurpose: String,
+        val currentToolMetadataPurpose: String? = null,
         val startedAtEpochMs: Long,
         val conversationId: String? = null,
         val reasoningEffort: String = ReasoningEffort.default.codexValue,
         val fastMode: Boolean = false,
+        val isContinuation: Boolean = false,
+        val attentionReason: String? = null,
+        val attentionActionLabel: String? = null,
+        /** Active time accumulated before this currently running segment. */
+        val elapsedBeforeStartMs: Long = 0L,
     ) : SessionState
 
     data class Paused(
         val sessionId: String,
         val request: String,
         val currentPurpose: String,
+        val currentToolMetadataPurpose: String? = null,
         val startedAtEpochMs: Long,
         val conversationId: String? = null,
         val reasoningEffort: String = ReasoningEffort.default.codexValue,
         val fastMode: Boolean = false,
+        val isContinuation: Boolean = false,
+        val attentionReason: String? = null,
+        val attentionActionLabel: String? = null,
+        /** Active time accumulated before the currently paused segment. */
+        val elapsedBeforeStartMs: Long = 0L,
     ) : SessionState
 
     data class Stopped(
         val sessionId: String,
         val reason: String,
         val conversationId: String? = null,
+        val reasoningEffort: String = ReasoningEffort.default.codexValue,
+        val fastMode: Boolean = false,
+        val request: String = "",
+        /** Total active time at the moment this run was stopped. */
+        val workedDurationMs: Long = 0L,
     ) : SessionState
 
     data class Completed(
         val sessionId: String,
         val message: String,
         val conversationId: String? = null,
+        /** Total active time across the task's run and any continuations. */
+        val workedDurationMs: Long = 0L,
     ) : SessionState
 }
 
 sealed interface ActionExecutionResult {
     data object SessionNotRunning : ActionExecutionResult
-    data class PolicyRejected(val message: String) : ActionExecutionResult
+    data class PolicyRejected(
+        val message: String,
+        val details: StaleObservationDiagnostics? = null,
+        val code: String = "POLICY_REJECTED",
+    ) : ActionExecutionResult
     data class TransportFinished(val result: TransportResult) : ActionExecutionResult
 }
 
@@ -74,6 +120,7 @@ data class PendingRequest(
     val codexThreadId: String? = null,
     val reasoningEffort: String = ReasoningEffort.default.codexValue,
     val fastMode: Boolean = false,
+    val isContinuation: Boolean = false,
 )
 
 /** A user instruction waiting to be appended to the active Codex turn. */
@@ -81,6 +128,17 @@ data class PendingSteer(
     val steerId: String,
     val sessionId: String,
     val text: String,
+)
+
+sealed interface AttentionResolution {
+    data object Acknowledged : AttentionResolution
+    data object Cancelled : AttentionResolution
+}
+
+private data class PendingAttention(
+    val sessionId: String,
+    val reason: String,
+    val completion: CompletableDeferred<AttentionResolution>,
 )
 
 /**
@@ -93,23 +151,46 @@ class SessionCoordinator(
     private val policyEngine: PolicyEngine,
     private val transport: PhoneActionTransport,
     private val conversationStore: ConversationStore? = null,
-    /**
-     * Phone actions stay queued until their local execution prerequisites are
-     * ready. The default keeps the coordinator easy to exercise in unit tests.
-     */
-    private val phoneActionsReadyProvider: () -> Boolean = { true },
     private val fullAccessProvider: () -> Boolean = { false },
+    /** Production DHD wires this true so task calls can never fall back to display 0. */
+    private val taskDisplayRequiredProvider: () -> Boolean = { false },
+    /** Optional display registry used to retain the live task surface after terminal state. */
+    private val taskDisplayBackend: TaskDisplayBackend? = null,
+    /** True only when the local phone-action service can accept a request. */
+    private val phoneAccessReadyProvider: () -> Boolean = { true },
+    /** Called when an automatic phone-access recovery needs user visibility. */
+    private val onPhoneAccessAttentionRequested: (String, String?) -> Unit = { _, _ -> },
+    /** Called after automatic phone-access recovery is resolved or cancelled. */
+    private val onPhoneAccessAttentionResolved: () -> Unit = {},
 ) {
     private val lock = Any()
     private val _state = MutableStateFlow<SessionState>(SessionState.Idle)
     private val _events = MutableStateFlow<List<ActivityEvent>>(emptyList())
+    private val _pointerEvent = MutableStateFlow<TaskPointerEvent?>(null)
+    private val _toolCalls = MutableStateFlow<List<DhdToolCall>>(emptyList())
     private var sessionJob: Job? = null
+    private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var claimedRequestSessionId: String? = null
     private val pendingSteers = mutableListOf<PendingSteer>()
     private val claimedSteers = mutableMapOf<String, PendingSteer>()
+    private var pendingAttention: PendingAttention? = null
+    private val completedAttentions = mutableMapOf<String, AttentionResolution>()
 
     val state: StateFlow<SessionState> = _state.asStateFlow()
     val events: StateFlow<List<ActivityEvent>> = _events.asStateFlow()
+    val toolCalls: StateFlow<List<DhdToolCall>> = _toolCalls.asStateFlow()
+
+    /** Latest task-display pointer feedback for the read-only live preview. */
+    val pointerEvent: StateFlow<TaskPointerEvent?> = _pointerEvent.asStateFlow()
+
+    /** Stable owner key used by the phone bridge to choose the task display. */
+    fun activeSessionId(): String? = synchronized(lock) {
+        when (val current = _state.value) {
+            is SessionState.Running -> current.sessionId
+            is SessionState.Paused -> current.sessionId
+            else -> null
+        }
+    }
 
     fun start(
         request: String,
@@ -123,8 +204,11 @@ class SessionCoordinator(
         val now = System.currentTimeMillis()
         val normalizedReasoningEffort = ReasoningEffort.fromCodexValue(reasoningEffort)?.codexValue
             ?: ReasoningEffort.default.codexValue
+        completedAttentions.clear()
+        _pointerEvent.value = null
         val startedRun = conversationStore?.startRun(sessionId, request, conversationId)
         claimedRequestSessionId = null
+        _toolCalls.value = emptyList()
         _state.value = SessionState.Running(
             sessionId = sessionId,
             request = request.trim(),
@@ -133,6 +217,8 @@ class SessionCoordinator(
             conversationId = startedRun?.conversationId ?: conversationId,
             reasoningEffort = normalizedReasoningEffort,
             fastMode = fastMode,
+            isContinuation = false,
+            elapsedBeforeStartMs = 0L,
         )
         sessionJob?.cancel()
         sessionJob = SupervisorJob()
@@ -144,13 +230,62 @@ class SessionCoordinator(
         true
     }
 
-    /** Return the active phone request until a desktop companion claims it. */
+    /**
+     * Begin a safe, presentation-only record for a dynamic DHD tool call.
+     * Arguments, screenshots, and private reasoning are intentionally absent.
+     */
+    fun beginToolCall(toolName: String, purpose: String? = null): String? = synchronized(lock) {
+        val current = _state.value
+        val sessionId = current.sessionIdOrNull ?: return@synchronized null
+        if (!current.isActive) return@synchronized null
+
+        val safeToolName = toolName.trim().take(MAX_TOOL_NAME_CHARS)
+            .ifBlank { "dhd_tool" }
+        val safePurpose = (purpose ?: defaultDhdToolPurpose(safeToolName))
+            .trim()
+            .take(MAX_TEXT_CHARS)
+            .ifBlank { defaultDhdToolPurpose(safeToolName) }
+        val now = System.currentTimeMillis()
+        val call = DhdToolCall(
+            id = UUID.randomUUID().toString(),
+            sessionId = sessionId,
+            toolName = safeToolName,
+            purpose = safePurpose,
+            status = DhdToolCallStatus.RUNNING,
+            startedAtEpochMs = now,
+        )
+        _toolCalls.value = (_toolCalls.value + call).takeLast(MAX_TOOL_CALLS)
+        setCurrentPurpose(safePurpose, metadataPurpose = safePurpose)
+        call.id
+    }
+
+    fun finishToolCall(
+        callId: String?,
+        status: DhdToolCallStatus = DhdToolCallStatus.COMPLETED,
+    ): Boolean = synchronized(lock) {
+        if (callId.isNullOrBlank()) return@synchronized false
+        val index = _toolCalls.value.indexOfFirst { it.id == callId }
+        if (index < 0) return@synchronized false
+        val call = _toolCalls.value[index]
+        if (call.status != DhdToolCallStatus.RUNNING) return@synchronized false
+        val updated = call.copy(
+            status = status,
+            endedAtEpochMs = System.currentTimeMillis(),
+        )
+        _toolCalls.value = _toolCalls.value.toMutableList().also { it[index] = updated }
+        true
+    }
+
+    /**
+     * Return the active phone request until a desktop companion claims it.
+     *
+     * Handoff must remain visible even when the local execution prerequisite is
+     * unavailable. The action transport keeps the safety boundary by rejecting
+     * every phone action before execution until its developer-mode connection
+     * is ready.
+     */
     fun pendingRequest(): PendingRequest? = synchronized(lock) {
         val running = _state.value as? SessionState.Running ?: return@synchronized null
-        // Keep the request on the phone while Shizuku (the current phone
-        // execution prerequisite) is unavailable. The companion must not
-        // start an LLM turn that cannot safely reach the phone.
-        if (!phoneActionsReadyProvider()) return@synchronized null
         if (claimedRequestSessionId == running.sessionId) return@synchronized null
         pendingRequestFor(running)
     }
@@ -167,8 +302,12 @@ class SessionCoordinator(
             text = safeText,
         )
         pendingSteers += steer
-        _state.value = running.copy(currentPurpose = "Steer queued")
+        _state.value = running.copy(
+            currentPurpose = "Steer queued",
+            currentToolMetadataPurpose = null,
+        )
         conversationStore?.setCurrentPurpose(running.sessionId, "Steer queued")
+        taskDisplayBackend?.updatePurposeForRun(running.sessionId, "Steer queued")
         conversationStore?.recordSteer(steer.steerId, running.sessionId, safeText)
         appendEvent(
             ActivityEventKind.SYSTEM,
@@ -230,10 +369,13 @@ class SessionCoordinator(
         if (expectedSessionId != null && expectedSessionId != running.sessionId) {
             return@synchronized null
         }
-        if (!phoneActionsReadyProvider()) return@synchronized null
         if (claimedRequestSessionId == running.sessionId) return@synchronized null
         claimedRequestSessionId = running.sessionId
-        _state.value = running.copy(currentPurpose = "Codex is planning")
+        _state.value = running.copy(
+            currentPurpose = "DHD is planning",
+            currentToolMetadataPurpose = null,
+        )
+        taskDisplayBackend?.updatePurposeForRun(running.sessionId, "DHD is planning")
         appendEvent(
             ActivityEventKind.SYSTEM,
             "Desktop Codex companion claimed the request.",
@@ -253,7 +395,11 @@ class SessionCoordinator(
         claimedRequestSessionId = null
         if (_state.value is SessionState.Running) {
             val running = _state.value as SessionState.Running
-            _state.value = running.copy(currentPurpose = "Waiting for desktop Codex bridge")
+            _state.value = running.copy(
+                currentPurpose = "Waiting for desktop Codex bridge",
+                currentToolMetadataPurpose = null,
+            )
+            taskDisplayBackend?.updatePurposeForRun(sessionId, "Waiting for desktop Codex bridge")
         }
         appendEvent(
             ActivityEventKind.SYSTEM,
@@ -265,32 +411,50 @@ class SessionCoordinator(
 
     fun pause(): Boolean = synchronized(lock) {
         val running = _state.value as? SessionState.Running ?: return false
+        val now = System.currentTimeMillis()
         _state.value = SessionState.Paused(
             sessionId = running.sessionId,
             request = running.request,
             currentPurpose = running.currentPurpose,
-            startedAtEpochMs = running.startedAtEpochMs,
+            currentToolMetadataPurpose = running.currentToolMetadataPurpose,
+            startedAtEpochMs = now,
             conversationId = running.conversationId,
             reasoningEffort = running.reasoningEffort,
             fastMode = running.fastMode,
+            isContinuation = running.isContinuation,
+            attentionReason = running.attentionReason,
+            attentionActionLabel = running.attentionActionLabel,
+            elapsedBeforeStartMs = running.elapsedAt(now),
         )
         conversationStore?.setRunStatus(running.sessionId, RunStatus.PAUSED)
+        cleanupScope.launch {
+            transport.updateSessionDisplayStatusForRun(running.sessionId, TaskDisplayStatus.PAUSED)
+        }
         appendEvent(ActivityEventKind.SESSION_PAUSED, "Session paused.", running.sessionId)
         true
     }
 
     fun resume(): Boolean = synchronized(lock) {
         val paused = _state.value as? SessionState.Paused ?: return false
+        val now = System.currentTimeMillis()
         _state.value = SessionState.Running(
             sessionId = paused.sessionId,
             request = paused.request,
             currentPurpose = paused.currentPurpose,
-            startedAtEpochMs = paused.startedAtEpochMs,
+            currentToolMetadataPurpose = paused.currentToolMetadataPurpose,
+            startedAtEpochMs = now,
             conversationId = paused.conversationId,
             reasoningEffort = paused.reasoningEffort,
             fastMode = paused.fastMode,
+            isContinuation = paused.isContinuation,
+            attentionReason = paused.attentionReason,
+            attentionActionLabel = paused.attentionActionLabel,
+            elapsedBeforeStartMs = paused.elapsedBeforeStartMs,
         )
         conversationStore?.setRunStatus(paused.sessionId, RunStatus.RUNNING)
+        cleanupScope.launch {
+            transport.updateSessionDisplayStatusForRun(paused.sessionId, TaskDisplayStatus.RUNNING)
+        }
         appendEvent(ActivityEventKind.SESSION_RESUMED, "Session resumed.", paused.sessionId)
         true
     }
@@ -301,16 +465,96 @@ class SessionCoordinator(
         else -> false
     }
 
+    /** Start a hidden continuation turn in the stopped run's persisted conversation. */
+    fun continueStopped(): Boolean = synchronized(lock) {
+        val stopped = _state.value as? SessionState.Stopped ?: return@synchronized false
+        if (_state.value.isActive) return@synchronized false
+
+        val sessionId = UUID.randomUUID().toString()
+        val now = System.currentTimeMillis()
+        val startedRun = conversationStore?.startContinuationRun(
+            runId = sessionId,
+            requestedConversationId = stopped.conversationId,
+        )
+        completedAttentions.clear()
+        _pointerEvent.value = null
+        claimedRequestSessionId = null
+        _state.value = SessionState.Running(
+            sessionId = sessionId,
+            request = stopped.request,
+            currentPurpose = "Preparing continuation",
+            startedAtEpochMs = now,
+            conversationId = startedRun?.conversationId ?: stopped.conversationId,
+            reasoningEffort = stopped.reasoningEffort,
+            fastMode = stopped.fastMode,
+            isContinuation = true,
+            elapsedBeforeStartMs = stopped.workedDurationMs,
+        )
+        sessionJob?.cancel()
+        sessionJob = SupervisorJob()
+        appendEvent(
+            ActivityEventKind.SESSION_STARTED,
+            "Continuation accepted. Waiting for the desktop Codex bridge.",
+            sessionId = sessionId,
+        )
+        true
+    }
+
     fun stop(reason: String = "Stopped by the user."): Boolean = synchronized(lock) {
-        val sessionId = _state.value.sessionIdOrNull ?: return false
+        val current = _state.value
+        val sessionId = current.sessionIdOrNull ?: return false
+        val now = System.currentTimeMillis()
+        val workedDurationMs = current.elapsedAt(now)
+        cancelPendingAttentionLocked()
+        completedAttentions.remove(sessionId)
         sessionJob?.cancel()
         sessionJob = null
+        transport.cancelSessionForRun(sessionId)
+        cleanupScope.launch {
+            transport.retainSessionForRun(sessionId, TaskDisplayStatus.STOPPED, reason)
+        }
         claimedRequestSessionId = null
         clearSteers(sessionId)
-        val conversationId = _state.value.conversationIdOrNull()
-        _state.value = SessionState.Stopped(sessionId, reason, conversationId)
+        val conversationId = current.conversationIdOrNull()
+        val continuationSettings = current.continuationSettings()
+        _state.value = SessionState.Stopped(
+            sessionId = sessionId,
+            reason = reason,
+            conversationId = conversationId,
+            reasoningEffort = continuationSettings.first,
+            fastMode = continuationSettings.second,
+            request = current.requestOrNull() ?: "",
+            workedDurationMs = workedDurationMs,
+        )
+        _pointerEvent.value = null
         conversationStore?.completeRun(sessionId, RunStatus.STOPPED)
         appendEvent(ActivityEventKind.SESSION_STOPPED, reason, sessionId)
+        true
+    }
+
+    /**
+     * Terminate any active or stopped session and reset coordinator state to Idle.
+     * Clears all steer instructions, tool calls, pointer events, and timeline events.
+     */
+    fun reset(): Boolean = synchronized(lock) {
+        val current = _state.value
+        val sessionId = current.sessionIdOrNull
+        cancelPendingAttentionLocked()
+        completedAttentions.clear()
+        sessionJob?.cancel()
+        sessionJob = null
+        if (sessionId != null) {
+            transport.cancelSessionForRun(sessionId)
+            clearSteers(sessionId)
+            conversationStore?.completeRun(sessionId, RunStatus.STOPPED)
+        }
+        pendingSteers.clear()
+        claimedSteers.clear()
+        claimedRequestSessionId = null
+        _pointerEvent.value = null
+        _toolCalls.value = emptyList()
+        _events.value = emptyList()
+        _state.value = SessionState.Idle
         true
     }
 
@@ -320,16 +564,35 @@ class SessionCoordinator(
      * replayed indefinitely by the polling companion.
      */
     fun fail(reason: String = "The desktop Codex turn failed."): Boolean = synchronized(lock) {
-        val sessionId = _state.value.sessionIdOrNull ?: return false
-        if (!_state.value.isActive) return false
+        val current = _state.value
+        val sessionId = current.sessionIdOrNull ?: return false
+        if (!current.isActive) return false
+        val now = System.currentTimeMillis()
+        val workedDurationMs = current.elapsedAt(now)
+        cancelPendingAttentionLocked()
+        completedAttentions.remove(sessionId)
         sessionJob?.cancel()
         sessionJob = null
+        transport.cancelSessionForRun(sessionId)
         claimedRequestSessionId = null
         clearSteers(sessionId)
         val safeReason = reason.trim().take(MAX_AGENT_FEEDBACK_CHARS)
             .ifBlank { "The desktop Codex turn failed." }
-        val conversationId = _state.value.conversationIdOrNull()
-        _state.value = SessionState.Stopped(sessionId, "Failed: $safeReason", conversationId)
+        cleanupScope.launch {
+            transport.retainSessionForRun(sessionId, TaskDisplayStatus.FAILED, safeReason)
+        }
+        val conversationId = current.conversationIdOrNull()
+        val continuationSettings = current.continuationSettings()
+        _state.value = SessionState.Stopped(
+            sessionId = sessionId,
+            reason = "Failed: $safeReason",
+            conversationId = conversationId,
+            reasoningEffort = continuationSettings.first,
+            fastMode = continuationSettings.second,
+            request = current.requestOrNull() ?: "",
+            workedDurationMs = workedDurationMs,
+        )
+        _pointerEvent.value = null
         conversationStore?.completeRun(
             sessionId,
             RunStatus.FAILED,
@@ -349,7 +612,11 @@ class SessionCoordinator(
         agentFeedback: String? = null,
         agentMessageId: String? = null,
     ): Boolean = synchronized(lock) {
-        val sessionId = _state.value.sessionIdOrNull ?: return false
+        val current = _state.value
+        val sessionId = current.sessionIdOrNull ?: return false
+        val workedDurationMs = current.elapsedAt(System.currentTimeMillis())
+        cancelPendingAttentionLocked()
+        completedAttentions.remove(sessionId)
         val feedback = agentFeedback
             ?.trim()
             ?.take(MAX_AGENT_FEEDBACK_CHARS)
@@ -359,11 +626,22 @@ class SessionCoordinator(
             ?.take(MAX_TEXT_CHARS)
             ?.ifBlank { null }
         val displayMessage = feedback ?: message.trim().take(MAX_TEXT_CHARS).ifBlank { "Session completed." }
+        sessionJob?.cancel()
         sessionJob = null
+        transport.cancelSessionForRun(sessionId)
+        cleanupScope.launch {
+            transport.retainSessionForRun(sessionId, TaskDisplayStatus.COMPLETED)
+        }
         claimedRequestSessionId = null
-        val conversationId = _state.value.conversationIdOrNull()
-        _state.value.sessionIdOrNull?.let(::clearSteers)
-        _state.value = SessionState.Completed(sessionId, displayMessage, conversationId)
+        val conversationId = current.conversationIdOrNull()
+        current.sessionIdOrNull?.let(::clearSteers)
+        _state.value = SessionState.Completed(
+            sessionId = sessionId,
+            message = displayMessage,
+            conversationId = conversationId,
+            workedDurationMs = workedDurationMs,
+        )
+        _pointerEvent.value = null
         // Feedback is emitted as an AGENT_MESSAGE below so the live timeline
         // and the durable timeline share one row. The fallback completion has
         // no separate event, so persist it directly here.
@@ -399,28 +677,201 @@ class SessionCoordinator(
     }
 
     /** Mark that the user should review the phone without launching an Activity. */
-    fun requestAttention(reason: String): Boolean = synchronized(lock) {
+    fun requestAttention(reason: String): Boolean = requestAttentionWaiter(reason) != null
+
+    /**
+     * Register an attention request and return its completion handle atomically.
+     * The bridge keeps this handle before showing the notification so a very
+     * fast Done tap cannot race with a later lookup of pendingAttention.
+     */
+    fun requestAttentionWaiter(
+        reason: String,
+        actionLabel: String = DEFAULT_ATTENTION_ACTION_LABEL,
+    ): CompletableDeferred<AttentionResolution>? = synchronized(lock) {
         val current = _state.value
-        val sessionId = current.sessionIdOrNull ?: return@synchronized false
+        val sessionId = current.sessionIdOrNull ?: return@synchronized null
         if (current !is SessionState.Running && current !is SessionState.Paused) {
+            return@synchronized null
+        }
+        if (pendingAttention != null) return@synchronized null
+        val message = reason.trim().take(MAX_TEXT_CHARS).ifBlank { "The phone assistant needs your attention." }
+        val safeActionLabel = actionLabel.trim().take(MAX_TEXT_CHARS)
+            .ifBlank { DEFAULT_ATTENTION_ACTION_LABEL }
+        val completion = CompletableDeferred<AttentionResolution>()
+        completedAttentions.remove(sessionId)
+        pendingAttention = PendingAttention(sessionId, message, completion)
+        val updated = when (current) {
+            is SessionState.Running -> current.copy(
+                currentPurpose = "Needs your attention",
+                currentToolMetadataPurpose = null,
+                attentionReason = message,
+                attentionActionLabel = safeActionLabel,
+            )
+            is SessionState.Paused -> current.copy(
+                currentPurpose = "Needs your attention",
+                currentToolMetadataPurpose = null,
+                attentionReason = message,
+                attentionActionLabel = safeActionLabel,
+            )
+            else -> return@synchronized null
+        }
+        _state.value = updated
+        conversationStore?.setCurrentPurpose(sessionId, "Needs your attention")
+        taskDisplayBackend?.updatePurposeForRun(sessionId, "Needs your attention")
+        cleanupScope.launch {
+            transport.updateSessionDisplayStatusForRun(sessionId, TaskDisplayStatus.PAUSED)
+        }
+        appendEvent(ActivityEventKind.ATTENTION_REQUIRED, message, sessionId)
+        completion
+    }
+
+    /** True while the Codex turn is waiting for the user to finish the step. */
+    fun attentionPending(): Boolean = synchronized(lock) { pendingAttention != null }
+
+    /** Suspend the bridge request until the phone user acknowledges or stops the run. */
+    suspend fun awaitAttention(sessionId: String): AttentionResolution =
+        synchronized(lock) {
+            pendingAttention
+                ?.takeIf { it.sessionId == sessionId }
+                ?.completion
+                ?: completedAttentions.remove(sessionId)?.let { resolution ->
+                    CompletableDeferred<AttentionResolution>().apply { complete(resolution) }
+                }
+        }?.await() ?: AttentionResolution.Cancelled
+
+    /** Complete the blocking attention tool from the DHD UI's Done button. */
+    fun acknowledgeAttention(automatic: Boolean = false): Boolean = synchronized(lock) {
+        val pending = pendingAttention ?: return@synchronized false
+        val current = _state.value
+        if (current.sessionIdOrNull != pending.sessionId || !current.isActive) {
+            cancelPendingAttentionLocked()
             return@synchronized false
         }
-        val message = reason.trim().take(MAX_TEXT_CHARS).ifBlank { "The phone assistant needs your attention." }
-        setCurrentPurpose("Needs your attention")
-        appendEvent(ActivityEventKind.ATTENTION_REQUIRED, message, sessionId)
+        pendingAttention = null
+        _state.value = when (current) {
+            is SessionState.Running -> current.copy(
+                currentPurpose = "DHD is planning",
+                currentToolMetadataPurpose = null,
+                attentionReason = null,
+                attentionActionLabel = null,
+            )
+            is SessionState.Paused -> current.copy(
+                currentPurpose = "Paused",
+                currentToolMetadataPurpose = null,
+                attentionReason = null,
+                attentionActionLabel = null,
+            )
+            else -> current
+        }
+        val resumedPurpose = when (val after = _state.value) {
+            is SessionState.Running -> after.currentPurpose
+            is SessionState.Paused -> after.currentPurpose
+            else -> "DHD is planning"
+        }
+        val resumedDisplayStatus = if (_state.value is SessionState.Paused) {
+            TaskDisplayStatus.PAUSED
+        } else {
+            TaskDisplayStatus.RUNNING
+        }
+        conversationStore?.setCurrentPurpose(pending.sessionId, resumedPurpose)
+        taskDisplayBackend?.updatePurposeForRun(pending.sessionId, resumedPurpose)
+        cleanupScope.launch {
+            transport.updateSessionDisplayStatusForRun(pending.sessionId, resumedDisplayStatus)
+        }
+        appendEvent(
+            ActivityEventKind.SYSTEM,
+            if (automatic) {
+                "Phone access was restored; DHD resumed the paused phone action."
+            } else {
+                "The user completed the requested attention step."
+            },
+            pending.sessionId,
+        )
+        completedAttentions[pending.sessionId] = AttentionResolution.Acknowledged
+        pending.completion.complete(AttentionResolution.Acknowledged)
         true
     }
 
-    fun setCurrentPurpose(purpose: String): Boolean = synchronized(lock) {
+    /**
+     * Keep a phone-dependent tool call open while the user restores DHD's
+     * phone access. This deliberately resolves automatically when the local
+     * service becomes ready; the model must never receive a normal tool error
+     * that it can absorb and turn into a misleading completed response.
+     */
+    suspend fun awaitPhoneAccessForTool(
+        reason: String = PHONE_ACCESS_RECOVERY_MESSAGE,
+    ): Boolean {
+        val sessionId = activeSessionId() ?: return false
+        while (true) {
+            if (!sessionStillActive(sessionId)) return false
+            if (phoneAccessReadyProvider()) return true
+
+            val attention = requestAttentionWaiter(
+                reason = reason,
+                actionLabel = PHONE_ACCESS_INSTRUCTIONS_ACTION_LABEL,
+            )
+            if (attention == null) {
+                if (!attentionPending()) return false
+                if (awaitAttention(sessionId) == AttentionResolution.Cancelled) return false
+                continue
+            }
+
+            val conversationId = synchronized(lock) {
+                _state.value.conversationIdOrNull()
+            }
+            runCatching {
+                onPhoneAccessAttentionRequested(reason, conversationId)
+            }
+            try {
+                while (sessionStillActive(sessionId)) {
+                    if (phoneAccessReadyProvider()) {
+                        if (acknowledgeAttention(automatic = true) || phoneAccessReadyProvider()) {
+                            return true
+                        }
+                    }
+                    if (attention.isCompleted) {
+                        when (attention.await()) {
+                            AttentionResolution.Acknowledged -> break
+                            AttentionResolution.Cancelled -> return false
+                        }
+                    }
+                    delay(PHONE_ACCESS_STATUS_POLL_INTERVAL_MS)
+                }
+            } finally {
+                runCatching { onPhoneAccessAttentionResolved() }
+            }
+            if (!sessionStillActive(sessionId)) return false
+        }
+    }
+
+    private fun cancelPendingAttentionLocked() {
+        val pending = pendingAttention ?: return
+        pendingAttention = null
+        completedAttentions[pending.sessionId] = AttentionResolution.Cancelled
+        pending.completion.complete(AttentionResolution.Cancelled)
+    }
+
+    fun setCurrentPurpose(purpose: String, metadataPurpose: String? = null): Boolean = synchronized(lock) {
         val displayPurpose = userFacingActivityLabel(actionType = null, purpose = purpose)
+        val safeMetadataPurpose = metadataPurpose
+            ?.trim()
+            ?.take(MAX_TEXT_CHARS)
+            ?.takeIf(String::isNotBlank)
         val current = _state.value
         val updated = when (current) {
-            is SessionState.Running -> current.copy(currentPurpose = displayPurpose)
-            is SessionState.Paused -> current.copy(currentPurpose = displayPurpose)
+            is SessionState.Running -> current.copy(
+                currentPurpose = displayPurpose,
+                currentToolMetadataPurpose = safeMetadataPurpose,
+            )
+            is SessionState.Paused -> current.copy(
+                currentPurpose = displayPurpose,
+                currentToolMetadataPurpose = safeMetadataPurpose,
+            )
             else -> return false
         }
         _state.value = updated
         current.sessionIdOrNull?.let { conversationStore?.setCurrentPurpose(it, displayPurpose) }
+        current.sessionIdOrNull?.let { taskDisplayBackend?.updatePurposeForRun(it, displayPurpose) }
         true
     }
 
@@ -431,22 +882,35 @@ class SessionCoordinator(
     }
 
     /** Record a safe purpose-bearing operation such as a fresh screen observation. */
-    fun recordPurpose(purpose: String, targetDescription: String? = null): Boolean = synchronized(lock) {
+    fun recordPurpose(
+        purpose: String,
+        targetDescription: String? = null,
+        toolName: String? = null,
+    ): Boolean = synchronized(lock) {
         val sessionId = _state.value.sessionIdOrNull ?: return@synchronized false
+        if (!_state.value.isActive) return@synchronized false
         val safePurpose = userFacingActivityLabel(actionType = null, purpose = purpose)
             .take(MAX_TEXT_CHARS)
             .ifBlank { return@synchronized false }
         val current = _state.value
         _state.value = when (current) {
-            is SessionState.Running -> current.copy(currentPurpose = safePurpose)
-            is SessionState.Paused -> current.copy(currentPurpose = safePurpose)
+            is SessionState.Running -> current.copy(
+                currentPurpose = safePurpose,
+                currentToolMetadataPurpose = safePurpose,
+            )
+            is SessionState.Paused -> current.copy(
+                currentPurpose = safePurpose,
+                currentToolMetadataPurpose = safePurpose,
+            )
             else -> current
         }
         conversationStore?.setCurrentPurpose(sessionId, safePurpose)
+        taskDisplayBackend?.updatePurposeForRun(sessionId, safePurpose)
         appendEvent(
             ActivityEventKind.SYSTEM,
             safePurpose,
             sessionId = sessionId,
+            toolName = toolName,
             purpose = safePurpose,
             targetDescription = targetDescription?.trim()?.take(MAX_TEXT_CHARS),
         )
@@ -457,23 +921,69 @@ class SessionCoordinator(
     suspend fun executeAction(
         action: PhoneAction,
         observation: ObservationSnapshot?,
+        toolName: String? = null,
+        targetDisplay: TaskDisplaySession? = null,
     ): ActionExecutionResult {
-        val running = _state.value as? SessionState.Running
+        val running = synchronized(lock) { _state.value as? SessionState.Running }
             ?: return ActionExecutionResult.SessionNotRunning
+        val targetSessionKey = targetDisplay?.sessionKey ?: running.sessionId
+        if (taskDisplayRequiredProvider()) {
+            val observationMatchesTask = observation?.taskSessionKey == targetSessionKey &&
+                (targetDisplay == null || observation.displayId == targetDisplay.displayId)
+            if ((observation != null && !observationMatchesTask) ||
+                (observation == null && action !is com.phonecontrol.assistant.domain.OpenAppAction)
+            ) {
+                return ActionExecutionResult.PolicyRejected(
+                    message = "The action must use the active task display; the physical display was not touched.",
+                    details = StaleObservationDiagnostics(
+                        approvedObservationId = action.metadata.observationId,
+                        currentObservationId = observation?.id,
+                        reasons = listOf(
+                            com.phonecontrol.assistant.domain.StaleObservationReason(
+                                code = com.phonecontrol.assistant.domain.StaleObservationReasonCode.TASK_SESSION_CHANGED,
+                                approved = observation?.taskSessionKey,
+                                current = targetSessionKey,
+                            ),
+                        ),
+                    ),
+                )
+            }
+        }
+        if (observation?.screenProtection?.requiresUserAttention == true &&
+            action !is com.phonecontrol.assistant.domain.OpenAppAction
+        ) {
+            val message = observation.screenProtection.reason
+                ?: "The current task screen is protected; ask the user to complete it before continuing."
+            appendEvent(
+                ActivityEventKind.ACTION_FAILED,
+                message,
+                sessionId = running.sessionId,
+                actionType = action.type,
+                toolName = toolName,
+                purpose = action.metadata.purpose,
+                observationId = action.metadata.observationId,
+                targetDescription = action.metadata.targetDescription,
+            )
+            return ActionExecutionResult.PolicyRejected(
+                message = "$message Call dhd_request_attention and wait for the user's Done acknowledgement.",
+                code = "SECURE_SCREEN_REQUIRES_USER",
+            )
+        }
         val displayPurpose = userFacingActivityLabel(
             actionType = action.type,
             purpose = action.metadata.purpose,
             targetDescription = action.metadata.targetDescription,
         )
-        setCurrentPurpose(displayPurpose)
+        setCurrentPurpose(displayPurpose, metadataPurpose = action.metadata.purpose)
         appendEvent(
             ActivityEventKind.ACTION_PROPOSED,
-            // Keep the provider's safe explanation as the expandable detail;
-            // the store derives the compact label from purpose + target.
+            // Keep the provider's metadata purpose as the activity label. The
+            // human-readable current-purpose status may still use displayPurpose.
             action.metadata.purpose,
             sessionId = running.sessionId,
             actionType = action.type,
-            purpose = displayPurpose,
+            toolName = toolName,
+            purpose = action.metadata.purpose,
             observationId = action.metadata.observationId,
             targetDescription = action.metadata.targetDescription,
         )
@@ -495,11 +1005,12 @@ class SessionCoordinator(
                     decision.message,
                     sessionId = running.sessionId,
                     actionType = action.type,
-                    purpose = displayPurpose,
+                    toolName = toolName,
+                    purpose = action.metadata.purpose,
                     observationId = action.metadata.observationId,
                     targetDescription = action.metadata.targetDescription,
                 )
-                return ActionExecutionResult.PolicyRejected(decision.message)
+                return ActionExecutionResult.PolicyRejected(decision.message, decision.details)
             }
         }
 
@@ -508,11 +1019,90 @@ class SessionCoordinator(
             "Executing ${action.type.name.lowercase().replace('_', ' ')}",
             sessionId = running.sessionId,
             actionType = action.type,
-            purpose = displayPurpose,
+            toolName = toolName,
+            purpose = action.metadata.purpose,
             observationId = action.metadata.observationId,
             targetDescription = action.metadata.targetDescription,
         )
-        val result = transport.execute(action, observation)
+        val tapAction = action as? TapAction
+        val stillActiveBeforeDispatch = synchronized(lock) {
+            _state.value.sessionIdOrNull == running.sessionId && _state.value.isActive
+        }
+        if (!stillActiveBeforeDispatch) return ActionExecutionResult.SessionNotRunning
+
+        var clickPressPublished = false
+        val beforeInput = if (tapAction != null && observation != null) {
+            {
+                if (!clickPressPublished) {
+                    clickPressPublished = true
+                    publishPointerEvent(
+                        sessionId = running.sessionId,
+                        action = tapAction,
+                        observation = observation,
+                        clickPhase = ClickPhase.PRESSED,
+                    )
+                }
+            }
+        } else {
+            null
+        }
+        val onPointerMove = when {
+            tapAction != null && observation != null -> {
+                {
+                    publishPointerEvent(
+                        sessionId = running.sessionId,
+                        action = tapAction,
+                        observation = observation,
+                        clickPhase = ClickPhase.MOVING,
+                    )
+                }
+            }
+
+            action is SwipeAction && observation != null -> {
+                {
+                    publishPointerEvent(
+                        sessionId = running.sessionId,
+                        action = action,
+                        observation = observation,
+                    )
+                }
+            }
+
+            else -> null
+        }
+        var result = transport.executeForSession(
+            targetSessionKey,
+            action,
+            observation,
+            beforeInput,
+            onPointerMove,
+        )
+        var phoneAccessRecoveryAttempts = 0
+        while (
+            result is TransportResult.Rejected &&
+                result.code == RejectionCode.DEVELOPER_MODE_UNAVAILABLE &&
+                phoneAccessRecoveryAttempts < MAX_PHONE_ACCESS_RECOVERY_ATTEMPTS
+        ) {
+            phoneAccessRecoveryAttempts += 1
+            if (!awaitPhoneAccessForTool()) {
+                val stillActiveAfterRecovery = synchronized(lock) {
+                    _state.value.sessionIdOrNull == running.sessionId && _state.value.isActive
+                }
+                if (!stillActiveAfterRecovery) return ActionExecutionResult.SessionNotRunning
+                break
+            }
+            result = transport.executeForSession(
+                targetSessionKey,
+                action,
+                observation,
+                beforeInput,
+                onPointerMove,
+            )
+        }
+        val stillActive = synchronized(lock) {
+            _state.value.sessionIdOrNull == running.sessionId && _state.value.isActive
+        }
+        if (!stillActive) return ActionExecutionResult.SessionNotRunning
         val eventKind = if (result is TransportResult.Succeeded) {
             ActivityEventKind.ACTION_SUCCEEDED
         } else {
@@ -523,17 +1113,94 @@ class SessionCoordinator(
             transportMessage(result),
             sessionId = running.sessionId,
             actionType = action.type,
-            purpose = displayPurpose,
+            toolName = toolName,
+            purpose = action.metadata.purpose,
             observationId = action.metadata.observationId,
             targetDescription = action.metadata.targetDescription,
         )
         return ActionExecutionResult.TransportFinished(result)
     }
 
+    /** Publish visual feedback for a gesture or one phase of a click. */
+    private fun publishPointerEvent(
+        sessionId: String,
+        action: PhoneAction,
+        observation: ObservationSnapshot?,
+        clickPhase: ClickPhase = ClickPhase.PRESSED,
+    ) = synchronized(lock) {
+        val current = _state.value
+        if (current.sessionIdOrNull != sessionId || !current.isActive || observation == null) {
+            return@synchronized
+        }
+        val sequence = (_pointerEvent.value?.sequence ?: 0L) + 1L
+        val nextEvent = when (action) {
+            is TapAction -> TaskPointerEvent.Click(
+                sequence = sequence,
+                sessionId = sessionId,
+                x = action.x,
+                y = action.y,
+                displayWidth = observation.width,
+                displayHeight = observation.height,
+                phase = clickPhase,
+            )
+
+            is SwipeAction -> TaskPointerEvent.Swipe(
+                sequence = sequence,
+                sessionId = sessionId,
+                startX = action.startX,
+                startY = action.startY,
+                endX = action.endX,
+                endY = action.endY,
+                durationMs = action.durationMs,
+                displayWidth = observation.width,
+                displayHeight = observation.height,
+            )
+
+            else -> return@synchronized
+        }
+        _pointerEvent.value = nextEvent
+    }
+
+    /**
+     * Publish the initial calibration cursor for a freshly opened task
+     * display. This is presentation metadata only; it does not dispatch an
+     * input action or alter the observation.
+     */
+    fun publishCalibrationPointerEvent(
+        observation: ObservationSnapshot,
+    ): TaskPointerEvent.Calibration? = synchronized(lock) {
+        val current = _state.value
+        val sessionId = current.sessionIdOrNull ?: return@synchronized null
+        if (!current.isActive || observation.width <= 0 || observation.height <= 0) {
+            return@synchronized null
+        }
+
+        val (xRatio, yRatio) = CALIBRATION_ANCHORS[Random.nextInt(CALIBRATION_ANCHORS.size)]
+        val nextEvent = TaskPointerEvent.Calibration(
+            sequence = (_pointerEvent.value?.sequence ?: 0L) + 1L,
+            sessionId = sessionId,
+            x = (observation.width * xRatio).roundToInt().coerceIn(0, observation.width - 1),
+            y = (observation.height * yRatio).roundToInt().coerceIn(0, observation.height - 1),
+            displayWidth = observation.width,
+            displayHeight = observation.height,
+        )
+        _pointerEvent.value = nextEvent
+        nextEvent
+    }
+
     fun close() {
         sessionJob?.cancel()
         sessionJob = null
+        val sessionId = synchronized(lock) { _state.value.sessionIdOrNull }
+        if (sessionId != null) {
+            transport.cancelSessionForRun(sessionId)
+            cleanupScope.launch {
+                transport.retainSessionForRun(sessionId, TaskDisplayStatus.STOPPED, "Session closed.")
+            }
+        }
         synchronized(lock) {
+            cancelPendingAttentionLocked()
+            completedAttentions.clear()
             pendingSteers.clear()
             claimedSteers.clear()
         }
@@ -544,6 +1211,10 @@ class SessionCoordinator(
         claimedSteers.entries.removeIf { it.value.sessionId == sessionId }
     }
 
+    private fun sessionStillActive(sessionId: String): Boolean = synchronized(lock) {
+        _state.value.sessionIdOrNull == sessionId && _state.value.isActive
+    }
+
     private fun pendingRequestFor(running: SessionState.Running): PendingRequest = PendingRequest(
         sessionId = running.sessionId,
         request = running.request,
@@ -551,6 +1222,7 @@ class SessionCoordinator(
         codexThreadId = conversationStore?.codexThreadId(running.conversationId),
         reasoningEffort = running.reasoningEffort,
         fastMode = running.fastMode,
+        isContinuation = running.isContinuation,
     )
 
     private fun appendEvent(
@@ -558,6 +1230,7 @@ class SessionCoordinator(
         message: String,
         sessionId: String? = _state.value.sessionIdOrNull,
         actionType: com.phonecontrol.assistant.domain.ActionType? = null,
+        toolName: String? = null,
         purpose: String? = null,
         observationId: String? = null,
         targetDescription: String? = null,
@@ -570,6 +1243,7 @@ class SessionCoordinator(
             kind = kind,
             message = message,
             actionType = actionType,
+            toolName = toolName,
             purpose = purpose,
             observationId = observationId,
             targetDescription = targetDescription,
@@ -586,15 +1260,32 @@ class SessionCoordinator(
 
     private companion object {
         const val MAX_EVENTS = 100
+        const val MAX_TOOL_CALLS = 12
+        const val MAX_TOOL_NAME_CHARS = 80
         const val MAX_TEXT_CHARS = 240
         const val MAX_AGENT_FEEDBACK_CHARS = 4_000
         const val MAX_STEER_CHARS = 4_000
         const val MAX_PENDING_STEERS = 8
+        const val MAX_PHONE_ACCESS_RECOVERY_ATTEMPTS = 3
+        const val PHONE_ACCESS_STATUS_POLL_INTERVAL_MS = 500L
+        const val DEFAULT_ATTENTION_ACTION_LABEL = "Done"
+        const val PHONE_ACCESS_INSTRUCTIONS_ACTION_LABEL = "View instructions"
+        const val PHONE_ACCESS_RECOVERY_MESSAGE =
+            "DHD paused this task because it needs phone access. Turn on Wi-Fi and Wireless debugging in Android Settings, then return to DHD. Your phone action has not been sent."
     }
 }
 
 private val SessionState.isActive: Boolean
     get() = this is SessionState.Running || this is SessionState.Paused
+
+private fun SessionState.elapsedAt(nowEpochMs: Long): Long = when (this) {
+    is SessionState.Running -> elapsedBeforeStartMs +
+        (nowEpochMs - startedAtEpochMs).coerceAtLeast(0L)
+    is SessionState.Paused -> elapsedBeforeStartMs
+    is SessionState.Stopped -> workedDurationMs
+    is SessionState.Completed -> workedDurationMs
+    SessionState.Idle -> 0L
+}.coerceAtLeast(0L)
 
 private val SessionState.sessionIdOrNull: String?
     get() = when (this) {
@@ -611,4 +1302,17 @@ private fun SessionState.conversationIdOrNull(): String? = when (this) {
     is SessionState.Paused -> conversationId
     is SessionState.Stopped -> conversationId
     is SessionState.Completed -> conversationId
+}
+
+private fun SessionState.continuationSettings(): Pair<String, Boolean> = when (this) {
+    is SessionState.Running -> reasoningEffort to fastMode
+    is SessionState.Paused -> reasoningEffort to fastMode
+    else -> ReasoningEffort.default.codexValue to false
+}
+
+private fun SessionState.requestOrNull(): String? = when (this) {
+    is SessionState.Running -> request
+    is SessionState.Paused -> request
+    is SessionState.Stopped -> request
+    else -> null
 }

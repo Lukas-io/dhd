@@ -9,6 +9,8 @@ export type CompanionJsonValue =
   | { [key: string]: CompanionJsonValue };
 
 export const COMPANION_TOOL_EVENT_TYPE = "dhd_tool_call" as const;
+export const COMPANION_TOKEN_USAGE_EVENT_TYPE = "dhd_token_usage" as const;
+export const COMPANION_PLAN_EVENT_TYPE = "dhd_plan" as const;
 
 export interface CompanionToolCallStartedEvent {
   type: typeof COMPANION_TOOL_EVENT_TYPE;
@@ -37,6 +39,51 @@ export type CompanionToolCallEvent =
 /** Public contract name used by worker/dashboard integrations. */
 export type CompanionToolEvent = CompanionToolCallEvent;
 
+export interface CompanionTokenUsageMetrics {
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+}
+
+export interface CompanionTokenUsageEvent {
+  type: typeof COMPANION_TOKEN_USAGE_EVENT_TYPE;
+  threadId: string;
+  turnId: string;
+  usage: CompanionTokenUsageMetrics;
+  modelContextWindow: number | null;
+  model?: string;
+  serviceTier?: string;
+  timestamp: number;
+}
+
+export type CompanionPlanStepStatus = "pending" | "in_progress" | "completed";
+
+export interface CompanionPlanStep {
+  step: string;
+  status: CompanionPlanStepStatus;
+}
+
+export interface CompanionPlanResetEvent {
+  type: typeof COMPANION_PLAN_EVENT_TYPE;
+  phase: "reset";
+}
+
+export interface CompanionPlanUpdatedEvent {
+  type: typeof COMPANION_PLAN_EVENT_TYPE;
+  phase: "updated";
+  threadId: string;
+  turnId: string;
+  explanation?: string;
+  steps: CompanionPlanStep[];
+  timestamp: number;
+}
+
+export type CompanionPlanEvent =
+  | CompanionPlanResetEvent
+  | CompanionPlanUpdatedEvent;
+
 export function isCompanionToolCallEvent(
   value: unknown,
 ): value is CompanionToolCallEvent {
@@ -55,6 +102,68 @@ export function isCompanionToolCallEvent(
   );
 }
 
+function isTokenCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+export function isCompanionTokenUsageEvent(
+  value: unknown,
+): value is CompanionTokenUsageEvent {
+  if (!value || typeof value !== "object") return false;
+  const event = value as Record<string, unknown>;
+  const usage = event.usage;
+  if (!usage || typeof usage !== "object") return false;
+  const metrics = usage as Record<string, unknown>;
+  const modelContextWindow = event.modelContextWindow;
+  return (
+    event.type === COMPANION_TOKEN_USAGE_EVENT_TYPE &&
+    typeof event.threadId === "string" &&
+    event.threadId.length > 0 &&
+    typeof event.turnId === "string" &&
+    event.turnId.length > 0 &&
+    isTokenCount(metrics.inputTokens) &&
+    isTokenCount(metrics.outputTokens) &&
+    isTokenCount(metrics.cachedInputTokens) &&
+    isTokenCount(metrics.reasoningOutputTokens) &&
+    isTokenCount(metrics.totalTokens) &&
+    (modelContextWindow === null || isTokenCount(modelContextWindow)) &&
+    (event.model === undefined || (typeof event.model === "string" && event.model.length > 0)) &&
+    (event.serviceTier === undefined ||
+      (typeof event.serviceTier === "string" && event.serviceTier.length > 0)) &&
+    isTokenCount(event.timestamp)
+  );
+}
+
+export function isCompanionPlanEvent(value: unknown): value is CompanionPlanEvent {
+  if (!value || typeof value !== "object") return false;
+  const event = value as Record<string, unknown>;
+  if (event.type !== COMPANION_PLAN_EVENT_TYPE) return false;
+  if (event.phase === "reset") return true;
+  if (
+    event.phase !== "updated" ||
+    typeof event.threadId !== "string" ||
+    event.threadId.length === 0 ||
+    typeof event.turnId !== "string" ||
+    event.turnId.length === 0 ||
+    !Array.isArray(event.steps) ||
+    !isTokenCount(event.timestamp) ||
+    (event.explanation !== undefined && typeof event.explanation !== "string")
+  ) {
+    return false;
+  }
+
+  return event.steps.every((step) => {
+    if (!step || typeof step !== "object") return false;
+    const entry = step as Record<string, unknown>;
+    return (
+      typeof entry.step === "string" &&
+      (entry.status === "pending" ||
+        entry.status === "in_progress" ||
+        entry.status === "completed")
+    );
+  });
+}
+
 /**
  * The dashboard may run the worker as a direct command without an IPC parent.
  * Diagnostics are intentionally best-effort: an unavailable or broken event
@@ -63,6 +172,26 @@ export function isCompanionToolCallEvent(
 export function emitCompanionToolCallEvent(
   event: CompanionToolCallEvent,
 ): void {
+  if (typeof process.send !== "function" || process.connected === false) return;
+  try {
+    process.send(event, () => undefined);
+  } catch {
+    // The worker must continue even when the dashboard has gone away.
+  }
+}
+
+export function emitCompanionTokenUsageEvent(
+  event: CompanionTokenUsageEvent,
+): void {
+  if (typeof process.send !== "function" || process.connected === false) return;
+  try {
+    process.send(event, () => undefined);
+  } catch {
+    // The worker must continue even when the dashboard has gone away.
+  }
+}
+
+export function emitCompanionPlanEvent(event: CompanionPlanEvent): void {
   if (typeof process.send !== "function" || process.connected === false) return;
   try {
     process.send(event, () => undefined);

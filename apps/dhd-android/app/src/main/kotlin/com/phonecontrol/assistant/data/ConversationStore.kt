@@ -12,10 +12,13 @@ import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.Update
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import com.phonecontrol.assistant.domain.ActivityEvent
 import com.phonecontrol.assistant.domain.ActivityEventKind
 import com.phonecontrol.assistant.domain.ActionType
-import com.phonecontrol.assistant.domain.userFacingActivityLabel
+import com.phonecontrol.assistant.execution.TaskDisplayRecord
+import com.phonecontrol.assistant.execution.TaskDisplayStatus
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -23,8 +26,18 @@ import java.util.UUID
 
 const val DHD_CONVERSATION_ID = "dhd-assistant"
 const val DHD_THREAD_INACTIVITY_MS = 3 * 60 * 60 * 1000L
+
+internal fun hasDhdConversationExpired(lastActivityEpochMs: Long, nowEpochMs: Long): Boolean =
+    nowEpochMs - lastActivityEpochMs >= DHD_THREAD_INACTIVITY_MS
+
+const val DHD_LIST_ALLOWED_APPS_TOOL = "dhd_list_allowed_apps"
+const val DHD_FOREGROUND_APP_TOOL = "dhd_get_foreground_app"
 const val DHD_EXECUTE_TOOL = "dhd_execute"
+const val DHD_EXECUTE_SEQUENCE_TOOL = "dhd_execute_sequence"
 const val DHD_OPEN_APP_TOOL = "dhd_open_app"
+const val DHD_BROWSE_APP_TOOL = "dhd_browse_app"
+const val DHD_SET_APP_DISPLAY_LAYOUT_TOOL = "dhd_set_app_display_layout"
+const val DHD_OBSERVE_TOOL = "dhd_observe"
 
 /** Local, app-private conversation metadata. Codex remains the remote context source of truth. */
 @Entity(tableName = "conversations")
@@ -57,6 +70,8 @@ data class MessageEntity(
 data class AgentRunEntity(
     @PrimaryKey val id: String,
     val conversationId: String,
+    // Continuation runs intentionally have no new user message and use an
+    // empty id so Play can resume the remote thread without adding a bubble.
     val userMessageId: String,
     val status: String,
     val currentPurpose: String,
@@ -83,6 +98,33 @@ data class ToolActivityEntity(
     val message: String,
     val createdAtEpochMs: Long,
     val updatedAtEpochMs: Long,
+)
+
+/** Durable metadata for a phone-local virtual display. Frames never enter Room. */
+@Entity(
+    tableName = "task_displays",
+    indices = [
+        Index(value = ["taskId"]),
+        Index(value = ["status"]),
+        Index(value = ["expiresAtEpochMs"]),
+    ],
+)
+data class TaskDisplayEntity(
+    @PrimaryKey val sessionKey: String,
+    val taskId: String,
+    val packageName: String,
+    val displayId: Int,
+    val width: Int,
+    val height: Int,
+    val densityDpi: Int,
+    val rotation: Int,
+    val status: String,
+    val createdAtEpochMs: Long,
+    val terminalAtEpochMs: Long? = null,
+    val expiresAtEpochMs: Long? = null,
+    val lastPurpose: String,
+    val error: String? = null,
+    val ownerPackageName: String? = null,
 )
 
 @Dao
@@ -146,15 +188,83 @@ interface ConversationDao {
 
     @Query("DELETE FROM tool_activities WHERE conversationId = :conversationId")
     fun deleteActivities(conversationId: String)
+
+    @Query("SELECT * FROM task_displays ORDER BY createdAtEpochMs DESC, sessionKey ASC")
+    fun listTaskDisplays(): List<TaskDisplayEntity>
+
+    @Query("SELECT * FROM task_displays WHERE sessionKey = :sessionKey LIMIT 1")
+    fun findTaskDisplay(sessionKey: String): TaskDisplayEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    fun insertTaskDisplay(display: TaskDisplayEntity)
+
+    @Query("DELETE FROM task_displays WHERE sessionKey = :sessionKey")
+    fun deleteTaskDisplay(sessionKey: String)
+
+    @Query("DELETE FROM task_displays")
+    fun deleteAllTaskDisplays()
 }
 
 @Database(
-    entities = [ConversationEntity::class, MessageEntity::class, AgentRunEntity::class, ToolActivityEntity::class],
-    version = 1,
+    entities = [
+        ConversationEntity::class,
+        MessageEntity::class,
+        AgentRunEntity::class,
+        ToolActivityEntity::class,
+        TaskDisplayEntity::class,
+    ],
+    version = 3,
     exportSchema = false,
 )
 abstract class AssistantDatabase : RoomDatabase() {
     abstract fun conversationDao(): ConversationDao
+
+    companion object {
+        /** Preserve existing conversations while adding display metadata. */
+        val MIGRATION_1_2: Migration = object : Migration(1, 2) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `task_displays` (
+                        `sessionKey` TEXT NOT NULL,
+                        `taskId` TEXT NOT NULL,
+                        `packageName` TEXT NOT NULL,
+                        `displayId` INTEGER NOT NULL,
+                        `width` INTEGER NOT NULL,
+                        `height` INTEGER NOT NULL,
+                        `densityDpi` INTEGER NOT NULL,
+                        `rotation` INTEGER NOT NULL,
+                        `status` TEXT NOT NULL,
+                        `createdAtEpochMs` INTEGER NOT NULL,
+                        `terminalAtEpochMs` INTEGER,
+                        `expiresAtEpochMs` INTEGER,
+                        `lastPurpose` TEXT NOT NULL,
+                        `error` TEXT,
+                        PRIMARY KEY(`sessionKey`)
+                    )
+                    """.trimIndent(),
+                )
+                database.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_task_displays_taskId` " +
+                        "ON `task_displays` (`taskId`)"
+                )
+                database.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_task_displays_status` " +
+                        "ON `task_displays` (`status`)"
+                )
+                database.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_task_displays_expiresAtEpochMs` " +
+                        "ON `task_displays` (`expiresAtEpochMs`)"
+                )
+            }
+        }
+
+        val MIGRATION_2_3: Migration = object : Migration(2, 3) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("ALTER TABLE `task_displays` ADD COLUMN `ownerPackageName` TEXT")
+            }
+        }
+    }
 }
 
 enum class RunStatus {
@@ -221,13 +331,18 @@ class ConversationStore(context: Context) {
         context.applicationContext,
         AssistantDatabase::class.java,
         "dhd-conversations.db",
-    ).fallbackToDestructiveMigration().allowMainThreadQueries().build()
+    )
+        .addMigrations(AssistantDatabase.MIGRATION_1_2, AssistantDatabase.MIGRATION_2_3)
+        .allowMainThreadQueries()
+        .build()
     private val dao = database.conversationDao()
     private val lock = Any()
     private val _conversations = MutableStateFlow<List<ConversationSummary>>(emptyList())
     private val timelineFlows = mutableMapOf<String, MutableStateFlow<List<TimelineItem>>>()
 
     val conversations: StateFlow<List<ConversationSummary>> = _conversations.asStateFlow()
+    private val _conversationExpiryPrompt = MutableStateFlow(false)
+    val conversationExpiryPrompt: StateFlow<Boolean> = _conversationExpiryPrompt.asStateFlow()
 
     init {
         refreshConversations()
@@ -240,6 +355,58 @@ class ConversationStore(context: Context) {
         }.asStateFlow()
     }
 
+    /** Report whether the DHD conversation should ask the user before expiring. */
+    fun promptForInactiveConversation(nowEpochMs: Long = System.currentTimeMillis()): Boolean = synchronized(lock) {
+        val existing = dao.findConversation(DHD_CONVERSATION_ID)
+        val shouldPrompt = existing != null &&
+            hasDhdConversationExpired(existing.updatedAtEpochMs, nowEpochMs)
+        _conversationExpiryPrompt.value = shouldPrompt
+        shouldPrompt
+    }
+
+    fun dismissInactiveConversationPrompt() = synchronized(lock) {
+        _conversationExpiryPrompt.value = false
+    }
+
+    /** Keep a stale conversation and restart its inactivity window. */
+    fun keepInactiveConversation(nowEpochMs: Long = System.currentTimeMillis()): Boolean = synchronized(lock) {
+        val existing = dao.findConversation(DHD_CONVERSATION_ID) ?: run {
+            _conversationExpiryPrompt.value = false
+            return@synchronized false
+        }
+        if (!hasDhdConversationExpired(existing.updatedAtEpochMs, nowEpochMs)) {
+            _conversationExpiryPrompt.value = false
+            return@synchronized false
+        }
+
+        dao.updateConversation(
+            existing.copy(
+                updatedAtEpochMs = nowEpochMs,
+                deleted = false,
+            ),
+        )
+        _conversationExpiryPrompt.value = false
+        refreshConversations()
+        true
+    }
+
+    /** Clear the DHD conversation once it has been inactive for the full window. */
+    fun expireInactiveConversation(nowEpochMs: Long = System.currentTimeMillis()): Boolean = synchronized(lock) {
+        val existing = dao.findConversation(DHD_CONVERSATION_ID) ?: run {
+            _conversationExpiryPrompt.value = false
+            return@synchronized false
+        }
+        if (!hasDhdConversationExpired(existing.updatedAtEpochMs, nowEpochMs)) {
+            _conversationExpiryPrompt.value = false
+            return@synchronized false
+        }
+
+        clearConversationRows(DHD_CONVERSATION_ID)
+        _conversationExpiryPrompt.value = false
+        refreshConversations()
+        true
+    }
+
     fun startRun(runId: String, request: String, requestedConversationId: String? = null): StartedRun = synchronized(lock) {
         val now = System.currentTimeMillis()
         val safeRequest = request.trim().take(MAX_MESSAGE_CHARS)
@@ -250,12 +417,13 @@ class ConversationStore(context: Context) {
         // to require a full fresh conversation.
         val existing = dao.findConversation(DHD_CONVERSATION_ID)
         val resetConversation = existing != null &&
-            now - existing.updatedAtEpochMs >= DHD_THREAD_INACTIVITY_MS
+            hasDhdConversationExpired(existing.updatedAtEpochMs, now)
         if (resetConversation) {
             // A thread rotation is a full conversation reset from the user's
             // perspective. Keep the old remote Codex thread unbound, but clear
             // the local presentation history before creating the new run.
             clearConversationRows(DHD_CONVERSATION_ID)
+            _conversationExpiryPrompt.value = false
         }
         val conversation = if (existing == null || resetConversation) {
             ConversationEntity(
@@ -296,6 +464,30 @@ class ConversationStore(context: Context) {
         )
         refresh(conversation.id)
         StartedRun(DHD_CONVERSATION_ID, runId, messageId)
+    }
+
+    /** Start a hidden local run for a Codex continuation with no local user message. */
+    fun startContinuationRun(runId: String, requestedConversationId: String? = null): StartedRun? = synchronized(lock) {
+        val now = System.currentTimeMillis()
+        val conversationId = canonicalConversationId(requestedConversationId)
+        val existing = dao.findConversation(conversationId) ?: return@synchronized null
+        val conversation = existing.copy(
+            updatedAtEpochMs = now,
+            deleted = false,
+        )
+        dao.updateConversation(conversation)
+        dao.insertRun(
+            AgentRunEntity(
+                id = runId,
+                conversationId = conversation.id,
+                userMessageId = "",
+                status = RunStatus.RUNNING.name,
+                currentPurpose = "Preparing request",
+                startedAtEpochMs = now,
+            ),
+        )
+        refresh(conversation.id)
+        StartedRun(conversation.id, runId, "")
     }
 
     fun setCurrentPurpose(runId: String, purpose: String) = synchronized(lock) {
@@ -395,7 +587,7 @@ class ConversationStore(context: Context) {
         val runId = event.sessionId ?: return@synchronized
         val run = dao.findRun(runId) ?: return@synchronized
         val purpose = event.purpose
-            ?.let { userFacingActivityLabel(event.actionType, it, event.targetDescription) }
+            ?.trim()
             ?.take(MAX_PURPOSE_CHARS)
             ?.ifBlank { null }
         if (purpose != null && event.kind in PURPOSE_EVENT_KINDS) {
@@ -424,7 +616,7 @@ class ConversationStore(context: Context) {
                         // Action lifecycle events are emitted by the DHD tool
                         // boundary. Keep the public tool name so the UI can
                         // distinguish real tool calls from system activity.
-                        toolName = when (event.actionType) {
+                        toolName = event.toolName ?: when (event.actionType) {
                             ActionType.OPEN_APP -> DHD_OPEN_APP_TOOL
                             null -> null
                             else -> DHD_EXECUTE_TOOL
@@ -454,6 +646,7 @@ class ConversationStore(context: Context) {
                 }
                 dao.updateActivity(
                     existing.copy(
+                        toolName = event.toolName ?: existing.toolName,
                         status = status,
                         message = updatedMessage,
                         updatedAtEpochMs = event.timestampEpochMs,
@@ -490,6 +683,32 @@ class ConversationStore(context: Context) {
         refresh(run.conversationId)
     }
 
+    /** Return the durable task-display registry, newest display first. */
+    fun listTaskDisplays(): List<TaskDisplayRecord> = synchronized(lock) {
+        dao.listTaskDisplays().mapNotNull { it.toTaskDisplayRecord() }
+    }
+
+    fun findTaskDisplay(sessionKey: String): TaskDisplayRecord? = synchronized(lock) {
+        dao.findTaskDisplay(sessionKey)?.toTaskDisplayRecord()
+    }
+
+    fun currentPurpose(runId: String): String? = synchronized(lock) {
+        dao.findRun(runId)?.currentPurpose
+    }
+
+    /** Insert or replace one display's metadata without storing frames. */
+    fun upsertTaskDisplay(record: TaskDisplayRecord) = synchronized(lock) {
+        dao.insertTaskDisplay(record.toEntity())
+    }
+
+    fun deleteTaskDisplay(sessionKey: String) = synchronized(lock) {
+        dao.deleteTaskDisplay(sessionKey)
+    }
+
+    fun deleteAllTaskDisplays() = synchronized(lock) {
+        dao.deleteAllTaskDisplays()
+    }
+
     fun bindCodexThread(conversationId: String, codexThreadId: String) = synchronized(lock) {
         val conversation = dao.findConversation(canonicalConversationId(conversationId)) ?: return@synchronized
         dao.updateConversation(conversation.copy(codexThreadId = codexThreadId, updatedAtEpochMs = System.currentTimeMillis()))
@@ -511,8 +730,10 @@ class ConversationStore(context: Context) {
 
     fun deleteConversation(conversationId: String): Boolean = synchronized(lock) {
         val canonicalId = canonicalConversationId(conversationId)
-        if (dao.findConversation(canonicalId) == null) return@synchronized false
         clearConversationRows(canonicalId)
+        if (canonicalId == DHD_CONVERSATION_ID) {
+            _conversationExpiryPrompt.value = false
+        }
         // Keep the flow instance that Compose is already collecting alive and
         // publish the empty state before dropping it from the cache. A
         // collector must not stay stuck displaying the deleted timeline.
@@ -556,7 +777,9 @@ class ConversationStore(context: Context) {
         val messages = dao.listMessages(conversationId).map {
             TimelineItem.Message(it.id, it.runId, it.role, it.text, it.createdAtEpochMs)
         }
-        val activities = dao.listConversationActivities(conversationId).map {
+        val activities = dao.listConversationActivities(conversationId)
+            .filterNot { it.toolName.equals("dhd_close_display", ignoreCase = true) || it.toolName.equals("close_display", ignoreCase = true) }
+            .map {
             TimelineItem.Activity(
                 id = it.id,
                 runId = it.runId,
@@ -616,4 +839,45 @@ private fun ActivityEventKind.activityStatus(): String = when (this) {
     ActivityEventKind.ACTION_FAILED -> "failed"
     ActivityEventKind.ATTENTION_REQUIRED -> "attention"
     else -> "info"
+}
+
+private fun TaskDisplayRecord.toEntity(): TaskDisplayEntity = TaskDisplayEntity(
+    sessionKey = sessionKey,
+    taskId = taskId,
+    packageName = packageName,
+    displayId = displayId,
+    width = width,
+    height = height,
+    densityDpi = densityDpi,
+    rotation = rotation,
+    status = status.name,
+    createdAtEpochMs = createdAtEpochMs,
+    terminalAtEpochMs = terminalAtEpochMs,
+    expiresAtEpochMs = expiresAtEpochMs,
+    lastPurpose = lastPurpose,
+    error = error,
+    ownerPackageName = ownerPackageName,
+)
+
+private fun TaskDisplayEntity.toTaskDisplayRecord(): TaskDisplayRecord? {
+    val parsedStatus = runCatching { TaskDisplayStatus.valueOf(status) }.getOrNull() ?: return null
+    return runCatching {
+        TaskDisplayRecord(
+            sessionKey = sessionKey,
+            taskId = taskId,
+            packageName = packageName,
+            displayId = displayId,
+            width = width,
+            height = height,
+            densityDpi = densityDpi,
+            rotation = rotation,
+            status = parsedStatus,
+            createdAtEpochMs = createdAtEpochMs,
+            terminalAtEpochMs = terminalAtEpochMs,
+            expiresAtEpochMs = expiresAtEpochMs,
+            lastPurpose = lastPurpose,
+            error = error,
+            ownerPackageName = ownerPackageName,
+        )
+    }.getOrNull()
 }

@@ -8,9 +8,10 @@ The desktop side of the pivot has two small local processes:
    The companion uses the same phone-tool dispatcher directly, so a normal
    companion turn does not depend on a second MCP stdio process.
 
-The Android app remains the authority for Shizuku, app allowlisting,
-confirmation boundaries, and stop/pause state. A request is kept queued on the
-phone until Shizuku is ready; the companion's normal poll is also the heartbeat
+The Android app remains the authority for its DHD-owned Wireless Debugging ADB
+connection, app allowlisting, confirmation boundaries, and stop/pause state. A
+request is kept queued on the phone until the developer-mode connection is
+ready; the companion's normal poll is also the heartbeat
 used by the existing desktop-companion recovery card. The companion claims a
 request before starting a turn and releases it if the desktop side fails, so a
 temporary disconnect does not silently lose the user's request. A completed
@@ -38,7 +39,7 @@ phone-tool dispatcher (shared with companion:tools)
 Phone Control Assistant (NDJSON bridge)
         |
         v
-SessionCoordinator -> PolicyEngine -> Shizuku typed argv
+SessionCoordinator -> PolicyEngine -> DHD-owned Wireless Debugging ADB typed argv
 ```
 
 ## Configure Codex
@@ -64,8 +65,8 @@ depending on the PATH inherited by the Codex process.
 
 Guard-region visual checks are an opt-in companion feature. They are hidden
 from the model by default. To expose the additional `guardRegions` fields on
-`dhd_observe`, `dhd_execute`, and `dhd_execute_sequence` across both the MCP
-and App Server tool surfaces, set this before starting the companion:
+`dhd_execute` and `dhd_execute_sequence` across both the MCP and App Server
+tool surfaces, set this before starting the companion:
 
 ```powershell
 $env:PHONE_ASSISTANT_ENABLE_GUARD_REGIONS = "true"
@@ -73,23 +74,35 @@ pnpm companion:dashboard
 ```
 
 Restart the companion after changing the flag. Leave it unset or set it to
-`false` for the normal structural-only observation contract.
+`false` for the normal structural-only observation contract. Guard regions are
+supplied with the action after the agent has inspected an observation; the
+phone compares each requested region with the preceding observation
+screenshot, whether that screenshot came from `dhd_observe` or the previous
+`dhd_execute`.
 
-For the normal wireless path, start the local companion dashboard and pair by
-short code. DHD Settings → Companion connection shows the code. The dashboard
-broadcasts the code on the local network; the phone bridge matches it and
-returns the current phone route and bridge credential to the dashboard. No
-phone IP, port, or token needs to be copied:
+An action rejected with `STALE_OBSERVATION` is returned with
+`inputSent: false`, `approvedObservationId`, `currentObservationId`, and a
+`reasons` array. `GUARD_REGION_CHANGED` refers only to a configured visual
+guard fingerprint; it does not claim that every screenshot pixel was
+compared. Other reason codes identify rotation, display identity or size,
+package, activity, and observation replacement.
+
+For the normal wireless path, start the local companion dashboard and discover
+the phone on the local network. The dashboard starts its worker automatically.
+Select the intended phone in the Connection tab, then approve the one-time
+request in DHD Settings → Companion connection. The phone bridge returns the
+current route and bridge credential only after approval. No phone IP, port,
+token, or pairing code needs to be copied:
 
 ```powershell
 pnpm companion:dashboard
 ```
 
-Open the dashboard at `http://127.0.0.1:8766`, open the Connection tab, enter
-the DHD pairing code, and choose **Pair phone**. The phone and laptop must be
-on the same reachable local network. The phone bridge listens for pairing
-discovery on UDP port `8766` and continues to serve the authenticated bridge
-on TCP port `8765`.
+Open the dashboard at `http://127.0.0.1:8766`, open the Connection tab, choose
+**Refresh phones**, and select a phone. The phone and laptop must be on the
+same reachable local network. The phone bridge listens for discovery and
+approval on UDP port `8766` and continues to serve the authenticated bridge on
+TCP port `8765`.
 
 For a desktop dashboard around the same worker, run this from the repository
 root:
@@ -98,18 +111,16 @@ root:
 pnpm companion:dashboard
 ```
 
-The companion dashboard stores the discovered phone route, device identity,
-pairing code, and bridge credential locally. If the phone receives a new local
-IP, **Check link** can rediscover it using the saved code and restart the
-worker with the new route. The dashboard does not replace the phone-owned
-policy or action layer and does not require Docker or a new dependency
-download.
+The companion dashboard stores the discovered phone route, device identity, and
+bridge credential locally. If the phone receives a new local IP, **Check link**
+can rediscover it by device identity and refresh the saved route. The dashboard
+does not replace the phone-owned policy or action layer and does not require
+Docker or a new dependency download.
 
-The pairing code is a local discovery secret and the bridge credential is
-returned over the local network after the code matches. This is still a
-development protocol without TLS, so use it only on a trusted network and do
-not forward ports `8765` or `8766` from the router to the internet. Refreshing
-the code in DHD revokes the old code.
+The bridge credential is returned over the local network only after the phone
+approves the request. This is still a development protocol without TLS, so use
+it only on a trusted network and do not forward ports `8765` or `8766` from the
+router to the internet.
 
 If a local USB/ADB fallback is useful, start the phone-side app and forward
 its loopback port instead:
@@ -127,9 +138,10 @@ MCP server:
   next action. The returned observation ID is the action's preflight baseline.
 - `dhd_get_foreground_app` — read the current foreground package, activity, and
   display context without taking a screenshot or creating an observation ID.
-  This is read-only context; call `dhd_observe` before any phone action.
-- `dhd_open_app` — open one allowlisted app and return the actual post-action
-  observation.
+  This is read-only context; call `dhd_observe` before phone input. App launch
+  establishes its own pre-launch baseline.
+- `dhd_open_app` — open one allowlisted app without a caller-supplied
+  observation ID and return the actual post-action observation.
 - `dhd_execute` — execute one typed interaction and return the actual
   post-action observation. It handles tap, type, swipe, scroll, back, keypress,
   and wait. If the post-action capture fails, the result is unknown and the
@@ -162,14 +174,15 @@ and warms the same connection in the background, so opening DHD can hide a
 desktop companion restart or crash recovery. Sending a request while warmup is
 in progress simply awaits the same idempotent startup operation.
 
-The first request after each companion process starts creates a fresh DHD thread
-even when the phone supplies a stored thread id. This establishes the current
-DHD tool contract instead of reviving a thread created by an older companion
-version. Successful later requests reuse that newly established loaded thread;
-`thread/resume` is used only for a current-contract thread that is not loaded
-in the active connection. At a three-hour DHD inactivity rotation, the
-companion sends `thread/unsubscribe` for the superseded loaded thread before
-starting the replacement, preventing old subscriptions from accumulating.
+When the phone supplies a stored thread id, a new companion process first tries
+`thread/resume` with the current DHD dynamic-tool contract. This preserves the
+Codex context after a worker restart or a user Stop. If the remote thread
+explicitly cannot be resumed, the companion starts a replacement thread and
+persists its id before `turn/start` so a later Stop can still be continued.
+Successful later requests reuse a loaded thread; at a three-hour DHD
+inactivity rotation, the companion sends `thread/unsubscribe` for the
+superseded loaded thread before starting the replacement, preventing old
+subscriptions from accumulating.
 
 The App Server child starts in a dedicated user runtime directory rather than
 the Phone Control repository: `%USERPROFILE%\\.dhd\\codex-runtime` by default.
@@ -180,11 +193,16 @@ needed. It also uses a dedicated Codex home at
 Authenticate that home once with `CODEX_HOME` pointing to it before starting
 the companion. The companion passes `CODEX_HOME` only to the App Server child,
 so it does not change the desktop Codex process or the parent environment.
-The companion passes minimal App Server config overrides that disable configured
+The repository packages DHD-specific guidance at
+`apps/dhd-companion/codex-home/AGENTS.md`. `pnpm dhd:setup` installs it as
+`AGENTS.md` in the selected Codex home when one is not already present, so fresh
+setups receive the same DHD behavior without inheriting the Phone Control
+repository's instructions. The companion passes minimal App Server config
+overrides that disable configured
 MCP servers, shell execution, apps, browser use, computer use, memories,
 multi-agent tools, plugins, remote plugins, skill search, unified exec, hooks,
-and dependency installation. Project instructions are not capped: the runtime
-can provide its own small `AGENTS.md` for DHD-specific guidance, without
+and dependency installation. Project instructions are not capped, so App
+Server can load the DHD-specific guidance from its isolated Codex home without
 inheriting the Phone Control repository's project instructions.
 It also turns off goals, shell snapshots, image generation, the in-app browser,
 tool suggestions, image viewing, and workspace dependencies for this child.
@@ -253,8 +271,8 @@ accidentally shown as the final result.
 The companion treats `turn/completed` as the App Server transport reaching its
 terminal state, not as independent proof that the user's phone task succeeded.
 The request itself is passed to App Server unchanged; persistent DHD behavior
-belongs in the runtime `AGENTS.md`, while phone capabilities and argument
-constraints belong in the direct tool contracts. A terminal-turn log line means
+belongs in the isolated DHD Codex home's `AGENTS.md`, while phone capabilities
+and argument constraints belong in the direct tool contracts. A terminal-turn log line means
 that Codex stopped producing work; the following `complete_session` call is the
 point at which the phone timeline is closed.
 
@@ -295,7 +313,7 @@ typing, swipes, keypresses, and waits. The foreground notification and the
 in-app timeline show a compact, independently scrollable stack of each action's
 short label, such as “Searching for jollof rice”. Expanding an item reveals its
 target and full safe explanation. When the turn finishes, the companion marks
-the phone session completed. DHD pins its own App Server turns to `gpt-5.6-luna` with `max`
+the phone session completed. DHD pins its own App Server turns to `gpt-6-luna` with `high`
 reasoning by default, independently of the interactive Codex chat's settings.
 The expanded phone composer also exposes a persisted Fast toggle; enabled turns
 send `serviceTier: "priority"` and disabled turns send `serviceTier: "default"`.
@@ -319,16 +337,21 @@ not create a new user-facing conversation or restart the phone session. The
 companion claims queued instructions from the phone, sends `turn/steer` with the
 active `threadId`, `expectedTurnId`, and text input, then acknowledges delivery.
 The steer appears in the local timeline beside the run it modified. Stop remains
-the urgent control: it ends the phone session and the companion propagates a
-`turn/interrupt` to Codex. A tap or swipe already in progress may finish before
-the interrupt is observed, so use Stop when the phone needs immediate attention.
+the urgent control: it ends the current phone session and the companion
+propagates a `turn/interrupt` to Codex. The local conversation and remote thread
+are retained. The Android composer swaps Stop for a **Play** button; Play starts
+a new `turn/start` in that same Codex context with an empty input array, so no
+synthetic user message is added. Typing in the composer swaps Play back to
+**Send**, and that text becomes a normal new turn in the same context. A tap or
+swipe already in progress may finish before the
+interrupt is observed, so use Stop when the phone needs immediate attention.
 
 DHD presents one assistant timeline rather than user-facing chat threads. The
 phone stores requests and tool activity locally and only renders the most recent
 24 hours by default. The companion reuses the stored Codex thread for requests
 within three hours of the last local activity. At or after three hours idle,
 the phone removes that stored remote thread id before handoff, so the next
-request starts a new Codex App Server thread without deleting the local history.
+request starts a new Codex App Server thread and clears the old local history.
 
 This route uses the Codex CLI/App Server's ChatGPT-managed login stored in the
 DHD Codex home and the user's subscription. It does not copy cookies, call

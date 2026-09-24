@@ -18,4 +18,5 @@ class ActionModelsTest {
     fun `guard region rejects inverted geometry`() {
         GuardRegion(left = 680, top = 840, right = 420, bottom = 960)
     }
+
 }

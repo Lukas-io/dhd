@@ -3,6 +3,9 @@ package com.phonecontrol.assistant.policy
 import com.phonecontrol.assistant.domain.ActionMetadata
 import com.phonecontrol.assistant.domain.OpenAppAction
 import com.phonecontrol.assistant.domain.PhoneAction
+import com.phonecontrol.assistant.domain.StaleObservationDiagnostics
+import com.phonecontrol.assistant.domain.StaleObservationReason
+import com.phonecontrol.assistant.domain.StaleObservationReasonCode
 import com.phonecontrol.assistant.domain.TapAction
 
 data class PolicyContext(
@@ -18,6 +21,7 @@ sealed interface PolicyDecision {
     data class Denied(
         val code: DenialCode,
         val message: String,
+        val details: StaleObservationDiagnostics? = null,
     ) : PolicyDecision
 }
 
@@ -44,7 +48,7 @@ class PolicyEngine(
     private val enforceObservationFreshness: Boolean = true,
 ) {
     fun evaluate(action: PhoneAction, context: PolicyContext): PolicyDecision {
-        val metadataError = validateMetadata(action.metadata)
+        val metadataError = validateMetadata(action)
         if (metadataError != null) {
             return PolicyDecision.Denied(DenialCode.INVALID_ACTION_METADATA, metadataError)
         }
@@ -66,7 +70,7 @@ class PolicyEngine(
                     if (action.packageName !in context.enabledPackages) {
                         return PolicyDecision.Denied(
                             DenialCode.APP_NOT_ALLOWED,
-                            "The app ${action.packageName} is not enabled for Phone Control.",
+                            "DHD isn't allowed to control the app ${action.packageName}. User should enable it in the settings.",
                         )
                     }
                 }
@@ -80,14 +84,14 @@ class PolicyEngine(
                     if (foregroundPackage !in context.enabledPackages) {
                         return PolicyDecision.Denied(
                             DenialCode.APP_NOT_ALLOWED,
-                            "The foreground app is not enabled for Phone Control.",
+                            "DHD isn't allowed to control the foreground app. User should enable it in the settings.",
                         )
                     }
                 }
             }
         }
 
-        if (enforceObservationFreshness) {
+        if (enforceObservationFreshness && action !is OpenAppAction) {
             val currentObservationId = context.currentObservationId
                 ?: return PolicyDecision.Denied(
                     DenialCode.OBSERVATION_MISSING,
@@ -97,6 +101,17 @@ class PolicyEngine(
                 return PolicyDecision.Denied(
                     DenialCode.STALE_OBSERVATION,
                     "The action was proposed from an older observation.",
+                    StaleObservationDiagnostics(
+                        approvedObservationId = action.metadata.observationId,
+                        currentObservationId = currentObservationId,
+                        reasons = listOf(
+                            StaleObservationReason(
+                                code = StaleObservationReasonCode.OBSERVATION_REPLACED,
+                                approved = action.metadata.observationId,
+                                current = currentObservationId,
+                            ),
+                        ),
+                    ),
                 )
             }
         }
@@ -107,9 +122,10 @@ class PolicyEngine(
         return PolicyDecision.Allowed
     }
 
-    private fun validateMetadata(metadata: ActionMetadata): String? {
+    private fun validateMetadata(action: PhoneAction): String? {
+        val metadata = action.metadata
         if (metadata.purpose.isBlank()) return "Every action needs a user-facing purpose."
-        if (enforceObservationFreshness && metadata.observationId.isBlank()) {
+        if (enforceObservationFreshness && action !is OpenAppAction && metadata.observationId.isBlank()) {
             return "Every action needs an observation ID."
         }
         if (metadata.targetDescription.isBlank()) return "Every action needs a target description."

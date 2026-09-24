@@ -1,0 +1,189 @@
+package com.phonecontrol.assistant.execution
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class TaskDisplayBackendTest {
+    @Test
+    fun `default spec keeps the fixed task geometry and app density override`() {
+        val spec = TaskDisplaySpec()
+
+        assertEquals(720, spec.width)
+        assertEquals(1_560, spec.height)
+        assertEquals(420, spec.densityDpi)
+        assertEquals(320, spec.appDensityDpi)
+    }
+
+    @Test
+    fun `full-size app layout uses a larger logical canvas without changing stream geometry`() {
+        val standard = TaskDisplaySpec()
+
+        val fullSize = standard.withFullSizeAppLayout(enabled = true)
+
+        assertEquals(standard.width, fullSize.width)
+        assertEquals(standard.height, fullSize.height)
+        assertEquals(standard.densityDpi, fullSize.densityDpi)
+        assertEquals(standard.densityDpi, fullSize.appDensityDpi)
+        assertEquals(945, fullSize.appDisplayWidth)
+        assertEquals(2_048, fullSize.appDisplayHeight)
+    }
+
+    @Test
+    fun `layout matcher identifies the display generation that must be recreated`() {
+        val standard = TaskDisplaySession(
+            sessionKey = "run-standard",
+            taskId = "task-standard",
+            displayId = 7,
+            geometry = TaskDisplayGeometry(720, 1_560, 420, 0),
+            packageName = "com.example.app",
+        )
+        val fullSize = standard.copy(
+            sessionKey = "run-full-size",
+            taskId = "task-full-size",
+            appDisplayWidth = 945,
+            appDisplayHeight = 2_048,
+        )
+
+        assertTrue(taskDisplayAppLayoutMatches(standard, TaskDisplaySpec()))
+        assertTrue(taskDisplayAppLayoutMatches(fullSize, TaskDisplaySpec().withFullSizeAppLayout(true)))
+        assertTrue(!taskDisplayAppLayoutMatches(standard, TaskDisplaySpec().withFullSizeAppLayout(true)))
+    }
+
+    @Test
+    fun `standard app layout remains unchanged when full-size mode is disabled`() {
+        val standard = TaskDisplaySpec()
+
+        assertEquals(standard, standard.withFullSizeAppLayout(enabled = false))
+    }
+
+    @Test
+    fun `display sessions reject the default display`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            TaskDisplaySession(
+                sessionKey = "run-1",
+                taskId = "run-1@0",
+                displayId = 0,
+                geometry = TaskDisplayGeometry(720, 1_560, 420, 0),
+            )
+        }
+    }
+
+    @Test
+    fun `display references are opaque generation-safe values`() {
+        val first = taskDisplayReference("run-1", 7)
+        val same = taskDisplayReference("run-1", 7)
+        val nextGeneration = taskDisplayReference("run-2", 7)
+
+        assertEquals(first, same)
+        assertTrue(first.matches(Regex("dsp_[a-f0-9]{14}")))
+        assertTrue(first != nextGeneration)
+    }
+
+    @Test
+    fun `reused display shows the new app while preserving its native owner`() {
+        val kuda = TaskDisplayRecord(
+            sessionKey = "kuda-owner",
+            taskId = "kuda-owner@12",
+            packageName = "com.kudabank.app",
+            displayId = 12,
+            width = 720,
+            height = 1_560,
+            densityDpi = 420,
+            rotation = 0,
+            status = TaskDisplayStatus.COMPLETED,
+            createdAtEpochMs = 1L,
+        )
+        val displayRef = kuda.displayRef
+
+        val moniepoint = kuda.withOpenedPackage("com.moniepoint.personal")
+        assertEquals("com.moniepoint.personal", moniepoint.packageName)
+        assertEquals("com.kudabank.app", moniepoint.nativePackageName)
+        assertEquals(displayRef, moniepoint.displayRef)
+
+        val switchedBack = moniepoint.withOpenedPackage("com.kudabank.app")
+        assertEquals("com.kudabank.app", switchedBack.packageName)
+        assertEquals("com.kudabank.app", switchedBack.nativePackageName)
+        assertEquals(displayRef, switchedBack.displayRef)
+    }
+
+    @Test
+    fun `terminalization starts retention at the first terminal timestamp`() {
+        val record = TaskDisplayRecord(
+            sessionKey = "run-1",
+            taskId = "run-1@7",
+            packageName = "com.example.app",
+            displayId = 7,
+            width = 720,
+            height = 1_560,
+            densityDpi = 420,
+            rotation = 0,
+            status = TaskDisplayStatus.RUNNING,
+            createdAtEpochMs = 1_000L,
+            lastPurpose = "Preparing request",
+        )
+
+        val completed = record.terminalized(
+            status = TaskDisplayStatus.COMPLETED,
+            terminalAtEpochMs = 5_000L,
+            retentionMs = 30 * 60 * 1_000L,
+        )
+        val retried = completed.terminalized(
+            status = TaskDisplayStatus.STOPPED,
+            terminalAtEpochMs = 99_000L,
+            retentionMs = 30 * 60 * 1_000L,
+        )
+
+        assertEquals(TaskDisplayStatus.COMPLETED, completed.status)
+        assertEquals(5_000L, completed.terminalAtEpochMs)
+        assertEquals(1_805_000L, completed.expiresAtEpochMs)
+        assertEquals("Task complete", completed.lastPurpose)
+        assertEquals(5_000L, retried.terminalAtEpochMs)
+        assertEquals(1_805_000L, retried.expiresAtEpochMs)
+    }
+
+    @Test
+    fun `terminalization sanitizes retained error text`() {
+        val record = TaskDisplayRecord(
+            sessionKey = "run-2",
+            taskId = "run-2@8",
+            packageName = "com.example.app",
+            displayId = 8,
+            width = 720,
+            height = 1_560,
+            densityDpi = 420,
+            rotation = 0,
+            status = TaskDisplayStatus.RUNNING,
+            createdAtEpochMs = 1L,
+        )
+
+        val failed = record.terminalized(
+            status = TaskDisplayStatus.FAILED,
+            terminalAtEpochMs = 2L,
+            retentionMs = 1_000L,
+            error = "  launch failed  ",
+        )
+
+        assertEquals("launch failed", failed.error)
+        assertNotNull(failed.expiresAtEpochMs)
+        assertTrue(failed.status.isTerminal)
+    }
+
+    @Test
+    fun `default closeAllTaskDisplays runs without throwing`() = kotlinx.coroutines.test.runTest {
+        val backend = object : TaskDisplayBackend {
+            override val displayRecords = kotlinx.coroutines.flow.MutableStateFlow<List<TaskDisplayRecord>>(emptyList())
+            override suspend fun create(sessionKey: String, packageName: String, spec: TaskDisplaySpec) = throw UnsupportedOperationException()
+            override suspend fun current(sessionKey: String) = null
+            override suspend fun capture(session: TaskDisplaySession) = throw UnsupportedOperationException()
+            override suspend fun attachLiveSurface(session: TaskDisplaySession, surface: android.view.Surface) = Unit
+            override suspend fun detachLiveSurface(session: TaskDisplaySession, surface: android.view.Surface) = Unit
+            override fun cancel(sessionKey: String) = Unit
+            override suspend fun close(session: TaskDisplaySession) = Unit
+            override suspend fun close(sessionKey: String) = Unit
+        }
+        backend.closeAllTaskDisplays()
+    }
+}

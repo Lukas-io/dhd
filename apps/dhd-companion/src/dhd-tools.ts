@@ -1,10 +1,15 @@
 import { randomUUID } from "node:crypto";
+import { Buffer } from "node:buffer";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import { requestBridge, type BridgeMessage } from "./phone-assistant-bridge.js";
+import {
+  BLOCKING_BRIDGE_TIMEOUT_MS,
+  requestBridge,
+  type BridgeMessage,
+} from "./phone-assistant-bridge.js";
 import {
   DHD_ACTION_TYPES,
   DHD_KEYPRESS_KEYS,
@@ -14,19 +19,36 @@ import {
   DHD_MAX_TEXT_CHARS,
   DHD_MAX_TYPE_TEXT_CHARS,
   DHD_MAX_WAIT_DURATION_MS,
-  DHD_SCROLL_AMOUNTS,
-  DHD_SCROLL_DIRECTIONS,
   dhdToolDescription,
   isGuardRegionsEnabled,
 } from "./dhd-tool-contract.js";
+import {
+  ScreenshotMarkerPresenter,
+  cropScreenshotPng,
+  type ScreenshotMarker,
+  type ScreenshotMarkerObservation,
+  type ScreenshotMarkerPoint,
+  type ScreenshotEvidenceMetadata,
+} from "@dhd/screenshot-markers";
 
 export * from "./dhd-tool-contract.js";
+
+const PHONE_ACCESS_BRIDGE_OPTIONS = {
+  timeoutMs: BLOCKING_BRIDGE_TIMEOUT_MS,
+  keepOpenAfterAccepted: true,
+};
 
 const packageNameSchema = z
   .string()
   .min(1)
   .max(255)
   .regex(/^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$/);
+
+const displayRefSchema = z.string().regex(/^dsp_[a-f0-9]{14}$/);
+
+const displayTargetFields = {
+  displayRef: displayRefSchema.optional(),
+};
 
 const guardRegionSchema = z
   .object({
@@ -57,7 +79,9 @@ function createActionMetadataSchema(
 
 export function createDhdToolSchemas(enableGuardRegions: boolean = isGuardRegionsEnabled()) {
   const actionMetadataSchema = createActionMetadataSchema(enableGuardRegions);
-  const openAppMetadataSchema = createActionMetadataSchema(false);
+  // App launch is setup, not an input against a model-supplied screen. The
+  // phone establishes its own pre-launch baseline before executing it.
+  const openAppMetadataSchema = createActionMetadataSchema(false, false);
   const sequenceActionMetadataSchema = createActionMetadataSchema(
     enableGuardRegions,
     false
@@ -66,6 +90,7 @@ export function createDhdToolSchemas(enableGuardRegions: boolean = isGuardRegion
   const dhdOpenAppInputSchema = z
     .object({
       packageName: packageNameSchema,
+      ...displayTargetFields,
       metadata: openAppMetadataSchema
     })
     .strict();
@@ -82,7 +107,22 @@ export function createDhdToolSchemas(enableGuardRegions: boolean = isGuardRegion
     })
     .strict();
 
-  const dhdGetForegroundAppInputSchema = z.object({}).strict();
+  const dhdSetAppDisplayLayoutInputSchema = z
+    .object({
+      packageName: packageNameSchema,
+      layout: z.enum(["standard", "full_size"]),
+    })
+    .strict();
+
+  const dhdListDisplaysInputSchema = z.object({}).strict();
+
+  const dhdCloseDisplayInputSchema = z
+    .object({
+      displayRef: displayRefSchema,
+    })
+    .strict();
+
+  const dhdGetForegroundAppInputSchema = z.object(displayTargetFields).strict();
 
   const dhdExecuteActionSchema = z.discriminatedUnion("type", [
     z
@@ -113,14 +153,6 @@ export function createDhdToolSchemas(enableGuardRegions: boolean = isGuardRegion
       .strict(),
     z
       .object({
-        type: z.literal(DHD_ACTION_TYPES.scroll),
-        direction: z.enum(DHD_SCROLL_DIRECTIONS),
-        amount: z.enum(DHD_SCROLL_AMOUNTS),
-        metadata: actionMetadataSchema
-      })
-      .strict(),
-    z
-      .object({
         type: z.literal(DHD_ACTION_TYPES.back),
         metadata: actionMetadataSchema
       })
@@ -141,9 +173,17 @@ export function createDhdToolSchemas(enableGuardRegions: boolean = isGuardRegion
       .strict()
   ]);
 
+  const dhdExecuteInputSchema = z
+    .object({
+      ...displayTargetFields,
+      action: dhdExecuteActionSchema,
+    })
+    .strict();
+
   const dhdExecuteSequenceInputSchema = z
     .object({
       observationId: z.string().min(1).max(DHD_MAX_TEXT_CHARS),
+      ...displayTargetFields,
       actions: z.array(
         z.discriminatedUnion("type", [
           z
@@ -174,14 +214,6 @@ export function createDhdToolSchemas(enableGuardRegions: boolean = isGuardRegion
             .strict(),
           z
             .object({
-              type: z.literal(DHD_ACTION_TYPES.scroll),
-              direction: z.enum(DHD_SCROLL_DIRECTIONS),
-              amount: z.enum(DHD_SCROLL_AMOUNTS),
-              metadata: sequenceActionMetadataSchema
-            })
-            .strict(),
-          z
-            .object({
               type: z.literal(DHD_ACTION_TYPES.back),
               metadata: sequenceActionMetadataSchema
             })
@@ -207,12 +239,16 @@ export function createDhdToolSchemas(enableGuardRegions: boolean = isGuardRegion
 
   const dhdObserveInputSchema = z
     .object({
-      expectedPackageName: packageNameSchema.optional(),
       purpose: z.string().min(1).max(DHD_MAX_TEXT_CHARS).optional(),
       targetDescription: z.string().min(1).max(DHD_MAX_TEXT_CHARS).optional(),
-      ...(enableGuardRegions
-        ? { guardRegions: z.array(guardRegionSchema).max(DHD_MAX_GUARD_REGIONS).optional().default([]) }
-        : {})
+      ...displayTargetFields,
+    })
+    .strict();
+
+  const dhdRequestAttentionInputSchema = z
+    .object({
+      reason: z.string().min(1).max(DHD_MAX_TEXT_CHARS),
+      ...displayTargetFields,
     })
     .strict();
 
@@ -220,10 +256,15 @@ export function createDhdToolSchemas(enableGuardRegions: boolean = isGuardRegion
     dhdOpenAppInputSchema,
     dhdListAllowedAppsInputSchema,
     dhdBrowseAppInputSchema,
+    dhdSetAppDisplayLayoutInputSchema,
+    dhdListDisplaysInputSchema,
+    dhdCloseDisplayInputSchema,
     dhdGetForegroundAppInputSchema,
     dhdExecuteActionSchema,
+    dhdExecuteInputSchema,
     dhdObserveInputSchema,
-    dhdExecuteSequenceInputSchema
+    dhdExecuteSequenceInputSchema,
+    dhdRequestAttentionInputSchema,
   };
 }
 
@@ -237,10 +278,15 @@ const defaultDhdToolSchemas = createDhdToolSchemas(isGuardRegionsEnabled());
 export const dhdOpenAppInputSchema = defaultDhdToolSchemas.dhdOpenAppInputSchema;
 export const dhdListAllowedAppsInputSchema = defaultDhdToolSchemas.dhdListAllowedAppsInputSchema;
 export const dhdBrowseAppInputSchema = defaultDhdToolSchemas.dhdBrowseAppInputSchema;
+export const dhdSetAppDisplayLayoutInputSchema = defaultDhdToolSchemas.dhdSetAppDisplayLayoutInputSchema;
+export const dhdListDisplaysInputSchema = defaultDhdToolSchemas.dhdListDisplaysInputSchema;
+export const dhdCloseDisplayInputSchema = defaultDhdToolSchemas.dhdCloseDisplayInputSchema;
 export const dhdGetForegroundAppInputSchema = defaultDhdToolSchemas.dhdGetForegroundAppInputSchema;
 export const dhdExecuteActionSchema = defaultDhdToolSchemas.dhdExecuteActionSchema;
+export const dhdExecuteInputSchema = defaultDhdToolSchemas.dhdExecuteInputSchema;
 export const dhdObserveInputSchema = defaultDhdToolSchemas.dhdObserveInputSchema;
 export const dhdExecuteSequenceInputSchema = defaultDhdToolSchemas.dhdExecuteSequenceInputSchema;
+export const dhdRequestAttentionInputSchema = defaultDhdToolSchemas.dhdRequestAttentionInputSchema;
 
 function parseInput<T>(schema: z.ZodType<T>, input: unknown): T {
   const parsed = schema.safeParse(input);
@@ -252,6 +298,7 @@ function parseInput<T>(schema: z.ZodType<T>, input: unknown): T {
 
 const DHD_SCREENSHOT_MIME_TYPE = "image/png" as const;
 const SCREENSHOT_DATA_URL_PATTERN = /^data:([^;,]+);base64,([\s\S]*)$/i;
+const screenshotMarkerPresenter = new ScreenshotMarkerPresenter();
 
 export interface NormalizedScreenshot {
   base64: string;
@@ -314,9 +361,28 @@ export function normalizeScreenshot(
 }
 
 function withoutScreenshot(message: BridgeMessage): Record<string, unknown> {
-  const copy = { ...message };
+  const copy = sanitizeAgentValue(message) as Record<string, unknown>;
   delete copy.screenshotBase64;
+  delete copy.beforeScreenshotBase64;
+  delete copy.beforeScreenshotMimeType;
+  delete copy.beforeObservation;
+  delete copy.initialPointer;
   return copy;
+}
+
+/** Remove bridge correlation, owner, and native display identifiers before a result reaches Codex. */
+function sanitizeAgentValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeAgentValue);
+  if (!value || typeof value !== "object") return value;
+  const record = value as Record<string, unknown>;
+  const sanitized: Record<string, unknown> = {};
+  for (const [key, nested] of Object.entries(record)) {
+    if (key === "requestId" || key === "taskId" || key === "taskSessionKey" || key === "sessionKey" || key === "displayId") {
+      continue;
+    }
+    sanitized[key] = sanitizeAgentValue(nested);
+  }
+  return sanitized;
 }
 
 type AssistantTextContent = { type: "text"; text: string };
@@ -326,22 +392,255 @@ type AssistantImageContent = {
   mimeType: typeof DHD_SCREENSHOT_MIME_TYPE;
 };
 
+export type PhoneAssistantDebugImage = {
+  type: "image";
+  label: "before" | "after";
+  data: string;
+  mimeType: typeof DHD_SCREENSHOT_MIME_TYPE;
+};
+
+export interface DhdToolInvocationOptions {
+  /** Include dashboard-only before/after screenshots in the diagnostic event. */
+  includeDebugImages?: boolean;
+}
+
 export interface PhoneAssistantToolResult {
   [key: string]: unknown;
   isError?: boolean;
   content: Array<AssistantTextContent | AssistantImageContent>;
   structuredContent?: Record<string, unknown>;
+  /** Never consumed by the model-facing dynamic-tool response. */
+  debugImages?: PhoneAssistantDebugImage[];
 }
 
-export function toMcpResult(message: BridgeMessage, error?: unknown): PhoneAssistantToolResult {
+interface DhdMarkerContext {
+  resetMarker?: boolean;
+  action?: Record<string, unknown>;
+  sequenceActions?: readonly Record<string, unknown>[];
+  initialPointer?: ScreenshotMarkerPoint;
+}
+
+function markerObservation(message: BridgeMessage): ScreenshotMarkerObservation | undefined {
+  const observation = readRecord(message.observation);
+  const observationId = typeof observation.id === "string" ? observation.id : undefined;
+  const displayId = typeof observation.displayId === "number" ? observation.displayId : undefined;
+  const rotation = typeof observation.rotation === "number" ? observation.rotation : undefined;
+  const width = typeof observation.width === "number" ? observation.width : undefined;
+  const height = typeof observation.height === "number" ? observation.height : undefined;
+  if (!observationId || width === undefined || height === undefined) return undefined;
+  return {
+    observationId,
+    displayId,
+    packageName: typeof observation.packageName === "string" ? observation.packageName : undefined,
+    rotation,
+    screenshotDimensions: { width, height },
+  };
+}
+
+function tapPoint(value: Record<string, unknown> | undefined): ScreenshotMarkerPoint | undefined {
+  if (value?.type !== "tap" || !Number.isInteger(value.x) || !Number.isInteger(value.y)) {
+    return undefined;
+  }
+  return { x: value.x as number, y: value.y as number };
+}
+
+function initialPointerPoint(message: BridgeMessage): ScreenshotMarkerPoint | undefined {
+  const pointer = readRecord(message.initialPointer);
+  if (!Number.isInteger(pointer.x) || !Number.isInteger(pointer.y)) return undefined;
+  return { x: pointer.x as number, y: pointer.y as number };
+}
+
+function successfulSequenceTap(
+  message: BridgeMessage,
+  actions: readonly Record<string, unknown>[] | undefined
+): ScreenshotMarkerPoint | undefined {
+  if (!actions) return undefined;
+  const steps = Array.isArray(message.steps) ? message.steps : [];
+  for (let index = steps.length - 1; index >= 0; index -= 1) {
+    const step = readRecord(steps[index]);
+    if (step.status !== "success" || !Number.isInteger(step.index)) continue;
+    const action = actions[step.index as number];
+    const point = tapPoint(action);
+    if (point) return point;
+  }
+  return undefined;
+}
+
+function markerForContext(
+  message: BridgeMessage,
+  context: DhdMarkerContext | undefined
+): ScreenshotMarkerPoint | undefined {
+  if (!context) return undefined;
+  if (context.action) {
+    return message.ok === true ? tapPoint(context.action) : undefined;
+  }
+  return successfulSequenceTap(message, context.sequenceActions);
+}
+
+function renderScreenshot(
+  message: BridgeMessage,
+  screenshot: NormalizedScreenshot,
+  context: DhdMarkerContext | undefined
+): { screenshot: NormalizedScreenshot; marker?: ScreenshotMarker } {
+  const observation = markerObservation(message);
+  if (!observation) return { screenshot };
+  if (context?.resetMarker) {
+    screenshotMarkerPresenter.reset(observation.displayId);
+  }
+  try {
+    const rendered = screenshotMarkerPresenter.render(
+      Buffer.from(screenshot.base64, "base64"),
+      observation,
+      {
+        lastTap: markerForContext(message, context),
+        initialPointer: context?.initialPointer,
+      }
+    );
+    const base64 = Buffer.from(rendered.screenshot).toString("base64");
+    return {
+      screenshot: {
+        base64,
+        mimeType: screenshot.mimeType,
+        dataUrl: `data:${screenshot.mimeType};base64,${base64}`,
+      },
+      marker: rendered.marker,
+    };
+  } catch (error) {
+    console.error(
+      `[phone-assistant-mcp] screenshot marker render failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    return { screenshot };
+  }
+}
+
+export function toMcpResult(
+  message: BridgeMessage,
+  error?: unknown,
+  markerContext?: DhdMarkerContext,
+  options: DhdToolInvocationOptions = {},
+): PhoneAssistantToolResult {
   const isError = Boolean(error) || message.ok === false;
+  if (message.type === "stopped") screenshotMarkerPresenter.reset();
   const content: Array<AssistantTextContent | AssistantImageContent> = [
-    {
-      type: "text",
-      text: JSON.stringify(error ? { ok: false, message: error instanceof Error ? error.message : String(error) } : withoutScreenshot(message))
-    }
+    { type: "text", text: "" }
   ];
-  const screenshot = normalizeScreenshot(message.screenshotBase64, message.screenshotMimeType);
+  let screenshot = normalizeScreenshot(message.screenshotBase64, message.screenshotMimeType);
+  let marker: ScreenshotMarker | undefined;
+  let debugImages: PhoneAssistantDebugImage[] | undefined;
+  let beforeTapImage: NormalizedScreenshot | undefined;
+  let screenshotEvidence: ScreenshotEvidenceMetadata | undefined;
+  let beforeScreenshot: NormalizedScreenshot | undefined;
+  let screenshotRendered = false;
+  const actionTap = markerContext?.action ? tapPoint(markerContext.action) : undefined;
+  if (actionTap || options.includeDebugImages) {
+    try {
+      beforeScreenshot = normalizeScreenshot(
+        message.beforeScreenshotBase64,
+        message.beforeScreenshotMimeType,
+      );
+    } catch (debugError) {
+      console.error(
+        `[phone-assistant-mcp] before-screenshot evidence ignored: ${
+          debugError instanceof Error ? debugError.message : String(debugError)
+        }`,
+      );
+    }
+  }
+  if (beforeScreenshot && screenshot && !error && message.ok === true) {
+    const beforeMessage: BridgeMessage = {
+      ...message,
+      ...(message.beforeObservation !== undefined
+        ? { observation: message.beforeObservation }
+        : {})
+    };
+    const beforeRendered = renderScreenshot(beforeMessage, beforeScreenshot, markerContext);
+    const afterRendered = renderScreenshot(message, screenshot, markerContext);
+    screenshot = afterRendered.screenshot;
+    marker = afterRendered.marker;
+    screenshotRendered = true;
+    if (actionTap) {
+      try {
+        const beforeObservation = markerObservation(beforeMessage);
+        if (!beforeObservation || message.beforeObservation === undefined) {
+          throw new Error("The before observation is missing provenance or screenshot dimensions.");
+        }
+        const crop = cropScreenshotPng(
+          Buffer.from(beforeRendered.screenshot.base64, "base64"),
+          beforeObservation.screenshotDimensions,
+          actionTap,
+        );
+        const cropBase64 = Buffer.from(crop.screenshot).toString("base64");
+        beforeTapImage = {
+          base64: cropBase64,
+          mimeType: beforeRendered.screenshot.mimeType,
+          dataUrl: `data:${beforeRendered.screenshot.mimeType};base64,${cropBase64}`,
+        };
+        screenshotEvidence = {
+          kind: "before_tap_crop",
+          sourceObservationId: beforeObservation.observationId,
+          tap: actionTap,
+          coordinateSpace: "display",
+          crop: crop.bounds,
+        };
+        if (options.includeDebugImages) {
+          debugImages = [
+            {
+              type: "image",
+              label: "before",
+              data: beforeTapImage.base64,
+              mimeType: beforeTapImage.mimeType,
+            },
+            {
+              type: "image",
+              label: "after",
+              data: afterRendered.screenshot.base64,
+              mimeType: afterRendered.screenshot.mimeType,
+            },
+          ];
+        }
+      } catch (evidenceError) {
+        console.error(
+          `[phone-assistant-mcp] before-tap crop failed: ${
+            evidenceError instanceof Error ? evidenceError.message : String(evidenceError)
+          }`,
+        );
+      }
+    } else if (options.includeDebugImages) {
+      debugImages = [
+        {
+          type: "image",
+          label: "before",
+          data: beforeRendered.screenshot.base64,
+          mimeType: beforeRendered.screenshot.mimeType,
+        },
+        {
+          type: "image",
+          label: "after",
+          data: afterRendered.screenshot.base64,
+          mimeType: afterRendered.screenshot.mimeType,
+        },
+      ];
+    }
+  }
+  if (screenshot && !error) {
+    if (!debugImages && !screenshotRendered) {
+      const rendered = renderScreenshot(message, screenshot, markerContext);
+      screenshot = rendered.screenshot;
+      marker = rendered.marker;
+    }
+  }
+  const responseMessage = withoutScreenshot(message);
+  if (marker) responseMessage.screenshotMarker = marker;
+  if (screenshotEvidence) responseMessage.screenshotEvidence = screenshotEvidence;
+  content[0] = {
+    type: "text",
+    text: JSON.stringify(error ? { ok: false, message: error instanceof Error ? error.message : String(error) } : responseMessage)
+  };
+  if (beforeTapImage) {
+    content.push({ type: "image", data: beforeTapImage.base64, mimeType: beforeTapImage.mimeType });
+  }
   if (screenshot) {
     content.push({ type: "image", data: screenshot.base64, mimeType: screenshot.mimeType });
   }
@@ -350,13 +649,18 @@ export function toMcpResult(message: BridgeMessage, error?: unknown): PhoneAssis
     content,
     structuredContent: error
       ? { ok: false, message: error instanceof Error ? error.message : String(error) }
-      : withoutScreenshot(message)
+      : responseMessage,
+    ...(debugImages ? { debugImages } : {})
   };
 }
 
-async function safely(work: () => Promise<BridgeMessage>) {
+async function safely(
+  work: () => Promise<BridgeMessage>,
+  markerContext?: () => DhdMarkerContext | undefined,
+  options: DhdToolInvocationOptions = {},
+) {
   try {
-    return toMcpResult(await work());
+    return toMcpResult(await work(), undefined, markerContext?.(), options);
   } catch (error) {
     console.error(`[phone-assistant-mcp] ${error instanceof Error ? error.message : String(error)}`);
     return toMcpResult({ ok: false }, error);
@@ -372,7 +676,8 @@ async function safely(work: () => Promise<BridgeMessage>) {
  */
 export async function invokeDhdTool(
   name: string,
-  input: unknown
+  input: unknown,
+  options: DhdToolInvocationOptions = {},
 ): Promise<PhoneAssistantToolResult> {
   const schemas = createDhdToolSchemas();
   switch (name) {
@@ -381,6 +686,7 @@ export async function invokeDhdTool(
         const parsed = parseInput(schemas.dhdListAllowedAppsInputSchema, input);
         return requestBridge({
           type: "allowed_apps",
+          tool: "dhd_list_allowed_apps",
           requestId: randomUUID(),
           includeAll: parsed.includeAll
         });
@@ -390,66 +696,146 @@ export async function invokeDhdTool(
         const parsed = parseInput(schemas.dhdBrowseAppInputSchema, input);
         return requestBridge({
           type: "browse_apps",
+          tool: "dhd_browse_app",
           requestId: randomUUID(),
           query: parsed.query
+        });
+        });
+    case "dhd_set_app_display_layout":
+      return safely(() => {
+        const parsed = parseInput(schemas.dhdSetAppDisplayLayoutInputSchema, input);
+        return requestBridge({
+          type: "set_app_display_layout",
+          tool: "dhd_set_app_display_layout",
+          requestId: randomUUID(),
+          packageName: parsed.packageName,
+          layout: parsed.layout,
+        });
+      });
+    case "dhd_list_displays":
+      return safely(() => {
+        parseInput(schemas.dhdListDisplaysInputSchema, input);
+        return requestBridge({
+          type: "list_displays",
+          tool: "dhd_list_displays",
+          requestId: randomUUID(),
+        });
+      });
+    case "dhd_close_display":
+      return safely(() => {
+        const parsed = parseInput(schemas.dhdCloseDisplayInputSchema, input);
+        return requestBridge({
+          type: "close_display",
+          tool: "dhd_close_display",
+          requestId: randomUUID(),
+          displayRef: parsed.displayRef,
         });
       });
     case "dhd_get_foreground_app":
       return safely(() => {
-        parseInput(schemas.dhdGetForegroundAppInputSchema, input);
-        return requestBridge({
-          type: "foreground_app",
-          requestId: randomUUID()
-        });
+        const parsed = parseInput(schemas.dhdGetForegroundAppInputSchema, input);
+        return requestBridge(
+          {
+            type: "foreground_app",
+            tool: "dhd_get_foreground_app",
+            requestId: randomUUID(),
+            ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
+          },
+          PHONE_ACCESS_BRIDGE_OPTIONS,
+        );
       });
     case "dhd_observe":
       return safely(() => {
         const parsed = parseInput(schemas.dhdObserveInputSchema, input);
-        const parsedGuardRegions = (parsed as Record<string, unknown>).guardRegions;
-        const guardRegions = Array.isArray(parsedGuardRegions) && parsedGuardRegions.length > 0
-          ? parsedGuardRegions
-          : undefined;
-        return requestBridge({
-          type: "observe",
-          requestId: randomUUID(),
-          ...(parsed.expectedPackageName ? { expectedPackageName: parsed.expectedPackageName } : {}),
-          ...(parsed.purpose ? { purpose: parsed.purpose } : {}),
-          ...(parsed.targetDescription ? { targetDescription: parsed.targetDescription } : {}),
-          ...(guardRegions ? { guardRegions } : {})
-        });
-      });
+        return requestBridge(
+          {
+            type: "observe",
+            tool: "dhd_observe",
+            requestId: randomUUID(),
+            ...(parsed.purpose ? { purpose: parsed.purpose } : {}),
+            ...(parsed.targetDescription ? { targetDescription: parsed.targetDescription } : {}),
+            ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
+          },
+          PHONE_ACCESS_BRIDGE_OPTIONS,
+        );
+      }, undefined, options);
     case "dhd_open_app":
-      return safely(() => {
+      let openedAction: Record<string, unknown> | undefined;
+      let openedInitialPointer: ScreenshotMarkerPoint | undefined;
+      return safely(async () => {
         const parsed = parseInput(schemas.dhdOpenAppInputSchema, input);
-        return requestBridge({
-          type: "execute_action",
-          requestId: randomUUID(),
-          action: {
-            type: "open_app",
-            packageName: parsed.packageName,
-            metadata: parsed.metadata
-          }
-        });
-      });
+        openedAction = {
+          type: "open_app",
+          packageName: parsed.packageName,
+        };
+        const message = await requestBridge(
+          {
+            type: "execute_action",
+            tool: "dhd_open_app",
+            requestId: randomUUID(),
+            ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
+            action: {
+              type: "open_app",
+              packageName: parsed.packageName,
+              metadata: parsed.metadata
+            }
+          },
+          PHONE_ACCESS_BRIDGE_OPTIONS,
+        );
+        openedInitialPointer = initialPointerPoint(message);
+        return message;
+      }, () => ({
+        resetMarker: true,
+        action: openedAction,
+        initialPointer: openedInitialPointer,
+      }), options);
     case "dhd_execute":
+      let executedAction: Record<string, unknown> | undefined;
       return safely(() => {
-        const action = parseInput(schemas.dhdExecuteActionSchema, readRecord(input).action);
-        return requestBridge({ type: "execute_action", requestId: randomUUID(), action });
-      });
+        const parsed = parseInput(schemas.dhdExecuteInputSchema, input);
+        const action = parsed.action;
+        executedAction = action as unknown as Record<string, unknown>;
+        return requestBridge(
+          {
+            type: "execute_action",
+            tool: "dhd_execute",
+            requestId: randomUUID(),
+            ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
+            action,
+          },
+          PHONE_ACCESS_BRIDGE_OPTIONS,
+        );
+      }, () => ({ action: executedAction }), options);
     case "dhd_execute_sequence":
+      let sequenceActions: readonly Record<string, unknown>[] | undefined;
       return safely(() => {
         const parsed = parseInput(schemas.dhdExecuteSequenceInputSchema, input);
-        return requestBridge({
-          type: "execute_sequence",
-          requestId: randomUUID(),
-          observationId: parsed.observationId,
-          actions: parsed.actions
-        });
-      });
+        sequenceActions = parsed.actions as readonly Record<string, unknown>[];
+        return requestBridge(
+          {
+            type: "execute_sequence",
+            tool: "dhd_execute_sequence",
+            requestId: randomUUID(),
+            observationId: parsed.observationId,
+            ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
+            actions: parsed.actions
+          },
+          PHONE_ACCESS_BRIDGE_OPTIONS,
+        );
+      }, () => ({ sequenceActions }), options);
     case "dhd_request_attention":
       return safely(() => {
-        const reason = parseInput(z.string().min(1).max(DHD_MAX_TEXT_CHARS), readRecord(input).reason);
-        return requestBridge({ type: "request_attention", requestId: randomUUID(), reason });
+        const parsed = parseInput(schemas.dhdRequestAttentionInputSchema, input);
+        return requestBridge(
+          {
+            type: "request_attention",
+            tool: "dhd_request_attention",
+            requestId: randomUUID(),
+            reason: parsed.reason,
+            ...(parsed.displayRef !== undefined ? { displayRef: parsed.displayRef } : {}),
+          },
+          PHONE_ACCESS_BRIDGE_OPTIONS,
+        );
       });
     default:
       throw new Error(`Unknown DHD tool: ${name}`);
@@ -489,6 +875,33 @@ export function createDhdMcpServer(
   );
 
   server.registerTool(
+    "dhd_set_app_display_layout",
+    {
+      description: dhdToolDescription("dhd_set_app_display_layout", enableGuardRegions),
+      inputSchema: schemas.dhdSetAppDisplayLayoutInputSchema.shape,
+    },
+    async (input) => invokeDhdTool("dhd_set_app_display_layout", input),
+  );
+
+  server.registerTool(
+    "dhd_list_displays",
+    {
+      description: dhdToolDescription("dhd_list_displays", enableGuardRegions),
+      inputSchema: schemas.dhdListDisplaysInputSchema.shape,
+    },
+    async (input) => invokeDhdTool("dhd_list_displays", input),
+  );
+
+  server.registerTool(
+    "dhd_close_display",
+    {
+      description: dhdToolDescription("dhd_close_display", enableGuardRegions),
+      inputSchema: schemas.dhdCloseDisplayInputSchema.shape,
+    },
+    async (input) => invokeDhdTool("dhd_close_display", input),
+  );
+
+  server.registerTool(
     "dhd_get_foreground_app",
     {
       description: dhdToolDescription("dhd_get_foreground_app", enableGuardRegions),
@@ -519,7 +932,7 @@ export function createDhdMcpServer(
     "dhd_execute",
     {
       description: dhdToolDescription("dhd_execute", enableGuardRegions),
-      inputSchema: { action: schemas.dhdExecuteActionSchema }
+      inputSchema: schemas.dhdExecuteInputSchema.shape,
     },
     async (input) => invokeDhdTool("dhd_execute", input)
   );
@@ -537,7 +950,7 @@ export function createDhdMcpServer(
     "dhd_request_attention",
     {
       description: dhdToolDescription("dhd_request_attention", enableGuardRegions),
-      inputSchema: { reason: z.string().min(1).max(DHD_MAX_TEXT_CHARS) }
+      inputSchema: schemas.dhdRequestAttentionInputSchema.shape,
     },
     async (input) => invokeDhdTool("dhd_request_attention", input)
   );

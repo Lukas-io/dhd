@@ -1,4 +1,4 @@
-package com.phonecontrol.assistant.shizuku
+package com.phonecontrol.assistant.execution
 
 import android.content.Context
 import android.graphics.Bitmap
@@ -8,9 +8,14 @@ import android.util.DisplayMetrics
 import android.view.Display
 import com.phonecontrol.assistant.domain.GuardRegion
 import com.phonecontrol.assistant.domain.ObservationSnapshot
+import com.phonecontrol.assistant.domain.ScreenProtection
+import com.phonecontrol.assistant.execution.PhoneProcessRunner
+import com.phonecontrol.assistant.execution.TaskDisplayResolution
 import java.nio.ByteBuffer
 import java.security.MessageDigest
+import java.util.LinkedHashMap
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
 
 sealed interface ObservationCaptureResult {
     data class Succeeded(
@@ -18,7 +23,10 @@ sealed interface ObservationCaptureResult {
         val screenshot: ByteArray,
     ) : ObservationCaptureResult
 
-    data class Failed(val message: String) : ObservationCaptureResult
+    data class Failed(
+        val message: String,
+        val code: String = "OBSERVATION_FAILED",
+    ) : ObservationCaptureResult
 }
 
 data class ForegroundAppInfo(
@@ -28,6 +36,7 @@ data class ForegroundAppInfo(
     val rotation: Int,
     val width: Int,
     val height: Int,
+    val screenProtection: ScreenProtection = ScreenProtection.VISIBLE,
 )
 
 sealed interface ForegroundAppResult {
@@ -54,7 +63,7 @@ private val FOCUS_REGEX = Regex(
 )
 
 /**
- * Captures the physical display using the Shizuku shell and records the
+ * Captures the physical display using the selected DHD phone shell and records the
  * package/fingerprint binding needed by the policy layer.
  *
  * This is intentionally a small v0 observer. It does not claim that every
@@ -62,22 +71,86 @@ private val FOCUS_REGEX = Regex(
  * failure is returned to the caller, which decides whether an action may run or
  * whether an already-dispatched action has an unknown outcome.
  */
-class ShizukuObservationProvider(
+class PhoneObservationProvider(
     private val context: Context,
-    private val processRunner: ShizukuProcessRunner,
+    private val processRunner: PhoneProcessRunner,
+    private val taskDisplayBackend: TaskDisplayBackend? = null,
 ) {
+    /**
+     * Keep the compressed capture bytes beside their observation IDs so an
+     * action can define guard regions after observing the screen. The bytes
+     * stay provider-owned rather than becoming part of the domain snapshot.
+     */
+    private val screenshotLock = Any()
+    private val screenshots = object : LinkedHashMap<String, ByteArray>(
+        MAX_RETAINED_SCREENSHOTS + 1,
+        0.75f,
+        true,
+    ) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>?): Boolean =
+            size > MAX_RETAINED_SCREENSHOTS
+    }
+
     /**
      * Read the current focused window without taking a screenshot or creating
      * an observation baseline. This is only situational context; callers must
      * still use capture() before sending any physical input.
      */
-    suspend fun getForegroundApp(): ForegroundAppResult {
-        val focused = when (val result = readFocusedWindowResult()) {
-            is FocusedWindowReadResult.Found -> result.window
+    suspend fun getForegroundApp(
+        taskSessionKey: String? = null,
+        displayId: Int? = null,
+        expectedDisplayRef: String? = null,
+    ): ForegroundAppResult {
+        if (taskSessionKey != null) {
+            val backend = taskDisplayBackend
+                ?: return ForegroundAppResult.Failed(
+                    code = "TASK_DISPLAY_UNAVAILABLE",
+                    message = "The task display is unavailable.",
+                )
+            val session = if (displayId != null) {
+                when (val resolution = backend.resolveDisplay(
+                    displayId = displayId,
+                    claimForSessionKey = taskSessionKey,
+                    expectedDisplayRef = expectedDisplayRef,
+                )) {
+                    is TaskDisplayResolution.Ready -> resolution.target.session
+                    is TaskDisplayResolution.Unavailable -> return ForegroundAppResult.Failed(
+                        code = resolution.code,
+                        message = resolution.message,
+                    )
+                }
+            } else {
+                backend.current(taskSessionKey)
+                    ?: return ForegroundAppResult.Failed(
+                        code = "TASK_DISPLAY_UNAVAILABLE",
+                        message = "The task display is no longer available.",
+                    )
+            }
+            return try {
+                val captured = backend.capture(session)
+                val foreground = captured.foreground
+                foreground.copy(
+                    screenProtection = detectTaskScreenProtection(
+                        screenshot = captured.screenshot,
+                        foreground = foreground,
+                    ),
+                ).let(ForegroundAppResult::Succeeded)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                ForegroundAppResult.Failed(
+                    code = "TASK_DISPLAY_UNAVAILABLE",
+                    message = "Could not read the task display foreground app: ${error.message ?: error::class.java.simpleName}",
+                )
+            }
+        }
+        val focusedRead = when (val result = readFocusedWindowResult()) {
+            is FocusedWindowReadResult.Found -> result
             is FocusedWindowReadResult.Failed -> {
                 return ForegroundAppResult.Failed(result.code, result.message)
             }
         }
+        val focused = focusedRead.window
         val display = context.getSystemService(DisplayManager::class.java)
             ?.getDisplay(Display.DEFAULT_DISPLAY)
             ?: return ForegroundAppResult.Failed(
@@ -105,6 +178,13 @@ class ShizukuObservationProvider(
                 rotation = display.rotation,
                 width = metrics.widthPixels,
                 height = metrics.heightPixels,
+                screenProtection = detectScreenProtection(
+                    screenshot = ByteArray(0),
+                    windowDump = focusedRead.dump,
+                    displayId = Display.DEFAULT_DISPLAY,
+                    packageName = focused.packageName,
+                    activityName = focused.activityName,
+                ),
             ),
         )
     }
@@ -112,20 +192,33 @@ class ShizukuObservationProvider(
     suspend fun capture(
         expectedPackageName: String? = null,
         guardRegions: List<GuardRegion> = emptyList(),
+        taskSessionKey: String? = null,
+        displayId: Int? = null,
+        expectedDisplayRef: String? = null,
     ): ObservationCaptureResult {
+        if (taskSessionKey != null) {
+            return captureTaskDisplay(
+                taskSessionKey = taskSessionKey,
+                expectedPackageName = expectedPackageName,
+                guardRegions = guardRegions,
+                displayId = displayId,
+                expectedDisplayRef = expectedDisplayRef,
+            )
+        }
         val screenshotResult = processRunner.run(listOf("screencap", "-p"))
         if (screenshotResult.timedOut || screenshotResult.exitCode != 0) {
             return ObservationCaptureResult.Failed(
-                "Shizuku screencap failed: ${screenshotResult.stderr.ifBlank { "exit ${screenshotResult.exitCode}" }}",
+                "DHD screenshot capture failed: ${screenshotResult.stderr.ifBlank { "exit ${screenshotResult.exitCode}" }}",
             )
         }
         val screenshot = screenshotResult.stdout
         val bounds = decodeBounds(screenshot)
-            ?: return ObservationCaptureResult.Failed("Shizuku returned an invalid PNG screenshot.")
+            ?: return ObservationCaptureResult.Failed("DHD returned an invalid PNG screenshot.")
         if (bounds.first <= 0 || bounds.second <= 0) {
             return ObservationCaptureResult.Failed("The screenshot has no usable display dimensions.")
         }
-        val focused = readFocusedWindow()
+        val focusedRead = readFocusedWindowResult()
+        val focused = (focusedRead as? FocusedWindowReadResult.Found)?.window
         val packageName = focused?.packageName ?: expectedPackageName
         if (packageName == null) {
             return ObservationCaptureResult.Failed(
@@ -137,6 +230,14 @@ class ShizukuObservationProvider(
                 "The foreground app changed to $packageName; expected $expectedPackageName.",
             )
         }
+
+        val screenProtection = detectScreenProtection(
+            screenshot = screenshot,
+            windowDump = (focusedRead as? FocusedWindowReadResult.Found)?.dump.orEmpty(),
+            displayId = Display.DEFAULT_DISPLAY,
+            packageName = packageName,
+            activityName = focused?.activityName,
+        )
 
         val guardFingerprints = try {
             fingerprintGuards(screenshot, bounds.first, bounds.second, guardRegions)
@@ -156,8 +257,109 @@ class ShizukuObservationProvider(
             height = bounds.second,
             screenshotFingerprint = sha256(screenshot),
             guardFingerprints = guardFingerprints,
+            screenProtection = screenProtection,
         )
+        synchronized(screenshotLock) {
+            screenshots[snapshot.id] = screenshot.copyOf()
+        }
         return ObservationCaptureResult.Succeeded(snapshot, screenshot)
+    }
+
+    private suspend fun captureTaskDisplay(
+        taskSessionKey: String,
+        expectedPackageName: String?,
+        guardRegions: List<GuardRegion>,
+        displayId: Int? = null,
+        expectedDisplayRef: String? = null,
+    ): ObservationCaptureResult {
+        val backend = taskDisplayBackend
+            ?: return ObservationCaptureResult.Failed(
+                message = "The task display is unavailable; refusing to use the physical display.",
+                code = "TASK_DISPLAY_UNAVAILABLE",
+            )
+        val session = if (displayId != null) {
+            when (val resolution = backend.resolveDisplay(
+                displayId = displayId,
+                claimForSessionKey = taskSessionKey,
+                expectedDisplayRef = expectedDisplayRef,
+            )) {
+                is TaskDisplayResolution.Ready -> resolution.target.session
+                is TaskDisplayResolution.Unavailable -> return ObservationCaptureResult.Failed(
+                    message = resolution.message,
+                    code = resolution.code,
+                )
+            }
+        } else {
+            backend.current(taskSessionKey)
+                ?: return ObservationCaptureResult.Failed(
+                    message = "The task display is no longer available; refusing to use the physical display.",
+                    code = "TASK_DISPLAY_UNAVAILABLE",
+                )
+        }
+        val captured = try {
+            backend.capture(session)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            return ObservationCaptureResult.Failed(
+                message = "DHD task display capture failed: ${error.message ?: error::class.java.simpleName}",
+                code = "TASK_DISPLAY_UNAVAILABLE",
+            )
+        }
+        if (captured.taskId != session.taskId) {
+            return ObservationCaptureResult.Failed(
+                "The task display changed while capturing; refusing to bind an action.",
+            )
+        }
+        val screenshot = captured.screenshot
+        val bounds = decodeBounds(screenshot)
+            ?: return ObservationCaptureResult.Failed("DHD returned an invalid task-display PNG screenshot.")
+        if (bounds.first <= 0 || bounds.second <= 0) {
+            return ObservationCaptureResult.Failed("The task-display screenshot has no usable dimensions.")
+        }
+        if (bounds.first != captured.geometry.width || bounds.second != captured.geometry.height) {
+            return ObservationCaptureResult.Failed(
+                "The task-display geometry changed from ${captured.geometry.width}x${captured.geometry.height} to ${bounds.first}x${bounds.second}.",
+            )
+        }
+        val focused = captured.foreground
+        if (expectedPackageName != null && focused.packageName != expectedPackageName) {
+            return ObservationCaptureResult.Failed(
+                "The task foreground app changed to ${focused.packageName}; expected $expectedPackageName.",
+            )
+        }
+        val screenProtection = detectTaskScreenProtection(
+            screenshot = screenshot,
+            foreground = focused,
+        )
+        val guardFingerprints = try {
+            fingerprintGuards(screenshot, bounds.first, bounds.second, guardRegions)
+        } catch (error: IllegalArgumentException) {
+            return ObservationCaptureResult.Failed(error.message ?: "Invalid guard region.")
+        }
+        val snapshot = ObservationSnapshot(
+            id = UUID.randomUUID().toString(),
+            packageName = focused.packageName,
+            activityName = focused.activityName,
+            displayId = focused.displayId,
+            taskSessionKey = taskSessionKey,
+            taskId = captured.taskId,
+            rotation = focused.rotation,
+            width = bounds.first,
+            height = bounds.second,
+            screenshotFingerprint = sha256(screenshot),
+            guardFingerprints = guardFingerprints,
+            screenProtection = screenProtection,
+        )
+        synchronized(screenshotLock) {
+            screenshots[snapshot.id] = screenshot.copyOf()
+        }
+        return ObservationCaptureResult.Succeeded(snapshot, screenshot)
+    }
+
+    /** Return the raw capture for a previously issued observation, if retained. */
+    internal fun screenshotFor(snapshot: ObservationSnapshot): ByteArray? = synchronized(screenshotLock) {
+        screenshots[snapshot.id]?.copyOf()
     }
 
     private suspend fun readFocusedWindow(): FocusedWindow? = when (val result = readFocusedWindowResult()) {
@@ -174,15 +376,36 @@ class ShizukuObservationProvider(
             val detail = result.stderr.ifBlank { "exit ${result.exitCode}" }
             return FocusedWindowReadResult.Failed(
                 code = foregroundFailureCode(detail),
-                message = "Could not read the current foreground app through Shizuku: $detail",
+                message = "Could not read the current foreground app through DHD: $detail",
             )
         }
         val text = result.stdout.toString(Charsets.UTF_8)
-        return parseFocusedWindow(text)?.let(FocusedWindowReadResult::Found)
+        return parseFocusedWindow(text)?.let { focused ->
+            FocusedWindowReadResult.Found(focused, text)
+        }
             ?: FocusedWindowReadResult.Failed(
                 code = "FOREGROUND_UNAVAILABLE",
                 message = "The current foreground app could not be identified.",
             )
+    }
+
+    private suspend fun detectTaskScreenProtection(
+        screenshot: ByteArray,
+        foreground: ForegroundAppInfo,
+    ): ScreenProtection {
+        val result = processRunner.run(listOf("dumpsys", "window"))
+        val dump = if (result.timedOut || result.exitCode != 0) {
+            ""
+        } else {
+            result.stdout.toString(Charsets.UTF_8)
+        }
+        return detectScreenProtection(
+            screenshot = screenshot,
+            windowDump = dump,
+            displayId = foreground.displayId,
+            packageName = foreground.packageName,
+            activityName = foreground.activityName,
+        )
     }
 
     private fun decodeBounds(bytes: ByteArray): Pair<Int, Int>? {
@@ -192,7 +415,7 @@ class ShizukuObservationProvider(
         return options.outWidth to options.outHeight
     }
 
-    private fun fingerprintGuards(
+    internal fun fingerprintGuards(
         bytes: ByteArray,
         width: Int,
         height: Int,
@@ -232,14 +455,16 @@ class ShizukuObservationProvider(
     }
 
     private sealed interface FocusedWindowReadResult {
-        data class Found(val window: FocusedWindow) : FocusedWindowReadResult
+        data class Found(val window: FocusedWindow, val dump: String) : FocusedWindowReadResult
         data class Failed(val code: String, val message: String) : FocusedWindowReadResult
     }
 
     private companion object {
+        private const val MAX_RETAINED_SCREENSHOTS = 64
+
         private fun foregroundFailureCode(detail: String): String = when {
-            detail.contains("Shizuku is unavailable", ignoreCase = true) -> "SHIZUKU_UNAVAILABLE"
-            detail.contains("permission is required", ignoreCase = true) -> "SHIZUKU_PERMISSION_REQUIRED"
+            detail.contains("Wireless Debugging", ignoreCase = true) ||
+                detail.contains("DHD could not execute", ignoreCase = true) -> "DEVELOPER_MODE_UNAVAILABLE"
             else -> "FOREGROUND_UNAVAILABLE"
         }
 

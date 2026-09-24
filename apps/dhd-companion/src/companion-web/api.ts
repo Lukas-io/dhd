@@ -1,4 +1,8 @@
-import type { CompanionJsonValue } from "../companion-events.js";
+import type {
+  CompanionJsonValue,
+  CompanionPlanStep,
+  CompanionTokenUsageMetrics
+} from "../companion-events.js";
 
 export type { CompanionJsonValue } from "../companion-events.js";
 
@@ -10,22 +14,28 @@ export interface CompanionSettingsSnapshot {
   port: number;
   tokenConfigured: boolean;
   pairingConfigured: boolean;
+  /** Safe device identifier used to label the matching discovered phone. */
+  pairedDeviceId?: string;
 }
 
-export interface CompanionSettingsInput {
-  host: string;
-  port: number;
-  /** An empty value keeps the token already saved in the companion. */
-  token?: string;
+export interface PairingDeviceInput {
+  deviceId: string;
+  /** Explicitly request a new phone approval after a saved pairing fails. */
+  replacePairing?: boolean;
 }
 
-export interface PairingInput {
-  code: string;
+/** Safe-to-display discovery metadata; no bridge token or pairing nonce. */
+export interface DiscoveredPhoneSnapshot {
+  deviceId: string;
+  deviceName: string;
+  model?: string;
 }
 
 export interface PhoneSnapshot {
   state: string;
   active: boolean;
+  /** Whether the phone has recently heard from the companion worker. */
+  companionConnected?: boolean;
   sessionId?: string;
   request?: string;
   currentPurpose?: string;
@@ -49,9 +59,14 @@ export interface CompanionToolCallImageContent {
   index: number;
 }
 
+export interface CompanionToolCallDebugImage extends CompanionToolCallImageContent {
+  label: "before" | "after";
+}
+
 export interface CompanionToolCallResponse {
   isError?: boolean;
   images: CompanionToolCallImageContent[];
+  debugImages?: CompanionToolCallDebugImage[];
   structuredContent?: { [key: string]: CompanionJsonValue };
 }
 
@@ -68,6 +83,22 @@ export interface CompanionToolCall {
   error?: string;
 }
 
+export interface CompanionTokenUsageSnapshot extends CompanionTokenUsageMetrics {
+  turnId: string;
+  updatedAt: number;
+  modelContextWindow: number | null;
+  model?: string;
+  serviceTier?: string;
+}
+
+export interface CompanionPlanSnapshot {
+  threadId: string;
+  turnId: string;
+  explanation?: string;
+  steps: CompanionPlanStep[];
+  updatedAt: number;
+}
+
 export interface CompanionState {
   processStatus: CompanionProcessStatus;
   bridgeStatus: BridgeStatus;
@@ -76,6 +107,8 @@ export interface CompanionState {
   lastError?: string;
   logs: CompanionLogEntry[];
   toolCalls: CompanionToolCall[];
+  plan?: CompanionPlanSnapshot;
+  tokenUsage?: CompanionTokenUsageSnapshot;
 }
 
 export interface BridgeCheckResult {
@@ -86,11 +119,9 @@ export interface BridgeCheckResult {
 
 export interface CompanionClientApi {
   getState(): Promise<CompanionState>;
-  saveSettings(input: CompanionSettingsInput): Promise<CompanionState>;
-  pairWithPhone(input: PairingInput): Promise<CompanionState>;
+  discoverPhones(): Promise<DiscoveredPhoneSnapshot[]>;
+  pairWithDiscoveredPhone(input: PairingDeviceInput): Promise<CompanionState>;
   checkConnection(): Promise<BridgeCheckResult>;
-  startCompanion(): Promise<CompanionState>;
-  stopCompanion(): Promise<CompanionState>;
   clearLogs(): Promise<CompanionState>;
   clearToolCalls(): Promise<CompanionState>;
   onState(callback: (state: CompanionState) => void): () => void;
