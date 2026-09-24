@@ -313,7 +313,7 @@ typing, swipes, keypresses, and waits. The foreground notification and the
 in-app timeline show a compact, independently scrollable stack of each action's
 short label, such as “Searching for jollof rice”. Expanding an item reveals its
 target and full safe explanation. When the turn finishes, the companion marks
-the phone session completed. DHD pins its own App Server turns to `gpt-5.6-luna` with `max`
+the phone session completed. DHD pins its own App Server turns to `gpt-6-luna` with `high`
 reasoning by default, independently of the interactive Codex chat's settings.
 The expanded phone composer also exposes a persisted Fast toggle; enabled turns
 send `serviceTier: "priority"` and disabled turns send `serviceTier: "default"`.

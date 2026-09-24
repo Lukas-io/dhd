@@ -184,8 +184,16 @@ interface TokenPricing {
   longContextOutputMultiplier?: number;
 }
 
-const DEFAULT_TOKEN_PRICING_MODEL = "gpt-5.6-luna";
+const DEFAULT_TOKEN_PRICING_MODEL = "gpt-6-luna";
 const TOKEN_PRICING: Record<string, TokenPricing> = {
+  "gpt-6-luna": {
+    inputPerMillion: 0.1,
+    cachedInputPerMillion: 0.01,
+    outputPerMillion: 0.5,
+    longContextThreshold: 272_000,
+    longContextInputMultiplier: 2,
+    longContextOutputMultiplier: 1.5,
+  },
   "gpt-6-astra": {
     inputPerMillion: 10,
     cachedInputPerMillion: 1,

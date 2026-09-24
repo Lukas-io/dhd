@@ -79,8 +79,8 @@ const PREWARM_ATTEMPTS = 2;
 const PREWARM_RETRY_DELAY_MS = 500;
 // DHD owns its App Server conversation settings. These defaults deliberately
 // do not depend on the user's interactive Codex chat or global config.
-const DEFAULT_CODEX_MODEL = "gpt-5.6-luna";
-const DEFAULT_CODEX_EFFORT = "max";
+const DEFAULT_CODEX_MODEL = "gpt-6-luna";
+const DEFAULT_CODEX_EFFORT = "high";
 const DEFAULT_CODEX_SERVICE_TIER = "default";
 const FAST_CODEX_SERVICE_TIER = "priority";
 const CODEX_REASONING_EFFORTS = new Set([
