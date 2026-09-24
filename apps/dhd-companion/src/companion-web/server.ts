@@ -71,18 +71,22 @@ const DEFAULT_WEB_HOST = "127.0.0.1";
 const BRIDGE_CHECK_TIMEOUT_MS = 5_000;
 const BRIDGE_CHECK_TOTAL_TIMEOUT_MS = 15_000;
 const PAIRED_DIRECT_CHECK_TIMEOUT_MS = 2_000;
+const PAIRED_DIRECT_CHECK_ATTEMPTS = 2;
+const BRIDGE_DISCONNECT_GRACE_MS = 30_000;
 const BRIDGE_CHECK_ATTEMPTS = 3;
 const BRIDGE_CHECK_RETRY_DELAYS_MS = [150, 400] as const;
 const COMPANION_DISCONNECT_TIMEOUT_MS = 1_500;
 const AUTOMATIC_REDISCOVERY_COOLDOWN_MS = 15_000;
 const BRIDGE_HEARTBEAT_INTERVAL_MS = 4_000;
-const BRIDGE_OFFLINE_RETRY_DELAYS_MS = [15_000, 30_000, 60_000] as const;
+const BRIDGE_OFFLINE_RETRY_DELAYS_MS = [4_000, 8_000, 15_000] as const;
 const PHONE_DISCOVERY_TIMEOUT_MS = DEFAULT_PHONE_DISCOVERY_TIMEOUT_MS;
 const WORKER_RESTART_DELAY_MS = 1_000;
 
 let connection: ConnectionConfig = initialConnection();
 let worker: ChildProcess | null = null;
 let workerConnection: ConnectionConfig | null = null;
+let workerTransitionInFlight = false;
+let connectionTransitionInFlight: Promise<CompanionState> | undefined;
 let processStatus: CompanionProcessStatus = "stopped";
 let bridgeStatus: BridgeStatus = "unknown";
 let phone: PhoneSnapshot | undefined;
@@ -95,6 +99,10 @@ let bridgeCheckInFlight: Promise<BridgeCheckResult> | undefined;
 let lastAutomaticRediscoveryAt = 0;
 let heartbeatRetryAt = 0;
 let heartbeatFailureCount = 0;
+let consecutiveBridgeCheckFailures = 0;
+let consecutiveUnconfirmedWorkerStatuses = 0;
+let lastSuccessfulBridgeCheckAt = 0;
+let successfulBridgeCheckVersion = 0;
 let dashboardActive = false;
 let workerRestartTimer: NodeJS.Timeout | undefined;
 let discoveredPhoneList: DiscoveredPhone[] = [];
@@ -476,7 +484,7 @@ function getWorkerScript(): { command: string; args: string[] } | null {
 }
 
 function scheduleWorkerRestart(): void {
-  if (!dashboardActive || processStatus === "stopping" || worker || workerRestartTimer) return;
+  if (!dashboardActive || workerTransitionInFlight || processStatus === "stopping" || worker || workerRestartTimer) return;
   appendLog("Companion worker exited unexpectedly; restarting it.", {
     level: "error",
     source: "system",
@@ -489,7 +497,7 @@ function scheduleWorkerRestart(): void {
 }
 
 function ensureWorkerRunning(): void {
-  if (!dashboardActive || processStatus === "stopping") return;
+  if (!dashboardActive || workerTransitionInFlight || processStatus === "stopping") return;
   if (worker && !worker.killed) return;
   if (workerRestartTimer) return;
   startWorker();
@@ -512,8 +520,9 @@ function startWorker(): CompanionState {
   }
 
   processStatus = "starting";
-  bridgeStatus = "unknown";
+  if (bridgeStatus === "offline") bridgeStatus = "unknown";
   lastError = undefined;
+  consecutiveUnconfirmedWorkerStatuses = 0;
   resetHeartbeatRetry();
   appendLog(`Starting companion worker for ${connection.host}:${connection.port}.`, { level: "system", source: "system" });
 
@@ -706,6 +715,7 @@ function awaitBeforeCheckDeadline<T>(operation: Promise<T>, deadlineAt: number |
 function resetHeartbeatRetry(): void {
   heartbeatRetryAt = 0;
   heartbeatFailureCount = 0;
+  consecutiveBridgeCheckFailures = 0;
 }
 
 function scheduleHeartbeatRetry(): void {
@@ -783,6 +793,7 @@ function phoneSnapshot(value: Record<string, unknown>): PhoneSnapshot {
   return {
     state: typeof value.state === "string" ? value.state : "unknown",
     active: value.active === true,
+    ...(typeof value.companionConnected === "boolean" ? { companionConnected: value.companionConnected } : {}),
     ...(typeof value.sessionId === "string" ? { sessionId: value.sessionId } : {}),
     ...(typeof value.request === "string" ? { request: value.request } : {}),
     ...(typeof value.currentPurpose === "string" ? { currentPurpose: value.currentPurpose } : {}),
@@ -833,6 +844,38 @@ async function rediscoverPairedDevice(
     throw new Error("No paired DHD phone answered on the local network. Make sure the phone and computer are on the same network.");
   }
 
+  return connectDiscoveredPairedDevice(target, discovered, deadlineAt);
+}
+
+function workerTargetsConnection(target: ConnectionConfig): boolean {
+  return Boolean(worker && !worker.killed && workerConnection && sameConnection(workerConnection, target));
+}
+
+function recordPhoneStatus(result: BridgeMessage, target: ConnectionConfig): PhoneSnapshot {
+  phone = phoneSnapshot(result);
+  const workerConfirmed = phone.companionConnected === true &&
+    (!dashboardActive || workerTargetsConnection(target));
+  consecutiveUnconfirmedWorkerStatuses = workerConfirmed ? 0 : consecutiveUnconfirmedWorkerStatuses + 1;
+  bridgeStatus = workerConfirmed
+    ? "connected"
+    : consecutiveUnconfirmedWorkerStatuses >= 3 ? "offline" : "checking";
+  lastError = undefined;
+  lastAutomaticRediscoveryAt = 0;
+  lastSuccessfulBridgeCheckAt = Date.now();
+  successfulBridgeCheckVersion += 1;
+  resetHeartbeatRetry();
+  return phone;
+}
+
+function newerConnectionForSamePhone(expected: ConnectionConfig, deviceId: string | undefined): boolean {
+  return Boolean(deviceId) && connection !== expected && connection.deviceId === deviceId && lastSuccessfulBridgeCheckAt > 0;
+}
+
+async function connectDiscoveredPairedDevice(
+  target: ConnectionConfig,
+  discovered: DiscoveredPhone,
+  deadlineAt?: number,
+): Promise<CompanionState> {
   let lastStatusError: unknown;
   const addresses = [...new Set([discovered.host, ...discovered.addresses])];
   for (const host of addresses) {
@@ -846,6 +889,7 @@ async function rediscoverPairedDevice(
       const result = await requestStatusWithRetry(candidate, { deadlineAt });
       return applyPairedConnection(candidate, result, "reconnected", target);
     } catch (error) {
+      if (target.deviceId && newerConnectionForSamePhone(target, target.deviceId)) return snapshot();
       lastStatusError = error;
     }
   }
@@ -855,8 +899,8 @@ async function rediscoverPairedDevice(
 }
 
 function checkConnection(options: { silent?: boolean } = {}): Promise<BridgeCheckResult> {
-  // Startup, the heartbeat, the initial page load, and the manual button can
-  // all ask for the same probe. Share one operation so an older failure cannot
+  // Startup, the heartbeat, and the initial page load can all ask for the same
+  // probe. Share one operation so an older failure cannot
   // overwrite a newer success or produce a misleading red toast.
   if (bridgeCheckInFlight) return bridgeCheckInFlight;
 
@@ -875,6 +919,7 @@ function checkConnection(options: { silent?: boolean } = {}): Promise<BridgeChec
 
 async function performConnectionCheck(options: { silent?: boolean } = {}): Promise<BridgeCheckResult> {
   const target = connection;
+  const successVersionAtStart = successfulBridgeCheckVersion;
   const previousBridgeStatus = bridgeStatus;
   const previousPhone = phone;
   const deadlineAt = Date.now() + BRIDGE_CHECK_TOTAL_TIMEOUT_MS;
@@ -890,7 +935,7 @@ async function performConnectionCheck(options: { silent?: boolean } = {}): Promi
     const result = await requestStatusWithRetry(
       target,
       target.deviceId && target.token
-        ? { deadlineAt, attempts: 1, timeoutMs: PAIRED_DIRECT_CHECK_TIMEOUT_MS }
+        ? { deadlineAt, attempts: PAIRED_DIRECT_CHECK_ATTEMPTS, timeoutMs: PAIRED_DIRECT_CHECK_TIMEOUT_MS }
         : { deadlineAt },
     );
     if (connection !== target) {
@@ -898,25 +943,56 @@ async function performConnectionCheck(options: { silent?: boolean } = {}): Promi
     }
     const nextPhone = phoneSnapshot(result);
     const phoneChanged = JSON.stringify(nextPhone) !== JSON.stringify(previousPhone);
-    phone = nextPhone;
-    bridgeStatus = "connected";
-    lastError = undefined;
-    lastAutomaticRediscoveryAt = 0;
-    resetHeartbeatRetry();
-    if (!options.silent || previousBridgeStatus !== "connected" || phoneChanged) {
+    recordPhoneStatus(result, target);
+    const linkReady = bridgeStatus === "connected";
+    if (!options.silent || previousBridgeStatus !== bridgeStatus || phoneChanged) {
       const requestAvailability = nextPhone.requestAvailable === undefined
         ? ""
         : `; request available: ${nextPhone.requestAvailable}`;
-      appendLog(`Phone bridge check passed; phone session state: ${nextPhone.state}${requestAvailability}.`, { level: "system", source: "bridge" });
+      appendLog(linkReady
+        ? `Phone bridge check passed; phone session state: ${nextPhone.state}${requestAvailability}.`
+        : bridgeStatus === "checking"
+          ? "Phone bridge responds; waiting for the companion worker to connect."
+          : "Phone bridge responds, but the companion worker is not connected.",
+      { level: "system", source: "bridge" });
     } else {
       publishState();
     }
-    return { ok: true, message: "Phone bridge connected.", phone: nextPhone };
+    return {
+      ok: linkReady,
+      message: linkReady
+        ? "Phone companion connected."
+        : bridgeStatus === "checking"
+          ? "Waiting for the companion worker to connect."
+          : "The phone is reachable, but the companion worker is not connected.",
+      phone: nextPhone,
+    };
   } catch (error) {
     if (connection !== target) {
       return { ok: false, message: "Connection settings changed while checking; check the new link." };
     }
+    if (successfulBridgeCheckVersion !== successVersionAtStart) {
+      return {
+        ok: bridgeStatus === "connected",
+        message: "A newer phone connection check has finished.",
+        phone,
+      };
+    }
     const directMessage = errorMessage(error);
+    consecutiveBridgeCheckFailures += 1;
+    const firstMissOnSavedConnection = consecutiveBridgeCheckFailures === 1 &&
+      (previousBridgeStatus === "connected" || (previousBridgeStatus === "unknown" && Boolean(target.token)));
+    const recentSuccess = lastSuccessfulBridgeCheckAt > 0 &&
+      Date.now() - lastSuccessfulBridgeCheckAt < BRIDGE_DISCONNECT_GRACE_MS;
+    if (firstMissOnSavedConnection) {
+      bridgeStatus = "checking";
+      lastError = undefined;
+      appendLog("Phone bridge missed one check; confirming before marking it disconnected.", {
+        level: "info",
+        source: "bridge",
+      });
+      return { ok: false, message: "Rechecking the phone connection after a missed response." };
+    }
     const canRediscover = Date.now() < deadlineAt &&
       Boolean(target.deviceId && target.token) &&
       (!options.silent || Date.now() - lastAutomaticRediscoveryAt >= AUTOMATIC_REDISCOVERY_COOLDOWN_MS);
@@ -936,6 +1012,14 @@ async function performConnectionCheck(options: { silent?: boolean } = {}): Promi
     } else {
       lastError = directMessage;
     }
+    if (recentSuccess && previousBridgeStatus !== "offline") {
+      // Rediscovery can repair a changed address, but a failed network probe
+      // alone does not revoke a recently verified connection.
+      bridgeStatus = "checking";
+      lastError = undefined;
+      publishState();
+      return { ok: false, message: "Rechecking the phone connection after a missed response." };
+    }
     bridgeStatus = "offline";
     if (!options.silent || previousBridgeStatus !== "offline") {
       appendLog(lastError, { level: "error", source: "bridge" });
@@ -952,41 +1036,54 @@ async function applyPairedConnection(
   logVerb: string,
   expectedConnection?: ConnectionConfig,
 ): Promise<CompanionState> {
+  if (connectionTransitionInFlight) {
+    await connectionTransitionInFlight.catch(() => {});
+  }
   if (expectedConnection && connection !== expectedConnection) {
+    if (newerConnectionForSamePhone(expectedConnection, candidate.deviceId)) return snapshot();
     throw new Error("Connection settings changed while rediscovering the phone; keeping the newer settings.");
   }
 
-  const workerTargetMatchesCandidate = !worker || worker.killed ||
-    (workerConnection !== null && sameConnection(workerConnection, candidate));
-  if (sameConnection(connection, candidate) && workerTargetMatchesCandidate) {
-    phone = phoneSnapshot(result);
-    bridgeStatus = "connected";
-    lastError = undefined;
-    lastAutomaticRediscoveryAt = 0;
-    resetHeartbeatRetry();
-    appendLog(`Phone bridge reconnected; state: ${phone.state}.`, { level: "system", source: "bridge" });
-    if (dashboardActive && (!worker || worker.killed)) startWorker();
-    return snapshot();
-  }
+  const operation = (async (): Promise<CompanionState> => {
+    const workerTargetMatchesCandidate = !worker || worker.killed || workerTargetsConnection(candidate);
+    if (sameConnection(connection, candidate) && workerTargetMatchesCandidate) {
+      if (dashboardActive && (!worker || worker.killed)) startWorker();
+      const nextPhone = recordPhoneStatus(result, candidate);
+      appendLog(`Phone bridge reconnected; state: ${nextPhone.state}.`, { level: "system", source: "bridge" });
+      return snapshot();
+    }
 
-  const wasRunning = Boolean(worker && !worker.killed);
-  if (wasRunning) await stopWorker("phone pairing changed", bridgeCheckInFlight);
-  if (expectedConnection && connection !== expectedConnection) {
-    if (dashboardActive || wasRunning) startWorker();
-    throw new Error("Connection settings changed while rediscovering the phone; keeping the newer settings.");
+    workerTransitionInFlight = true;
+    try {
+      const wasRunning = Boolean(worker && !worker.killed);
+      if (wasRunning) await stopWorker("phone pairing changed", bridgeCheckInFlight);
+      if (expectedConnection && connection !== expectedConnection) {
+        if (newerConnectionForSamePhone(expectedConnection, candidate.deviceId)) return snapshot();
+        if (dashboardActive || wasRunning) startWorker();
+        throw new Error("Connection settings changed while rediscovering the phone; keeping the newer settings.");
+      }
+      connection = candidate;
+      await saveConnection();
+      // The worker must use the new address before the UI can report that
+      // this desktop is connected. A status request alone does not renew the
+      // phone's companion presence lease.
+      if (dashboardActive || wasRunning) startWorker();
+      const nextPhone = recordPhoneStatus(result, candidate);
+      appendLog(`Phone pairing ${logVerb}; the companion discovered the phone automatically; state: ${nextPhone.state}.`, {
+        level: "system",
+        source: "bridge",
+      });
+      return snapshot();
+    } finally {
+      workerTransitionInFlight = false;
+    }
+  })();
+  connectionTransitionInFlight = operation;
+  try {
+    return await operation;
+  } finally {
+    if (connectionTransitionInFlight === operation) connectionTransitionInFlight = undefined;
   }
-  connection = candidate;
-  await saveConnection();
-  phone = phoneSnapshot(result);
-  bridgeStatus = "connected";
-  lastError = undefined;
-  lastAutomaticRediscoveryAt = 0;
-  resetHeartbeatRetry();
-  appendLog(`Phone pairing ${logVerb}; the companion discovered the phone automatically.`, { level: "system", source: "bridge" });
-  // The active dashboard owns the worker lifecycle. Always start against the
-  // newly saved target, even if the old worker exited during rediscovery.
-  if (dashboardActive || wasRunning) startWorker();
-  return snapshot();
 }
 
 async function pairWithDiscoveredDevice(value: unknown): Promise<CompanionState> {
@@ -996,13 +1093,27 @@ async function pairWithDiscoveredDevice(value: unknown): Promise<CompanionState>
   const deviceId = (value as { deviceId: string }).deviceId.trim();
   if (!deviceId) throw new Error("A discovered phone must be selected.");
   const expectedConnection = connection;
+  const replacePairing = (value as { replacePairing?: unknown }).replacePairing === true;
+  if (targetHasSavedPairing(expectedConnection, deviceId) && !replacePairing && bridgeStatus === "connected") {
+    return snapshot();
+  }
 
   // Refresh before pairing so the nonce and address belong to a recent LAN
   // response rather than a stale browser list.
   const phones = await discoverPhonesOnNetwork();
   const selected = phones.find((candidate) => candidate.deviceId === deviceId);
   if (!selected) {
+    if (newerConnectionForSamePhone(expectedConnection, deviceId)) return snapshot();
     throw new Error("That phone is no longer visible on the local network. Refresh the phone list and try again.");
+  }
+
+  if (targetHasSavedPairing(expectedConnection, deviceId) && !replacePairing) {
+    try {
+      return await connectDiscoveredPairedDevice(expectedConnection, selected);
+    } catch (error) {
+      if (newerConnectionForSamePhone(expectedConnection, deviceId)) return snapshot();
+      throw new Error(`Could not reconnect with the saved pairing: ${errorMessage(error)} Choose Pair again if the phone no longer accepts this computer.`);
+    }
   }
 
   const offer = await requestPairingApproval(selected);
@@ -1014,6 +1125,10 @@ async function pairWithDiscoveredDevice(value: unknown): Promise<CompanionState>
   };
   const result = await requestStatusWithRetry(candidate);
   return applyPairedConnection(candidate, result, "paired", expectedConnection);
+}
+
+function targetHasSavedPairing(target: ConnectionConfig, deviceId: string): boolean {
+  return target.deviceId === deviceId && Boolean(target.token);
 }
 
 async function readRequestBody(req: http.IncomingMessage): Promise<unknown> {
@@ -1171,7 +1286,7 @@ export function createCompanionWebServer(): http.Server {
     }
 
     if (pathname === "/api/state" && req.method === "GET") {
-      res.writeHead(200, { "Content-Type": "application/json" });
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
       res.end(JSON.stringify(snapshot()));
       return;
     }
@@ -1323,13 +1438,13 @@ function startHeartbeat(): void {
       return;
     }
     if (processStatus !== "running") return;
-    if (bridgeStatus === "checking") return;
+    if (bridgeCheckInFlight) return;
     if (!connection.token) return;
     if (Date.now() < heartbeatRetryAt) return;
     try {
       const result = await checkConnection({ silent: true });
       if (result.ok) resetHeartbeatRetry();
-      else scheduleHeartbeatRetry();
+      else if (bridgeStatus !== "checking") scheduleHeartbeatRetry();
     } catch {
       scheduleHeartbeatRetry();
     }

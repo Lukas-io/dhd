@@ -20,6 +20,8 @@ export interface CompanionSettingsSnapshot {
 
 export interface PairingDeviceInput {
   deviceId: string;
+  /** Explicitly request a new phone approval after a saved pairing fails. */
+  replacePairing?: boolean;
 }
 
 /** Safe-to-display discovery metadata; no bridge token or pairing nonce. */
@@ -32,6 +34,8 @@ export interface DiscoveredPhoneSnapshot {
 export interface PhoneSnapshot {
   state: string;
   active: boolean;
+  /** Whether the phone has recently heard from the companion worker. */
+  companionConnected?: boolean;
   sessionId?: string;
   request?: string;
   currentPurpose?: string;

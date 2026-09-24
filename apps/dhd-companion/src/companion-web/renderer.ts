@@ -12,9 +12,15 @@ import type {
 function createWebApi(): CompanionClientApi {
   return {
     async getState(): Promise<CompanionState> {
-      const res = await fetch("/api/state");
-      if (!res.ok) throw new Error(`Server returned ${res.status}: ${res.statusText}`);
-      return res.json();
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 5_000);
+      try {
+        const res = await fetch("/api/state", { cache: "no-store", signal: controller.signal });
+        if (!res.ok) throw new Error(`Server returned ${res.status}: ${res.statusText}`);
+        return res.json();
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
     },
     async discoverPhones(): Promise<DiscoveredPhoneSnapshot[]> {
       const res = await fetch("/api/discover", { method: "POST" });
@@ -111,15 +117,9 @@ const api: CompanionClientApi = createWebApi();
 const byId = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 
 const elements = {
-  appStatusDetail: byId<HTMLSpanElement>("app-status-detail"),
-  headerTarget: document.getElementById("header-target") as HTMLSpanElement | null,
-  bridgeState: byId<HTMLSpanElement>("bridge-state"),
-  bridgeTarget: byId<HTMLSpanElement>("bridge-target"),
-  phoneState: byId<HTMLSpanElement>("phone-state"),
+  activePhoneRequest: byId<HTMLDivElement>("active-phone-request"),
   phonePurpose: byId<HTMLHeadingElement>("phone-purpose"),
   phoneRequest: byId<HTMLPreElement>("phone-request"),
-  processState: byId<HTMLSpanElement>("process-state"),
-  tokenState: byId<HTMLSpanElement>("token-state"),
   tokenUsagePopover: byId<HTMLDivElement>("token-usage-popover"),
   tokenUsageTrigger: byId<HTMLButtonElement>("token-usage-trigger"),
   tokenUsageTriggerTotal: byId<HTMLSpanElement>("token-usage-trigger-total"),
@@ -134,7 +134,6 @@ const elements = {
   tokenEstimatedCost: byId<HTMLElement>("token-estimated-cost"),
   tokenPricingBreakdown: byId<HTMLDivElement>("token-pricing-breakdown"),
   tokenUsageMeta: byId<HTMLDivElement>("token-usage-meta"),
-  lastError: byId<HTMLDivElement>("last-error"),
   sessionBadge: byId<HTMLSpanElement>("session-badge"),
   logCount: byId<HTMLSpanElement>("log-count"),
   logCountBadge: byId<HTMLSpanElement>("log-count-badge"),
@@ -158,7 +157,6 @@ const elements = {
   discoveryStatus: byId<HTMLSpanElement>("discovery-status"),
   discoveredPhones: byId<HTMLDivElement>("discovered-phones"),
   toolsTab: byId<HTMLElement>("tab-tools"),
-  check: byId<HTMLButtonElement>("check-connection"),
   logList: byId<HTMLDivElement>("log-list"),
   logScrollContainer: byId<HTMLDivElement>("log-scroll-container"),
   toast: byId<HTMLDivElement>("toast"),
@@ -250,35 +248,7 @@ const TOAST_ICONS = {
 };
 
 const SPINNER_SVG = `<svg class="btn-svg spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10" stroke-opacity="0.25" stroke="currentColor" fill="none"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-linecap="round"/></svg>`;
-const CHECK_CONNECTION_BUTTON_HTML = elements.check.innerHTML;
 const CHECK_REQUEST_TIMEOUT_MS = 18_000;
-
-function setCheckButtonLoading(loading: boolean): void {
-  const alreadyLoading = elements.check.querySelector(".spinner") !== null;
-  if (loading && !alreadyLoading) {
-    elements.check.innerHTML = `${SPINNER_SVG}<span>Checking...</span>`;
-  } else if (!loading && alreadyLoading) {
-    elements.check.innerHTML = CHECK_CONNECTION_BUTTON_HTML;
-  }
-  elements.check.disabled = loading;
-}
-
-async function withButtonLoading<T>(
-  button: HTMLButtonElement,
-  loadingText: string,
-  action: () => Promise<T>
-): Promise<T> {
-  const originalHtml = button.innerHTML;
-  const originalDisabled = button.disabled;
-  button.disabled = true;
-  button.innerHTML = `${SPINNER_SVG}<span>${loadingText}</span>`;
-  try {
-    return await action();
-  } finally {
-    button.innerHTML = originalHtml;
-    button.disabled = originalDisabled;
-  }
-}
 
 function formatTime(timestamp: number): string {
   return new Intl.DateTimeFormat(undefined, {
@@ -885,64 +855,50 @@ function renderTokenUsage(
     : "No App Server token usage reported yet.";
 }
 
+let stateRenderVersion = 0;
+let lastRenderedState: string | undefined;
+let serverUnavailable = false;
+let stateSyncFailures = 0;
+
 function render(next: CompanionState): void {
-  const targetStr = `${next.settings.host}:${next.settings.port}`;
-  if (elements.headerTarget) elements.headerTarget.textContent = targetStr;
-
-  elements.appStatusDetail.textContent = next.processStatus === "running"
-    ? "worker active // listening"
-    : next.processStatus === "starting"
-      ? "worker starting"
-      : next.processStatus === "stopping"
-        ? "worker stopping"
-        : next.processStatus === "error"
-          ? "worker error"
-          : "worker offline";
-
-  setText(elements.bridgeState, next.bridgeStatus.toUpperCase());
-  elements.bridgeState.className = `state-badge font-mono ${next.bridgeStatus}`;
-
-  setText(elements.bridgeTarget, targetStr);
-  setText(elements.processState, next.processStatus.toUpperCase());
-  elements.processState.className = `state-badge font-mono ${next.processStatus}`;
-
-  const isPaired = next.settings.pairingConfigured;
-  const isManual = next.settings.tokenConfigured;
+  serverUnavailable = false;
+  stateSyncFailures = 0;
+  const serializedState = JSON.stringify(next);
+  if (serializedState === lastRenderedState) return;
+  stateRenderVersion += 1;
   pairedDeviceId = next.settings.pairedDeviceId;
-
-  setText(elements.tokenState, isPaired ? "PAIRED" : isManual ? "MANUAL" : "NOT_CONFIGURED");
+  latestBridgeStatus = next.bridgeStatus;
 
   if (elements.connectionStatusPill) {
-    if (isPaired) {
-      elements.connectionStatusPill.textContent = "PAIRED";
+    if (next.bridgeStatus === "connected") {
+      elements.connectionStatusPill.textContent = "PHONE CONNECTED";
       elements.connectionStatusPill.className = "state-badge font-mono connected";
-    } else if (isManual) {
-      elements.connectionStatusPill.textContent = "MANUAL TOKEN";
-      elements.connectionStatusPill.className = "state-badge font-mono connected";
+    } else if (next.bridgeStatus === "checking" || isCheckingSavedPhone()) {
+      elements.connectionStatusPill.textContent = "CHECKING PHONE";
+      elements.connectionStatusPill.className = "state-badge font-mono checking";
     } else {
-      elements.connectionStatusPill.textContent = "NOT PAIRED";
+      elements.connectionStatusPill.textContent = "PHONE NOT CONNECTED";
       elements.connectionStatusPill.className = "state-badge font-mono stopped";
     }
   }
 
   const phoneState = next.phone;
   const isPhoneActive = phoneState?.active === true;
-  setText(elements.phoneState, (phoneState?.state ?? "NOT_CHECKED").toUpperCase());
   setText(elements.phonePurpose, phoneState?.currentPurpose || (isPhoneActive ? "Active Phone Session" : "Waiting for phone session..."));
   setText(elements.phoneRequest, phoneState?.request || "No active request reported by the phone.");
+  elements.activePhoneRequest.hidden = !isPhoneActive;
 
   elements.sessionBadge.textContent = isPhoneActive ? (phoneState?.state ?? "ACTIVE").toUpperCase() : "IDLE";
   elements.sessionBadge.className = `state-badge font-mono ${isPhoneActive ? "active" : ""}`;
 
-  elements.lastError.textContent = next.lastError || "";
-  elements.lastError.hidden = !next.lastError;
-  setCheckButtonLoading(next.bridgeStatus === "checking");
   renderDiscoveredPhones();
+  updateDiscoveryStatus();
 
   renderLogs(next.logs);
   renderPlan(next.plan);
   renderToolCalls(next.toolCalls);
   renderTokenUsage(next.tokenUsage, isPhoneActive);
+  lastRenderedState = serializedState;
 }
 
 function hideToast(): void {
@@ -993,48 +949,131 @@ function runConnectionCheck(): BridgeCheckPromise {
 }
 
 async function refreshState(options: { verifyConnection?: boolean } = {}): Promise<void> {
+  const version = stateRenderVersion;
   const state = await api.getState();
+  if (version !== stateRenderVersion) return;
   render(state);
   // Verify once on every page load so a previous offline result cannot remain
   // visible forever after the phone comes back. Calls made after an explicit
   // action keep the existing behavior and only probe an unknown connection.
-  const shouldVerify = options.verifyConnection === true || state.bridgeStatus === "unknown";
+  const shouldVerify = state.bridgeStatus === "unknown" ||
+    (options.verifyConnection === true && state.bridgeStatus !== "connected");
   if (shouldVerify && (state.settings.tokenConfigured || state.settings.pairingConfigured)) {
     const checkingState = { ...state, bridgeStatus: "checking" as const, lastError: undefined };
-    render(checkingState);
+    if (state.bridgeStatus !== "connected") render(checkingState);
+    const pendingRenderVersion = stateRenderVersion;
     void runConnectionCheck()
       .then(async (result) => {
         try {
-          render(await api.getState());
+          const checkedState = await api.getState();
+          if (stateRenderVersion === pendingRenderVersion) render(checkedState);
         } catch {
-          render({
-            ...checkingState,
-            bridgeStatus: result.ok ? "connected" : "offline",
-            ...(result.ok ? {} : { lastError: result.message }),
-          });
+          if (stateRenderVersion === pendingRenderVersion) {
+            render({
+              ...checkingState,
+              bridgeStatus: result.ok ? "connected" : "offline",
+              ...(result.ok ? {} : { lastError: result.message }),
+            });
+          }
         }
       })
       .catch((error: unknown) => {
-        render({
-          ...checkingState,
-          bridgeStatus: "offline",
-          lastError: error instanceof Error ? error.message : String(error),
-        });
+        if (stateRenderVersion === pendingRenderVersion) {
+          render({
+            ...checkingState,
+            bridgeStatus: "offline",
+            lastError: error instanceof Error ? error.message : String(error),
+          });
+        }
       });
   }
 }
 
 let discoveredPhoneList: DiscoveredPhoneSnapshot[] = [];
 let pairingDeviceId: string | undefined;
+let repairDeviceId: string | undefined;
 let pairedDeviceId: string | undefined;
+let latestBridgeStatus: CompanionState["bridgeStatus"] = "unknown";
 let discoveryInFlight: Promise<void> | undefined;
+let discoveryFinished = false;
+const discoverButtonIdleHtml = elements.discoverPhones.innerHTML;
+
+function isCheckingSavedPhone(): boolean {
+  return Boolean(pairedDeviceId) &&
+    (latestBridgeStatus === "checking" || latestBridgeStatus === "unknown");
+}
+
+let stateSyncInFlight: Promise<void> | undefined;
+
+function syncState(): Promise<void> {
+  if (stateSyncInFlight) return stateSyncInFlight;
+  const version = stateRenderVersion;
+  const operation = api.getState().then((state) => {
+    stateSyncFailures = 0;
+    // An event or action can render a newer state while this request is on the
+    // wire. The next sync can reconcile it without repainting stale data now.
+    if (version === stateRenderVersion) render(state);
+  }).catch((error: unknown) => {
+    if (version === stateRenderVersion && ++stateSyncFailures >= 2 && !serverUnavailable) {
+      serverUnavailable = true;
+      stateRenderVersion += 1;
+      lastRenderedState = undefined;
+      if (elements.connectionStatusPill) {
+        elements.connectionStatusPill.textContent = "COMPANION UNAVAILABLE";
+        elements.connectionStatusPill.className = "state-badge font-mono stopped";
+      }
+      elements.discoverPhones.disabled = true;
+      elements.discoveryStatus.textContent = "Reconnecting to the desktop companion...";
+      elements.discoveredPhones.replaceChildren();
+    }
+    throw error;
+  });
+  stateSyncInFlight = operation;
+  void operation.finally(() => {
+    if (stateSyncInFlight === operation) stateSyncInFlight = undefined;
+  }).catch(() => {});
+  return operation;
+}
+
+function updateDiscoverButton(): void {
+  const searching = Boolean(discoveryInFlight) || isCheckingSavedPhone();
+  elements.discoverPhones.disabled = searching || serverUnavailable;
+  elements.discoverPhones.innerHTML = searching
+    ? `${SPINNER_SVG}<span>Searching...</span>`
+    : discoverButtonIdleHtml;
+}
 
 function renderDiscoveredPhones(): void {
   elements.discoveredPhones.replaceChildren();
   if (discoveredPhoneList.length === 0) {
+    if (!discoveryFinished) return;
     const empty = document.createElement("div");
-    empty.className = "discovery-empty font-mono";
-    empty.textContent = "No DHD phones found yet. Make sure the phone and computer are on the same local network.";
+    empty.className = "discovery-empty";
+    const title = document.createElement("p");
+    title.className = "discovery-empty-title";
+    const checkingSavedPhone = isCheckingSavedPhone();
+    title.textContent = latestBridgeStatus === "connected"
+      ? "Phone connected"
+      : checkingSavedPhone ? "Checking saved phone" : "No phones found";
+    empty.append(title);
+    if (latestBridgeStatus === "connected" || checkingSavedPhone) {
+      const message = document.createElement("p");
+      message.className = "discovery-connected-copy";
+      message.textContent = latestBridgeStatus === "connected"
+        ? "DHD is responding. Nearby search only lists phones available to pair."
+        : "Confirming the saved connection. This may take a moment.";
+      empty.append(message);
+      elements.discoveredPhones.append(empty);
+      return;
+    }
+
+    const steps = document.createElement("ul");
+    const openApp = document.createElement("li");
+    openApp.textContent = "Make sure DHD is open on your phone.";
+    const sameNetwork = document.createElement("li");
+    sameNetwork.textContent = "Connect both devices to the same Wi-Fi, or connect this computer to your phone's hotspot.";
+    steps.append(openApp, sameNetwork);
+    empty.append(steps);
     elements.discoveredPhones.append(empty);
     return;
   }
@@ -1051,19 +1090,26 @@ function renderDiscoveredPhones(): void {
     const model = document.createElement("div");
     model.className = "discovered-phone-model font-mono";
     model.textContent = phone.model || "DHD phone on local network";
-    details.append(name, model);
+    details.append(name);
+    if (!phone.model || !phone.deviceName.toLowerCase().includes(phone.model.toLowerCase())) {
+      details.append(model);
+    }
 
+    const isSavedPhone = phone.deviceId === pairedDeviceId;
+    const isConnectedPhone = isSavedPhone && latestBridgeStatus === "connected";
+    const isCheckingPhone = isSavedPhone && isCheckingSavedPhone();
     const pairButton = document.createElement("button");
     pairButton.type = "button";
-    pairButton.className = "action-btn secondary small discovered-phone-pair";
-    const isPairedPhone = phone.deviceId === pairedDeviceId;
-    pairButton.disabled = pairingDeviceId !== undefined || isPairedPhone;
-    pairButton.textContent = isPairedPhone
-      ? "Paired"
+    pairButton.className = `action-btn ${isConnectedPhone ? "secondary" : "primary"} small discovered-phone-pair`;
+    pairButton.disabled = pairingDeviceId !== undefined || isConnectedPhone || isCheckingPhone;
+    pairButton.textContent = isConnectedPhone
+      ? "Connected"
+      : isCheckingPhone
+        ? "Checking..."
       : pairingDeviceId === phone.deviceId
-        ? "Approve on phone"
-        : "Pair";
-    if (!isPairedPhone) {
+        ? repairDeviceId === phone.deviceId || !isSavedPhone ? "Approve on phone" : "Reconnecting..."
+        : repairDeviceId === phone.deviceId ? "Pair again" : isSavedPhone ? "Reconnect" : "Pair";
+    if (!isConnectedPhone) {
       pairButton.addEventListener("click", () => {
         void pairDiscoveredPhone(phone);
       });
@@ -1074,27 +1120,40 @@ function renderDiscoveredPhones(): void {
   }
 }
 
+function updateDiscoveryStatus(): void {
+  updateDiscoverButton();
+  if (latestBridgeStatus === "connected") {
+    elements.discoveryStatus.textContent = "Phone connected.";
+    return;
+  }
+  if (!discoveryFinished || discoveryInFlight || pairingDeviceId) return;
+  elements.discoveryStatus.textContent = discoveredPhoneList.length === 0
+    ? isCheckingSavedPhone() ? "Checking saved phone..." : "No phones answered."
+    : `${discoveredPhoneList.length} phone${discoveredPhoneList.length === 1 ? "" : "s"} found.`;
+}
+
 async function discoverPhonesOnNetwork(): Promise<void> {
   if (discoveryInFlight) return discoveryInFlight;
   const operation = (async () => {
     elements.discoveryStatus.textContent = "Searching the local network...";
     try {
       discoveredPhoneList = await api.discoverPhones();
+      discoveryFinished = true;
       renderDiscoveredPhones();
-      elements.discoveryStatus.textContent = discoveredPhoneList.length === 0
-        ? "No phones answered."
-        : `${discoveredPhoneList.length} phone${discoveredPhoneList.length === 1 ? "" : "s"} found.`;
     } catch (error) {
       elements.discoveryStatus.textContent = "Discovery failed.";
       throw error;
     }
   })();
   discoveryInFlight = operation;
+  updateDiscoverButton();
   try {
-    await withButtonLoading(elements.discoverPhones, "Searching...", async () => operation);
+    await operation;
   } finally {
     if (discoveryInFlight === operation) discoveryInFlight = undefined;
+    updateDiscoverButton();
   }
+  updateDiscoveryStatus();
 }
 
 function setTokenUsagePopoverOpen(open: boolean): void {
@@ -1234,20 +1293,40 @@ if (themeToggle) {
 
 async function pairDiscoveredPhone(phone: DiscoveredPhoneSnapshot): Promise<void> {
   if (pairingDeviceId) return;
+  if (phone.deviceId === pairedDeviceId && latestBridgeStatus === "connected") return;
+  const reconnecting = phone.deviceId === pairedDeviceId && repairDeviceId !== phone.deviceId;
+  const replacePairing = repairDeviceId === phone.deviceId;
   pairingDeviceId = phone.deviceId;
-  elements.discoveryStatus.textContent = "Approve the connection request on your phone.";
+  elements.discoveryStatus.textContent = reconnecting
+    ? "Reconnecting with your saved pairing..."
+    : "Approve the connection request on your phone.";
   renderDiscoveredPhones();
   try {
-    render(await api.pairWithDiscoveredPhone({ deviceId: phone.deviceId }));
-    discoveredPhoneList = [];
+    const responseState = await api.pairWithDiscoveredPhone({
+      deviceId: phone.deviceId,
+      ...(replacePairing ? { replacePairing: true } : {}),
+    });
+    const currentState = await api.getState().catch(() => responseState);
+    render(currentState);
+    repairDeviceId = undefined;
     renderDiscoveredPhones();
-    elements.discoveryStatus.textContent = `Paired with ${phone.deviceName}.`;
-    showToast(`Paired with ${phone.deviceName}.`, "success");
+    if (currentState.bridgeStatus === "connected") {
+      elements.discoveryStatus.textContent = "Phone connected.";
+      showToast(reconnecting ? `Reconnected to ${phone.deviceName}.` : `Paired with ${phone.deviceName}.`, "success");
+    }
   } catch (error) {
+    const currentState = await api.getState().catch(() => undefined);
+    if (currentState?.settings.pairedDeviceId === phone.deviceId && currentState.bridgeStatus === "connected") {
+      repairDeviceId = undefined;
+      render(currentState);
+      return;
+    }
+    if (reconnecting) repairDeviceId = phone.deviceId;
     showToast(error instanceof Error ? error.message : String(error), "error");
   } finally {
     pairingDeviceId = undefined;
     renderDiscoveredPhones();
+    updateDiscoveryStatus();
   }
 }
 
@@ -1259,30 +1338,24 @@ elements.discoverPhones.addEventListener("click", async () => {
   }
 });
 
-elements.check.addEventListener("click", async () => {
-  try {
-    let checkResult: { ok: boolean; message: string } | undefined;
-    await withButtonLoading(elements.check, "Checking...", async () => {
-      checkResult = await runConnectionCheck();
-      // The bridge result is authoritative for the toast. A separate UI
-      // refresh must not turn a successful phone probe into a red error.
-      await refreshState().catch((error: unknown) => {
-        console.warn("Could not refresh companion state after checking the phone link:", error);
-      });
-    });
-    if (checkResult) {
-      showToast(checkResult.message, checkResult.ok ? "success" : "error");
-    }
-  } catch (error) {
-    showToast(error instanceof Error ? error.message : String(error), "error");
-  }
-});
-
 api.onState(render);
 renderDiscoveredPhones();
-void discoverPhonesOnNetwork().catch((error: unknown) => {
-  showToast(error instanceof Error ? error.message : String(error), "error");
-});
 void refreshState({ verifyConnection: true }).catch((error: unknown) => {
   showToast(error instanceof Error ? error.message : String(error), "error");
+}).finally(() => {
+  void discoverPhonesOnNetwork().catch((error: unknown) => {
+    showToast(error instanceof Error ? error.message : String(error), "error");
+  });
+});
+
+// EventSource reconnects on its own, but an interrupted stream can leave a
+// still-open page behind the phone. Reconcile from the server while visible.
+window.setInterval(() => {
+  if (!document.hidden) void syncState().catch(() => {});
+}, 5_000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) void syncState().catch(() => {});
+});
+window.addEventListener("focus", () => {
+  void syncState().catch(() => {});
 });
