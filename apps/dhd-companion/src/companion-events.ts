@@ -164,38 +164,45 @@ export function isCompanionPlanEvent(value: unknown): value is CompanionPlanEven
   });
 }
 
+export type CompanionEvent =
+  | CompanionToolCallEvent
+  | CompanionTokenUsageEvent
+  | CompanionPlanEvent;
+
+export type CompanionEventSink = (event: CompanionEvent) => void;
+
 /**
  * The dashboard may run the worker as a direct command without an IPC parent.
  * Diagnostics are intentionally best-effort: an unavailable or broken event
  * channel must never change phone-tool behavior.
  */
-export function emitCompanionToolCallEvent(
-  event: CompanionToolCallEvent,
-): void {
+export const ipcCompanionEventSink: CompanionEventSink = (event) => {
   if (typeof process.send !== "function" || process.connected === false) return;
   try {
     process.send(event, () => undefined);
   } catch {
     // The worker must continue even when the dashboard has gone away.
   }
+};
+
+let companionEventSink: CompanionEventSink = ipcCompanionEventSink;
+
+export function setCompanionEventSink(sink: CompanionEventSink): void {
+  companionEventSink = sink;
+}
+
+export function emitCompanionToolCallEvent(
+  event: CompanionToolCallEvent,
+): void {
+  companionEventSink(event);
 }
 
 export function emitCompanionTokenUsageEvent(
   event: CompanionTokenUsageEvent,
 ): void {
-  if (typeof process.send !== "function" || process.connected === false) return;
-  try {
-    process.send(event, () => undefined);
-  } catch {
-    // The worker must continue even when the dashboard has gone away.
-  }
+  companionEventSink(event);
 }
 
 export function emitCompanionPlanEvent(event: CompanionPlanEvent): void {
-  if (typeof process.send !== "function" || process.connected === false) return;
-  try {
-    process.send(event, () => undefined);
-  } catch {
-    // The worker must continue even when the dashboard has gone away.
-  }
+  companionEventSink(event);
 }
