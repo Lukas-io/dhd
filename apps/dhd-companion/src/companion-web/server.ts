@@ -46,7 +46,7 @@ import type {
   DiscoveredPhoneSnapshot,
 } from "./api.js";
 
-interface ConnectionConfig {
+export interface ConnectionConfig {
   host: string;
   port: number;
   token: string;
@@ -130,11 +130,11 @@ function settingsPath(): string {
   return join(homedir(), ".dhd", "companion-connection.json");
 }
 
-async function loadConnection(): Promise<ConnectionConfig> {
+export async function loadConnection(path = settingsPath()): Promise<ConnectionConfig> {
   const defaults = initialConnection();
   let stored: StoredConnectionSettings = {};
   try {
-    stored = JSON.parse(await readFile(settingsPath(), "utf8")) as StoredConnectionSettings;
+    stored = JSON.parse(await readFile(path, "utf8")) as StoredConnectionSettings;
   } catch {
     // Default configuration if settings file does not exist
   }
@@ -247,7 +247,7 @@ function removeToolImages(callId: string): void {
   }
 }
 
-function toJsonValue(value: unknown): CompanionJsonValue {
+export function toJsonValue(value: unknown): CompanionJsonValue {
   if (value === null) return null;
   if (typeof value === "string" || typeof value === "boolean") return value;
   if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
@@ -262,7 +262,7 @@ function toJsonValue(value: unknown): CompanionJsonValue {
   return String(value);
 }
 
-function decodeImage(value: string): Buffer | undefined {
+export function decodeImage(value: string): Buffer | undefined {
   const raw = value.trim();
   const dataUrlMatch = raw.match(/^data:([^;,]+);base64,([\s\S]*)$/i);
   const base64 = (dataUrlMatch ? dataUrlMatch[2] : raw).replace(/\s+/g, "");
@@ -273,7 +273,7 @@ function decodeImage(value: string): Buffer | undefined {
   return bytes.length > 0 ? bytes : undefined;
 }
 
-function dashboardToolResponse(
+export function dashboardToolResponse(
   callId: string,
   value: unknown,
 ): CompanionToolCallResponse | undefined {
@@ -789,7 +789,7 @@ async function releaseCompanionPresence(
   }
 }
 
-function phoneSnapshot(value: Record<string, unknown>): PhoneSnapshot {
+export function phoneSnapshot(value: Record<string, unknown>): PhoneSnapshot {
   return {
     state: typeof value.state === "string" ? value.state : "unknown",
     active: value.active === true,
@@ -1162,6 +1162,13 @@ function getContentType(path: string): string {
   return "text/plain; charset=utf-8";
 }
 
+const BROWSER_MODULES = new Set(["renderer", "api", "pricing", "tool-images"]);
+
+function browserModuleName(pathname: string): string | undefined {
+  const name = /^\/([a-z-]+)\.(?:js|ts)$/.exec(pathname)?.[1];
+  return name && BROWSER_MODULES.has(name) ? name : undefined;
+}
+
 function transpileTsFile(tsCode: string): string {
   return ts.transpileModule(tsCode, {
     compilerOptions: {
@@ -1367,11 +1374,9 @@ export function createCompanionWebServer(): http.Server {
     if (pathname === "/favicon.png") {
       return serveStaticFile(res, "favicon.png");
     }
-    if (pathname === "/renderer.js" || pathname === "/renderer.ts") {
-      return serveStaticFile(res, "renderer.js");
-    }
-    if (pathname === "/api.js" || pathname === "/api.ts") {
-      return serveStaticFile(res, "api.js");
+    const browserModule = browserModuleName(pathname);
+    if (browserModule) {
+      return serveStaticFile(res, `${browserModule}.js`);
     }
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("Not Found");

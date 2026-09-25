@@ -1,4 +1,8 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import {
+  spawn,
+  type ChildProcessWithoutNullStreams,
+  type SpawnOptionsWithoutStdio,
+} from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -172,6 +176,16 @@ interface AgentMessageStreamUpdate {
   text: string;
 }
 
+export type AppServerSpawner = (
+  command: string,
+  args: readonly string[],
+  options: SpawnOptionsWithoutStdio,
+) => ChildProcessWithoutNullStreams;
+
+export interface CodexAppServerClientOptions {
+  spawnAppServer?: AppServerSpawner;
+}
+
 /**
  * Persistent Codex App Server client. Authentication stays in the Codex
  * CLI/App Server; this process never handles ChatGPT cookies or API keys.
@@ -209,6 +223,11 @@ export class CodexAppServerClient {
   private userMessageLogged = false;
   private activeModel = resolveCodexModel();
   private activeServiceTier = DEFAULT_CODEX_SERVICE_TIER;
+  private readonly spawnAppServer: AppServerSpawner;
+
+  constructor(options: CodexAppServerClientOptions = {}) {
+    this.spawnAppServer = options.spawnAppServer ?? spawn;
+  }
 
   /** True while this client still owns an in-flight App Server turn. */
   get isTurnInFlight(): boolean {
@@ -519,7 +538,7 @@ export class CodexAppServerClient {
       process.platform === "win32"
         ? `${quoteWindowsCommand(command)} ${args.map(quoteWindowsCommand).join(" ")}`
         : command;
-    const child = spawn(
+    const child = this.spawnAppServer(
       windowsCommand,
       process.platform === "win32" ? [] : args,
       {
@@ -1347,7 +1366,7 @@ interface NormalizedDynamicArguments {
   rawArguments?: string;
 }
 
-function normalizeDynamicArguments(value: unknown): NormalizedDynamicArguments {
+export function normalizeDynamicArguments(value: unknown): NormalizedDynamicArguments {
   if (value === undefined || value === null) return { value: {} };
   if (typeof value !== "string") return { value };
   try {
@@ -1365,7 +1384,7 @@ function extractDynamicToolName(value: unknown): string {
   return typeof params?.tool === "string" ? params.tool : "";
 }
 
-function extractDynamicToolFailure(
+export function extractDynamicToolFailure(
   result: DynamicToolCallResponse,
 ): Omit<PhoneToolFailure, "tool"> {
   for (const item of result.contentItems) {
@@ -1427,7 +1446,7 @@ function dynamicToolFailure(message: string): DynamicToolCallResponse {
   };
 }
 
-function emptyToolAnswers(
+export function emptyToolAnswers(
   value: unknown,
 ): Record<string, { answers: string[] }> {
   const questions = extractRecord(value ?? {})?.questions;
@@ -1543,7 +1562,7 @@ function streamedAgentMessageId(sessionId: string): string {
   return `dhd-agent-${sessionId}`;
 }
 
-interface ActiveCodexTurn {
+export interface ActiveCodexTurn {
   sessionId: string;
   client: CodexAppServerClient;
 }
@@ -1589,10 +1608,11 @@ async function maintainCompanionHeartbeat(
   }
 }
 
-export async function runAssistantCompanion(): Promise<void> {
+export async function runAssistantCompanion(
+  codexClient = new CodexAppServerClient(),
+): Promise<void> {
   const pollIntervalMs = parsePollInterval(process.env.PHONE_ASSISTANT_POLL_MS);
   let stopping = false;
-  const codexClient = new CodexAppServerClient();
   let pendingRun: Promise<void> | null = null;
   const stop = () => {
     stopping = true;
@@ -1738,7 +1758,7 @@ async function prewarmCodexClient(
   return false;
 }
 
-async function processPendingRequest(
+export async function processPendingRequest(
   pending: BridgeMessage,
   codexClient: CodexAppServerClient,
 ): Promise<void> {
@@ -1891,7 +1911,7 @@ async function processPendingRequest(
   }
 }
 
-async function processPendingSteer(active: ActiveCodexTurn): Promise<void> {
+export async function processPendingSteer(active: ActiveCodexTurn): Promise<void> {
   const pending = await requestBridge(
     {
       type: "pending_steer",
@@ -2015,7 +2035,7 @@ function normalizeAgentFeedback(text: string): string {
   return text.replace(/\r\n?/g, "\n").trim().slice(0, MAX_AGENT_FEEDBACK_CHARS);
 }
 
-function extractThreadId(value: unknown): string | null {
+export function extractThreadId(value: unknown): string | null {
   if (!value || typeof value !== "object") return null;
   const record = value as Record<string, unknown>;
   const thread = record.thread;
@@ -2028,7 +2048,7 @@ function extractThreadId(value: unknown): string | null {
   return typeof record.id === "string" && record.id ? record.id : null;
 }
 
-function extractTurnId(value: unknown): string | null {
+export function extractTurnId(value: unknown): string | null {
   const record = extractRecord(value);
   if (!record) return null;
   const turn = extractRecord(record.turn);
@@ -2096,7 +2116,7 @@ export function extractCompanionTokenUsageEvent(
   };
 }
 
-function extractText(value: unknown): string {
+export function extractText(value: unknown): string {
   const record = extractRecord(value);
   if (!record) return "";
   for (const key of ["delta", "text", "message"]) {
@@ -2255,7 +2275,7 @@ function extractAgentMessagePhase(value: unknown): string | null {
   return typeof item?.phase === "string" && item.phase ? item.phase : null;
 }
 
-function extractTurnError(value: unknown): string {
+export function extractTurnError(value: unknown): string {
   const record = extractRecord(value);
   const nestedError = extractRecord(record?.error);
   if (typeof nestedError?.message === "string") return nestedError.message;
@@ -2265,7 +2285,7 @@ function extractTurnError(value: unknown): string {
   return typeof record?.message === "string" ? record.message : "";
 }
 
-function resolveCodexBin(): string {
+export function resolveCodexBin(): string {
   const configured = process.env.PHONE_ASSISTANT_CODEX_BIN?.trim();
   if (configured) return configured;
   if (process.platform === "win32") {
@@ -2353,7 +2373,7 @@ function resolveCodexRuntimeCwd(): string {
  * during a phone turn. Only section names are read; credentials and command
  * values never enter logs.
  */
-function disabledConfiguredMcpOverrides(codexHome: string): string[] {
+export function disabledConfiguredMcpOverrides(codexHome: string): string[] {
   const configPath = join(codexHome, "config.toml");
   let config: string;
   try {
@@ -2375,7 +2395,7 @@ function extractRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function parsePollInterval(value: string | undefined): number {
+export function parsePollInterval(value: string | undefined): number {
   if (!value?.trim()) return DEFAULT_POLL_INTERVAL_MS;
   if (!/^\d+$/.test(value.trim()))
     throw new Error("PHONE_ASSISTANT_POLL_MS must be a positive integer.");
@@ -2396,7 +2416,7 @@ function resolveCodexEffort(): string {
   );
 }
 
-function normalizeCodexEffort(value: string | undefined): string {
+export function normalizeCodexEffort(value: string | undefined): string {
   const normalized = value?.trim().toLowerCase();
   return normalized && CODEX_REASONING_EFFORTS.has(normalized)
     ? normalized
@@ -2407,7 +2427,7 @@ function serviceTierForFastMode(fastMode: boolean): string {
   return fastMode ? FAST_CODEX_SERVICE_TIER : DEFAULT_CODEX_SERVICE_TIER;
 }
 
-function quoteWindowsCommand(command: string): string {
+export function quoteWindowsCommand(command: string): string {
   if (
     /\s|[&|<>^]/.test(command) &&
     !(command.startsWith('"') && command.endsWith('"'))
