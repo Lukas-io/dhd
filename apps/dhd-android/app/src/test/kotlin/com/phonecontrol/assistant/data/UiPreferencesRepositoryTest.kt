@@ -1,14 +1,9 @@
 package com.phonecontrol.assistant.data
 
 import com.phonecontrol.assistant.testing.InMemorySharedPreferences
-import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.test.UnconfinedTestDispatcher
-import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
-@OptIn(ExperimentalCoroutinesApi::class)
 class UiPreferencesRepositoryTest {
     private val preferences = InMemorySharedPreferences()
     private val repository = UiPreferencesRepository(preferences)
@@ -53,14 +48,33 @@ class UiPreferencesRepositoryTest {
     }
 
     @Test
-    fun `changes publish the current snapshot and every later write`() = runTest(UnconfinedTestDispatcher()) {
-        val seen = mutableListOf<UiPreferences>()
-        backgroundScope.launch { repository.changes.collect { seen += it } }
+    fun `state follows writes from any holder of the preferences`() {
+        val overlayRepository = UiPreferencesRepository(preferences)
 
+        overlayRepository.setFastMode(true)
+        preferences.edit().putString("pref_theme_mode", "light").apply()
+
+        assertEquals(true, repository.state.value.fastMode)
+        assertEquals("light", repository.state.value.themeMode)
+    }
+
+    @Test
+    fun `writes that do not change a value are skipped`() {
         repository.setFastMode(true)
-        repository.setThemeMode("light")
+        repository.setReasoningEffort("low")
+        repository.setBubblePosition(10, 20)
+        repository.setVisibleReasoningEfforts("low,high")
+        val edits = preferences.appliedEdits
 
-        assertEquals(listOf(false, true, true), seen.map(UiPreferences::fastMode))
-        assertEquals(listOf("dark", "dark", "light"), seen.map(UiPreferences::themeMode))
+        repeat(30) {
+            repository.setFastMode(true)
+            repository.setReasoningEffort("low")
+            repository.setBubblePosition(10, 20)
+            repository.setThemeMode("dark")
+            repository.setOverlayEnabled(false)
+            repository.setVisibleReasoningEfforts("low,high")
+        }
+
+        assertEquals(edits, preferences.appliedEdits)
     }
 }
