@@ -18,7 +18,9 @@ import androidx.core.content.ContextCompat
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.produceState
 import androidx.lifecycle.lifecycleScope
-import com.phonecontrol.assistant.developer.TaskPreviewState
+import com.phonecontrol.assistant.core.ToolNames
+import com.phonecontrol.assistant.core.sessionIdOrNull
+import com.phonecontrol.assistant.display.TaskPreviewState
 import com.phonecontrol.assistant.domain.ActivityEvent
 import com.phonecontrol.assistant.domain.TaskPointerEvent
 import com.phonecontrol.assistant.execution.TaskDisplayRecord
@@ -96,7 +98,7 @@ class MainActivity : ComponentActivity() {
         refreshOverlayState()
         maybeStartFirstRunPermissionSetup()
         val initialConversationId = intent.getStringExtra(EXTRA_CONVERSATION_ID)
-        val app = application as PhoneControlApplication
+        val app = (application as PhoneControlApplication).container
         val appPackageManager = packageManager
         setContent {
             val display by app.taskDisplayBackend.activeSession.collectAsState()
@@ -107,7 +109,7 @@ class MainActivity : ComponentActivity() {
             val events by app.sessionCoordinator.events.collectAsState()
             val pointerEvent by app.sessionCoordinator.pointerEvent.collectAsState()
             val purpose = sessionState.displayPurpose()
-            val coordinatorSessionKey = sessionState.sessionKeyOrNull()
+            val coordinatorSessionKey = sessionState.sessionIdOrNull
             // A new coordinator run can claim a retained display whose native
             // owner key belongs to the previous run. Resolve that binding for
             // the inline viewer so the UI follows the selected display rather
@@ -220,7 +222,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        val app = application as? PhoneControlApplication
+        val app = (application as? PhoneControlApplication)?.container
         app?.let {
             it.notificationVisibility.setActivityVisible(true)
             // A conversation that aged out while the app was not visible is
@@ -242,8 +244,8 @@ class MainActivity : ComponentActivity() {
                 com.phonecontrol.assistant.overlay.OverlayHideReason.DHD_ACTIVITY,
             )
         }
-        (application as? PhoneControlApplication)?.let { app ->
-            app.developerModeController.refresh()
+        (application as? PhoneControlApplication)?.container?.let { app ->
+            app.phoneAccessController.refresh()
             app.devBridgeServer.requestCodexWarmup()
         }
     }
@@ -257,8 +259,8 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         conversationExpiryMonitor?.cancel()
         conversationExpiryMonitor = null
-        (application as? PhoneControlApplication)?.notificationVisibility?.setActivityVisible(false)
-        (application as? PhoneControlApplication)?.conversationStore?.dismissInactiveConversationPrompt()
+        (application as? PhoneControlApplication)?.container?.notificationVisibility?.setActivityVisible(false)
+        (application as? PhoneControlApplication)?.container?.conversationStore?.dismissInactiveConversationPrompt()
         overlayActivityToken?.close()
         overlayActivityToken = null
         super.onStop()
@@ -439,7 +441,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startFresh() {
-        val app = application as PhoneControlApplication
+        val app = (application as PhoneControlApplication).container
         app.startFresh()
         startService(
             Intent(this, AssistantForegroundService::class.java)
@@ -448,7 +450,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun continueSession() {
-        val app = application as PhoneControlApplication
+        val app = (application as PhoneControlApplication).container
         if (app.sessionCoordinator.state.value !is SessionState.Stopped) return
         ContextCompat.startForegroundService(
             this,
@@ -458,7 +460,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun steerSession(text: String): Boolean =
-        (application as PhoneControlApplication).sessionCoordinator.enqueueSteer(text) != null
+        (application as PhoneControlApplication).container.sessionCoordinator.enqueueSteer(text) != null
 
     private fun refreshOverlayState() {
         val granted = Settings.canDrawOverlays(this)
@@ -551,7 +553,7 @@ internal fun latestToolNameForRun(events: List<ActivityEvent>, sessionKey: Strin
     sessionKey?.let {
         events.asReversed()
             .firstOrNull { event ->
-                event.sessionId == sessionKey && !event.toolName.isNullOrBlank() && !event.toolName.equals("dhd_close_display", ignoreCase = true) && !event.toolName.equals("close_display", ignoreCase = true)
+                event.sessionId == sessionKey && !event.toolName.isNullOrBlank() && !ToolNames.isCloseDisplay(event.toolName)
             }
             ?.toolName
     }
@@ -774,12 +776,4 @@ internal fun TaskPreviewState.forSession(sessionKey: String): TaskPreviewState? 
     is TaskPreviewState.Attached -> takeIf { session.sessionKey == sessionKey }
     is TaskPreviewState.Ended -> takeIf { session.sessionKey == sessionKey }
     is TaskPreviewState.Error -> takeIf { this.sessionKey == sessionKey }
-}
-
-private fun SessionState.sessionKeyOrNull(): String? = when (this) {
-    SessionState.Idle -> null
-    is SessionState.Running -> sessionId
-    is SessionState.Paused -> sessionId
-    is SessionState.Stopped -> sessionId
-    is SessionState.Completed -> sessionId
 }

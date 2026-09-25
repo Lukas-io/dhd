@@ -8,14 +8,9 @@ import com.phonecontrol.assistant.core.BuildDeviceInfo
 import com.phonecontrol.assistant.core.Clock
 import com.phonecontrol.assistant.core.DeviceInfo
 import com.phonecontrol.assistant.core.SystemClockClock
-import com.phonecontrol.assistant.data.DHD_BROWSE_APP_TOOL
-import com.phonecontrol.assistant.data.DHD_EXECUTE_TOOL
-import com.phonecontrol.assistant.data.DHD_FOREGROUND_APP_TOOL
-import com.phonecontrol.assistant.data.DHD_EXECUTE_SEQUENCE_TOOL
-import com.phonecontrol.assistant.data.DHD_LIST_ALLOWED_APPS_TOOL
-import com.phonecontrol.assistant.data.DHD_OBSERVE_TOOL
-import com.phonecontrol.assistant.data.DHD_OPEN_APP_TOOL
-import com.phonecontrol.assistant.data.DHD_SET_APP_DISPLAY_LAYOUT_TOOL
+import com.phonecontrol.assistant.core.ToolNames
+import com.phonecontrol.assistant.core.conversationIdOrNull
+import com.phonecontrol.assistant.core.sessionIdOrNull
 import com.phonecontrol.assistant.domain.ActionMetadata
 import com.phonecontrol.assistant.domain.BackAction
 import com.phonecontrol.assistant.domain.GuardRegion
@@ -39,9 +34,9 @@ import com.phonecontrol.assistant.session.DhdToolCallStatus
 import com.phonecontrol.assistant.session.SessionCoordinator
 import com.phonecontrol.assistant.session.SessionState
 import com.phonecontrol.assistant.session.defaultDhdToolPurpose
-import com.phonecontrol.assistant.execution.ForegroundAppResult
-import com.phonecontrol.assistant.execution.ObservationCaptureResult
-import com.phonecontrol.assistant.execution.PhoneObservationSource
+import com.phonecontrol.assistant.observation.ForegroundAppResult
+import com.phonecontrol.assistant.observation.ObservationCaptureResult
+import com.phonecontrol.assistant.observation.PhoneObservationSource
 import com.phonecontrol.assistant.execution.TransportResult
 import com.phonecontrol.assistant.execution.TaskDisplayBackend
 import com.phonecontrol.assistant.execution.TaskDisplayCloseResult
@@ -618,23 +613,23 @@ class DevBridgeServer internal constructor(
                 "stream_agent_message" -> streamAgentMessage(requestId, json, writer)
                 "complete_session" -> completeSession(requestId, json, writer)
                 "fail_session" -> failSession(requestId, json, writer)
-                "allowed_apps" -> withDhdTool(json, DHD_LIST_ALLOWED_APPS_TOOL) {
+                "allowed_apps" -> withDhdTool(json, ToolNames.LIST_ALLOWED_APPS) {
                     allowedApps(requestId, json, writer)
                 }
-                "browse_apps" -> withDhdTool(json, DHD_BROWSE_APP_TOOL) {
+                "browse_apps" -> withDhdTool(json, ToolNames.BROWSE_APP) {
                     browseApps(requestId, json, writer)
                 }
-                "set_app_display_layout" -> withDhdTool(json, DHD_SET_APP_DISPLAY_LAYOUT_TOOL) {
+                "set_app_display_layout" -> withDhdTool(json, ToolNames.SET_APP_DISPLAY_LAYOUT) {
                     setAppDisplayLayout(requestId, json, writer)
                 }
                 "list_displays" -> listDisplays(requestId, writer)
                 "close_display" -> closeDisplay(requestId, json, writer)
-                "foreground_app" -> withDhdTool(json, DHD_FOREGROUND_APP_TOOL) {
+                "foreground_app" -> withDhdTool(json, ToolNames.FOREGROUND_APP) {
                     foregroundApp(requestId, json, writer)
                 }
                 "observe" -> withDhdTool(
                     json = json,
-                    fallbackToolName = DHD_OBSERVE_TOOL,
+                    fallbackToolName = ToolNames.OBSERVE,
                 ) {
                     observe(requestId, json, writer)
                 }
@@ -646,13 +641,13 @@ class DevBridgeServer internal constructor(
                 }
                 "execute_sequence" -> withDhdTool(
                     json = json,
-                    fallbackToolName = "dhd_execute_sequence",
+                    fallbackToolName = ToolNames.EXECUTE_SEQUENCE,
                 ) {
                     phoneActionMutex.withLock { executeSequence(requestId, json, writer) }
                 }
                 "request_attention" -> withDhdTool(
                     json = json,
-                    fallbackToolName = "dhd_request_attention",
+                    fallbackToolName = ToolNames.REQUEST_ATTENTION,
                     terminalStatus = DhdToolCallStatus.ATTENTION,
                 ) {
                     requestAttention(requestId, json, writer)
@@ -694,16 +689,16 @@ class DevBridgeServer internal constructor(
 
     internal fun fallbackActionToolName(json: JSONObject): String {
         val actionType = json.optJSONObject("action")?.optString("type")?.lowercase()
-        return if (actionType == "open_app") DHD_OPEN_APP_TOOL else DHD_EXECUTE_TOOL
+        return if (actionType == "open_app") ToolNames.OPEN_APP else ToolNames.EXECUTE
     }
 
     internal fun toolPurpose(toolName: String, json: JSONObject): String =
         metadataPurpose(json) ?: when (toolName) {
-            DHD_OBSERVE_TOOL -> json.optString("purpose").trim().takeIf(String::isNotBlank)
+            ToolNames.OBSERVE -> json.optString("purpose").trim().takeIf(String::isNotBlank)
                 ?: defaultDhdToolPurpose(toolName)
-            DHD_OPEN_APP_TOOL -> openingAppPurpose(json)
-            DHD_SET_APP_DISPLAY_LAYOUT_TOOL -> appDisplayLayoutPurpose(json)
-            DHD_EXECUTE_TOOL -> {
+            ToolNames.OPEN_APP -> openingAppPurpose(json)
+            ToolNames.SET_APP_DISPLAY_LAYOUT -> appDisplayLayoutPurpose(json)
+            ToolNames.EXECUTE -> {
                 val action = json.optJSONObject("action")
                 if (action?.optString("type")?.equals("open_app", ignoreCase = true) == true) {
                     openingAppPurpose(json)
@@ -711,7 +706,7 @@ class DevBridgeServer internal constructor(
                     defaultDhdToolPurpose(toolName)
                 }
             }
-            "dhd_request_attention" -> defaultDhdToolPurpose(toolName)
+            ToolNames.REQUEST_ATTENTION -> defaultDhdToolPurpose(toolName)
             else -> defaultDhdToolPurpose(toolName)
         }
 
@@ -751,7 +746,7 @@ class DevBridgeServer internal constructor(
         val label = packageName
             ?.let(::appLabel)
             ?.takeIf { it.isNotBlank() && !it.equals(packageName, ignoreCase = true) }
-        return label?.let { "Opening $it" } ?: defaultDhdToolPurpose(DHD_OPEN_APP_TOOL)
+        return label?.let { "Opening $it" } ?: defaultDhdToolPurpose(ToolNames.OPEN_APP)
     }
 
     private fun appDisplayLayoutPurpose(json: JSONObject): String {
@@ -766,7 +761,7 @@ class DevBridgeServer internal constructor(
                 ?: "Fitting the app to the task display"
             "standard" -> label?.let { "Restoring ${it}'s standard task layout" }
                 ?: "Restoring the standard task layout"
-            else -> defaultDhdToolPurpose(DHD_SET_APP_DISPLAY_LAYOUT_TOOL)
+            else -> defaultDhdToolPurpose(ToolNames.SET_APP_DISPLAY_LAYOUT)
         }
     }
 
@@ -1081,7 +1076,7 @@ class DevBridgeServer internal constructor(
     ) {
         val sessionId = json.optString("sessionId").trim()
         require(sessionId.isNotEmpty()) { "sessionId is required." }
-        if (coordinator.state.value.sessionIdOrNullForBridge() != sessionId) {
+        if (coordinator.state.value.sessionIdOrNull != sessionId) {
             write(
                 writer,
                 errorResponse(requestId, "The phone session is no longer active.")
@@ -1097,7 +1092,7 @@ class DevBridgeServer internal constructor(
         if (failed) {
             platform.showAttentionNotification(
                 "DHD stopped: $reason",
-                coordinator.state.value.conversationIdOrNullForBridge(),
+                coordinator.state.value.conversationIdOrNull,
             )
         }
         platform.reconcileServiceLifetime()
@@ -1127,7 +1122,7 @@ class DevBridgeServer internal constructor(
         require(text.length <= MAX_AGENT_FEEDBACK_CHARS) {
             "text must be at most $MAX_AGENT_FEEDBACK_CHARS characters."
         }
-        if (coordinator.state.value.sessionIdOrNullForBridge() != sessionId) {
+        if (coordinator.state.value.sessionIdOrNull != sessionId) {
             write(
                 writer,
                 errorResponse(requestId, "The phone session is no longer active.")
@@ -1166,7 +1161,7 @@ class DevBridgeServer internal constructor(
             .trim()
             .ifBlank { null }
             ?.take(MAX_TEXT_CHARS)
-        val activeSessionId = coordinator.state.value.sessionIdOrNullForBridge()
+        val activeSessionId = coordinator.state.value.sessionIdOrNull
         if (activeSessionId != sessionId) {
             write(
                 writer,
@@ -1182,7 +1177,7 @@ class DevBridgeServer internal constructor(
             agentMessageId = agentMessageId,
         )
         if (completed) {
-            platform.showCompletionNotification(completionMessage, coordinator.state.value.conversationIdOrNullForBridge())
+            platform.showCompletionNotification(completionMessage, coordinator.state.value.conversationIdOrNull)
         }
         platform.removeAttentionNotification()
         platform.reconcileServiceLifetime()
@@ -1193,7 +1188,7 @@ class DevBridgeServer internal constructor(
                 .put("requestId", requestId)
                 .put("ok", completed)
                 .put("sessionId", sessionId)
-                .put("conversationId", coordinator.state.value.conversationIdOrNullForBridge() ?: JSONObject.NULL)
+                .put("conversationId", coordinator.state.value.conversationIdOrNull ?: JSONObject.NULL)
                 .put("message", completionMessage)
                 .put("feedback", feedback ?: JSONObject.NULL),
         )
@@ -1241,7 +1236,7 @@ class DevBridgeServer internal constructor(
             )
             return
         }
-        platform.showAttentionNotification(reason, coordinator.state.value.conversationIdOrNullForBridge())
+        platform.showAttentionNotification(reason, coordinator.state.value.conversationIdOrNull)
         when (attention.await()) {
             AttentionResolution.Cancelled -> write(
                 writer,
@@ -1300,7 +1295,7 @@ class DevBridgeServer internal constructor(
                 includeAll -> "Listing all allowed launchable apps"
                 else -> "Listing allowed apps"
             },
-            toolName = DHD_LIST_ALLOWED_APPS_TOOL,
+            toolName = ToolNames.LIST_ALLOWED_APPS,
         )
         write(
             writer,
@@ -1337,7 +1332,7 @@ class DevBridgeServer internal constructor(
         coordinator.recordPurpose(
             purpose = "Browsing installed apps",
             targetDescription = query,
-            toolName = DHD_BROWSE_APP_TOOL,
+            toolName = ToolNames.BROWSE_APP,
         )
 
         val fullAccess = fullAccessProvider()
@@ -1417,7 +1412,7 @@ class DevBridgeServer internal constructor(
         coordinator.recordPurpose(
             purpose = if (enabled) "Saving full-size app layout" else "Restoring standard app layout",
             targetDescription = app.label,
-            toolName = DHD_SET_APP_DISPLAY_LAYOUT_TOOL,
+            toolName = ToolNames.SET_APP_DISPLAY_LAYOUT,
         )
         val changed = platform.isFullSizeLayoutEnabled(packageName) != enabled
         platform.setFullSizeLayoutEnabled(packageName, enabled)
@@ -1650,7 +1645,7 @@ class DevBridgeServer internal constructor(
         coordinator.recordPurpose(
             purpose = purpose,
             targetDescription = json.optString("targetDescription").trim().take(MAX_TEXT_CHARS).ifBlank { null },
-            toolName = DHD_OBSERVE_TOOL,
+            toolName = ToolNames.OBSERVE,
         )
         if (!coordinator.awaitPhoneAccessForTool()) {
             write(
@@ -1699,7 +1694,7 @@ class DevBridgeServer internal constructor(
     ) {
         coordinator.recordPurpose(
             purpose = "Checking foreground app",
-            toolName = DHD_FOREGROUND_APP_TOOL,
+            toolName = ToolNames.FOREGROUND_APP,
         )
         if (!coordinator.awaitPhoneAccessForTool()) {
             write(
@@ -2172,7 +2167,7 @@ class DevBridgeServer internal constructor(
                 coordinator.executeAction(
                     action = action,
                     observation = baseline,
-                    toolName = DHD_EXECUTE_SEQUENCE_TOOL,
+                    toolName = ToolNames.EXECUTE_SEQUENCE,
                     targetDisplay = target?.session,
                 )
             },
@@ -3040,20 +3035,4 @@ private fun ActionExecutionResult.failureCode(): String? = when (this) {
     }
     is ActionExecutionResult.PolicyRejected -> code
     ActionExecutionResult.SessionNotRunning -> "SESSION_NOT_RUNNING"
-}
-
-private fun SessionState.sessionIdOrNullForBridge(): String? = when (this) {
-    SessionState.Idle -> null
-    is SessionState.Running -> sessionId
-    is SessionState.Paused -> sessionId
-    is SessionState.Stopped -> sessionId
-    is SessionState.Completed -> sessionId
-}
-
-private fun SessionState.conversationIdOrNullForBridge(): String? = when (this) {
-    SessionState.Idle -> null
-    is SessionState.Running -> conversationId
-    is SessionState.Paused -> conversationId
-    is SessionState.Stopped -> conversationId
-    is SessionState.Completed -> conversationId
 }
