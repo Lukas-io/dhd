@@ -5,8 +5,7 @@ import {
 } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import * as readline from "node:readline";
 
@@ -24,27 +23,30 @@ import {
   type CompanionTokenUsageEvent,
   type CompanionToolCallEvent,
 } from "./companion-events.js";
-import {
-  DHD_ACTION_TYPES,
-  DHD_KEYPRESS_KEYS,
-  DHD_MAX_GUARD_REGIONS,
-  DHD_MAX_SEQUENCE_ACTIONS,
-  DHD_MAX_SWIPE_DURATION_MS,
-  DHD_MAX_TEXT_CHARS,
-  DHD_MAX_TYPE_TEXT_CHARS,
-  DHD_MAX_WAIT_DURATION_MS,
-  dhdToolDescription,
-  isDhdToolName,
-  isGuardRegionsEnabled,
-  type DhdToolName,
-} from "./dhd-tool-contract.js";
+import { isGuardRegionsEnabled } from "./config/env.js";
+import { isDhdToolName, type DhdToolName } from "./tools/contract.js";
+import { DHD_TOOL_DEFINITIONS, dhdToolDescription } from "./tools/registry.js";
 import {
   bridgeHost,
   bridgePort,
   isLoopbackBridgeHost,
   requestBridge,
-  type BridgeMessage,
-} from "./phone-assistant-bridge.js";
+} from "./phone/bridge-client.js";
+import type { BridgeMessage } from "./phone/protocol.js";
+import { errorMessage, toError } from "./shared/errors.js";
+import { asRecord } from "./shared/guards.js";
+import { isMainModule } from "./shared/is-main-module.js";
+import {
+  codexBinSetting,
+  codexHomeDirectory,
+  codexModelSetting,
+  codexReasoningEffortSetting,
+  codexRuntimeDirectory,
+  isCodeModeHostDisabled,
+  isDebugTimingEnabled,
+  pollIntervalSetting,
+  windowsLocalAppDataDirectory,
+} from "./config/env.js";
 
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 const BRIDGE_POLL_TIMEOUT_MS = 5_000;
@@ -55,8 +57,6 @@ const STREAM_BRIDGE_TIMEOUT_MS = 5_000;
 const MAX_AGENT_FEEDBACK_CHARS = 4_000;
 const MAX_STEER_CHARS = 4_000;
 const DEFAULT_COMPLETION_MESSAGE = "Your DHD task is ready to review.";
-const DEFAULT_CODEX_HOME = join(homedir(), ".dhd", "codex-home");
-const DEFAULT_CODEX_RUNTIME_CWD = join(homedir(), ".dhd", "codex-runtime");
 const MINIMAL_CODEX_CONFIG_OVERRIDES = [
   "mcp_servers={}",
   "features.apps=false",
@@ -136,12 +136,6 @@ function logCompanionPhase(phase: string, details?: string): void {
   );
 }
 
-function debugTimingEnabled(): boolean {
-  return ["1", "true", "yes", "on"].includes(
-    (process.env.PHONE_ASSISTANT_DEBUG_TIMING ?? "").trim().toLowerCase(),
-  );
-}
-
 export interface DynamicToolCallResponse {
   contentItems: Array<
     | { type: "inputText"; text: string }
@@ -200,8 +194,8 @@ export class CodexAppServerClient {
   private startPromise: Promise<void> | null = null;
   private initialized = false;
   private loadedThreadIds = new Set<string>();
-  private readonly codexHome = resolveCodexHome();
-  private readonly runtimeCwd = resolveCodexRuntimeCwd();
+  private readonly codexHome = codexHomeDirectory();
+  private readonly runtimeCwd = codexRuntimeDirectory();
   private turnCompletion: {
     resolve: (result: TurnResult) => void;
     reject: (error: Error) => void;
@@ -360,7 +354,7 @@ export class CodexAppServerClient {
           // discard a valid stored context merely because it has no local
           // loaded-thread cache.
           console.error(
-            `[codex-app-server] could not resume stored thread ${existingThreadId}: ${error instanceof Error ? error.message : String(error)}`,
+            `[codex-app-server] could not resume stored thread ${existingThreadId}: ${errorMessage(error)}`,
           );
           logger.log("resume:failed", `threadId=${existingThreadId}`);
         }
@@ -394,7 +388,7 @@ export class CodexAppServerClient {
           });
         } catch (error) {
           console.error(
-            `[codex-app-server] could not name thread: ${error instanceof Error ? error.message : String(error)}`,
+            `[codex-app-server] could not name thread: ${errorMessage(error)}`,
           );
         }
       }
@@ -434,7 +428,7 @@ export class CodexAppServerClient {
         }
       } catch (error) {
         this.turnCompletion?.reject(
-          error instanceof Error ? error : new Error(String(error)),
+          toError(error),
         );
         this.turnCompletion = null;
         throw error;
@@ -486,7 +480,7 @@ export class CodexAppServerClient {
       input: [{ type: "text", text: safeText }],
       expectedTurnId: turnId,
     });
-    const acceptedTurnId = extractRecord(response.result)?.turnId;
+    const acceptedTurnId = asRecord(response.result)?.turnId;
     if (typeof acceptedTurnId === "string" && acceptedTurnId !== turnId) {
       throw new Error(
         `Codex accepted the steer for unexpected turn ${acceptedTurnId}.`,
@@ -526,10 +520,7 @@ export class CodexAppServerClient {
     // fail closed with `code-mode host is disabled`. An explicit `false` is
     // still useful for diagnostics or environments that provide their own
     // tool-routing policy.
-    if (
-      process.env.PHONE_ASSISTANT_ENABLE_CODE_MODE_HOST?.trim().toLowerCase() ===
-      "false"
-    ) {
+    if (isCodeModeHostDisabled()) {
       args.push("--disable", "code_mode_host");
     } else {
       args.push("--enable", "code_mode_host");
@@ -655,8 +646,8 @@ export class CodexAppServerClient {
         }
       }
     } else if (message.method === "thread/status/changed") {
-      const params = extractRecord(message.params);
-      const status = extractRecord(params?.status);
+      const params = asRecord(message.params);
+      const status = asRecord(params?.status);
       if (status?.type === "notLoaded") {
         const threadId = extractThreadId(message.params);
         if (threadId) {
@@ -714,8 +705,8 @@ export class CodexAppServerClient {
       return;
     }
     if (message.method === "turn/completed") {
-      const turn = extractRecord(message.params)?.turn;
-      const status = extractRecord(turn)?.status;
+      const turn = asRecord(message.params)?.turn;
+      const status = asRecord(turn)?.status;
       this.activeTiming?.log(
         "turn/completed",
         `status=${String(status ?? "unknown")}`,
@@ -782,14 +773,14 @@ export class CodexAppServerClient {
 
   private logUserMessagePhaseFromValue(value: unknown, event: string): void {
     if (this.userMessageLogged) return;
-    const record = extractRecord(value);
+    const record = asRecord(value);
     const candidates: unknown[] = [record?.item];
-    const turn = extractRecord(record?.turn);
+    const turn = asRecord(record?.turn);
     if (Array.isArray(turn?.items)) candidates.push(...turn.items);
     if (Array.isArray(record?.items)) candidates.push(...record.items);
     if (record?.type === "userMessage") candidates.push(record);
     const userMessage = candidates
-      .map((candidate) => extractRecord(candidate))
+      .map((candidate) => asRecord(candidate))
       .find((item) => item?.type === "userMessage");
     if (!userMessage) return;
     this.userMessageLogged = true;
@@ -815,7 +806,7 @@ export class CodexAppServerClient {
       timing.log("thread/unsubscribe:error", `threadId=${threadId}`);
       console.error(
         `[codex-app-server] could not unsubscribe superseded thread ${threadId}: ` +
-          `${error instanceof Error ? error.message : String(error)}`,
+          `${errorMessage(error)}`,
       );
     } finally {
       this.loadedThreadIds.delete(threadId);
@@ -900,7 +891,7 @@ export class CodexAppServerClient {
       this.respondError(
         id,
         -32000,
-        error instanceof Error ? error.message : String(error),
+        errorMessage(error),
       );
     }
   }
@@ -930,7 +921,7 @@ export class CodexAppServerClient {
       // error must not become an unhandled rejection that kills the phone
       // companion worker during an otherwise expected shutdown.
       console.error(
-        `[codex-app-server] could not send server-request error: ${error instanceof Error ? error.message : String(error)}`,
+        `[codex-app-server] could not send server-request error: ${errorMessage(error)}`,
       );
     }
   }
@@ -955,7 +946,7 @@ export class CodexAppServerClient {
       } catch (error) {
         this.pending.delete(id);
         clearTimeout(timer);
-        reject(error instanceof Error ? error : new Error(String(error)));
+        reject(toError(error));
       }
     });
   }
@@ -1029,257 +1020,13 @@ export function buildDhdDynamicTools(
 ): DynamicToolSpec[] {
   const enableGuardRegions =
     options.enableGuardRegions ?? isGuardRegionsEnabled();
-  const guardRegion = {
-    type: "object",
-    properties: {
-      left: { type: "integer", minimum: 0 },
-      top: { type: "integer", minimum: 0 },
-      right: { type: "integer", minimum: 0 },
-      bottom: { type: "integer", minimum: 0 },
-    },
-    required: ["left", "top", "right", "bottom"],
-    additionalProperties: false,
-  };
-  const baseMetadataProperties: Record<string, unknown> = {
-    purpose: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
-    targetDescription: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
-    observationId: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
-  };
-  const metadataProperties: Record<string, unknown> = {
-    ...baseMetadataProperties,
-  };
-  if (enableGuardRegions) {
-    metadataProperties.guardRegions = {
-      type: "array",
-      maxItems: DHD_MAX_GUARD_REGIONS,
-      items: guardRegion,
-    };
-  }
-  const metadata = {
-    type: "object",
-    properties: metadataProperties,
-    required: ["purpose", "targetDescription", "observationId"],
-    additionalProperties: false,
-  };
-  const sequenceMetadata = {
-    type: "object",
-    properties: {
-      purpose: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
-      targetDescription: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
-      ...(enableGuardRegions
-        ? { guardRegions: { type: "array", maxItems: DHD_MAX_GUARD_REGIONS, items: guardRegion } }
-        : {}),
-    },
-    required: ["purpose", "targetDescription"],
-    additionalProperties: false,
-  };
-  const openAppMetadata = {
-    type: "object",
-    properties: {
-      purpose: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
-      targetDescription: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
-    },
-    required: ["purpose", "targetDescription"],
-    additionalProperties: false,
-  };
-  const actionObject = (
-    properties: Record<string, unknown>,
-    required: string[],
-    actionMetadata: Record<string, unknown> = metadata,
-  ) => ({
-    type: "object",
-    properties: { ...properties, metadata: actionMetadata },
-    required: [...required, "metadata"],
-    additionalProperties: false,
-  });
-  const actionVariants = [
-    {
-      properties: {
-        type: { const: DHD_ACTION_TYPES.tap },
-        x: { type: "integer", minimum: 0 },
-        y: { type: "integer", minimum: 0 },
-      },
-      required: ["type", "x", "y"],
-    },
-    {
-      properties: {
-        type: { const: DHD_ACTION_TYPES.type },
-        text: { type: "string", minLength: 1, maxLength: DHD_MAX_TYPE_TEXT_CHARS },
-      },
-      required: ["type", "text"],
-    },
-    {
-      properties: {
-        type: { const: DHD_ACTION_TYPES.swipe },
-        startX: { type: "integer", minimum: 0 },
-        startY: { type: "integer", minimum: 0 },
-        endX: { type: "integer", minimum: 0 },
-        endY: { type: "integer", minimum: 0 },
-        durationMs: { type: "integer", minimum: 1, maximum: DHD_MAX_SWIPE_DURATION_MS },
-      },
-      required: ["type", "startX", "startY", "endX", "endY"],
-    },
-    { properties: { type: { const: DHD_ACTION_TYPES.back } }, required: ["type"] },
-    {
-      properties: {
-        type: { const: DHD_ACTION_TYPES.keypress },
-        key: { type: "string", enum: [...DHD_KEYPRESS_KEYS] },
-      },
-      required: ["type", "key"],
-    },
-    {
-      properties: {
-        type: { const: DHD_ACTION_TYPES.wait },
-        durationMs: { type: "integer", minimum: 1, maximum: DHD_MAX_WAIT_DURATION_MS },
-      },
-      required: ["type", "durationMs"],
-    },
-  ];
-  const createActionSchema = (actionMetadata: Record<string, unknown>) => ({
-    oneOf: actionVariants.map((variant) =>
-      actionObject(variant.properties, variant.required, actionMetadata),
-    ),
-  });
-  const action = createActionSchema(metadata);
-  const sequenceAction = createActionSchema(sequenceMetadata);
-  const displayTargetProperties: Record<string, unknown> = {
-    displayRef: { type: "string", pattern: "^dsp_[a-f0-9]{14}$" },
-  };
-  const observeProperties: Record<string, unknown> = {
-    purpose: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
-    targetDescription: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
-    ...displayTargetProperties,
-  };
-
-  return [
+  return DHD_TOOL_DEFINITIONS.map((definition) =>
     dynamicTool(
-      "dhd_list_allowed_apps",
-      dhdToolDescription("dhd_list_allowed_apps", enableGuardRegions),
-      {
-        type: "object",
-        properties: { includeAll: { type: "boolean", default: false } },
-        additionalProperties: false,
-      },
+      definition.name,
+      dhdToolDescription(definition.name, enableGuardRegions),
+      definition.jsonSchema(enableGuardRegions),
     ),
-    dynamicTool(
-      "dhd_browse_app",
-      dhdToolDescription("dhd_browse_app", enableGuardRegions),
-      {
-        type: "object",
-        properties: { query: { type: "string", minLength: 1, maxLength: 120 } },
-        required: ["query"],
-        additionalProperties: false,
-      },
-    ),
-    dynamicTool(
-      "dhd_set_app_display_layout",
-      dhdToolDescription("dhd_set_app_display_layout", enableGuardRegions),
-      {
-        type: "object",
-        properties: {
-          packageName: {
-            type: "string",
-            minLength: 1,
-            pattern: "^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+$",
-          },
-          layout: { type: "string", enum: ["standard", "full_size"] },
-        },
-        required: ["packageName", "layout"],
-        additionalProperties: false,
-      },
-    ),
-    dynamicTool(
-      "dhd_list_displays",
-      dhdToolDescription("dhd_list_displays", enableGuardRegions),
-      emptySchema(),
-    ),
-    dynamicTool(
-      "dhd_close_display",
-      dhdToolDescription("dhd_close_display", enableGuardRegions),
-      {
-        type: "object",
-        properties: {
-          ...displayTargetProperties,
-        },
-        required: ["displayRef"],
-        additionalProperties: false,
-      },
-    ),
-    dynamicTool(
-      "dhd_get_foreground_app",
-      dhdToolDescription("dhd_get_foreground_app", enableGuardRegions),
-      {
-        type: "object",
-        properties: displayTargetProperties,
-        additionalProperties: false,
-      },
-    ),
-    dynamicTool(
-      "dhd_observe",
-      dhdToolDescription("dhd_observe", enableGuardRegions),
-      {
-        type: "object",
-        properties: observeProperties,
-        additionalProperties: false,
-      },
-    ),
-    dynamicTool(
-      "dhd_open_app",
-      dhdToolDescription("dhd_open_app", enableGuardRegions),
-      {
-        type: "object",
-        properties: {
-          ...displayTargetProperties,
-          packageName: { type: "string", minLength: 1 },
-          metadata: openAppMetadata,
-        },
-        required: ["packageName", "metadata"],
-        additionalProperties: false,
-      },
-    ),
-    dynamicTool(
-      "dhd_execute",
-      dhdToolDescription("dhd_execute", enableGuardRegions),
-      {
-        type: "object",
-        properties: { ...displayTargetProperties, action },
-        required: ["action"],
-        additionalProperties: false,
-      },
-    ),
-    dynamicTool(
-      "dhd_execute_sequence",
-      dhdToolDescription("dhd_execute_sequence", enableGuardRegions),
-      {
-        type: "object",
-        properties: {
-          ...displayTargetProperties,
-          observationId: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
-          actions: {
-            type: "array",
-            minItems: 1,
-            maxItems: DHD_MAX_SEQUENCE_ACTIONS,
-            items: sequenceAction,
-          },
-        },
-        required: ["observationId", "actions"],
-        additionalProperties: false,
-      },
-    ),
-    dynamicTool(
-      "dhd_request_attention",
-      dhdToolDescription("dhd_request_attention", enableGuardRegions),
-      {
-        type: "object",
-        properties: {
-          reason: { type: "string", minLength: 1, maxLength: DHD_MAX_TEXT_CHARS },
-          ...displayTargetProperties,
-        },
-        required: ["reason"],
-        additionalProperties: false,
-      },
-    ),
-  ];
+  );
 }
 
 function dynamicTool(
@@ -1288,10 +1035,6 @@ function dynamicTool(
   inputSchema: Record<string, unknown>,
 ): DynamicToolSpec {
   return { type: "function", name, description, inputSchema };
-}
-
-function emptySchema(): Record<string, unknown> {
-  return { type: "object", properties: {}, additionalProperties: false };
 }
 
 interface DynamicToolCallOptions {
@@ -1303,7 +1046,7 @@ export async function handleDynamicToolCall(
   value: unknown,
   options: DynamicToolCallOptions = {},
 ): Promise<DynamicToolCallResponse> {
-  const params = extractRecord(value) ?? {};
+  const params = asRecord(value) ?? {};
   const requestedName = extractDynamicToolName(value);
   const name = requestedName.includes(".")
     ? requestedName.slice(requestedName.lastIndexOf(".") + 1)
@@ -1354,7 +1097,7 @@ export async function handleDynamicToolCall(
       callId,
       tool: mappedName,
       ...(result ? { result } : {}),
-      error: error instanceof Error ? error.message : String(error),
+      error: errorMessage(error),
       completedAt: Date.now(),
     });
     throw error;
@@ -1380,7 +1123,7 @@ export function normalizeDynamicArguments(value: unknown): NormalizedDynamicArgu
 }
 
 function extractDynamicToolName(value: unknown): string {
-  const params = extractRecord(value);
+  const params = asRecord(value);
   return typeof params?.tool === "string" ? params.tool : "";
 }
 
@@ -1390,7 +1133,7 @@ export function extractDynamicToolFailure(
   for (const item of result.contentItems) {
     if (item.type !== "inputText") continue;
     try {
-      const record = extractRecord(JSON.parse(item.text));
+      const record = asRecord(JSON.parse(item.text));
       if (!record) continue;
       const failure: Omit<PhoneToolFailure, "tool"> = {
         message:
@@ -1449,11 +1192,11 @@ function dynamicToolFailure(message: string): DynamicToolCallResponse {
 export function emptyToolAnswers(
   value: unknown,
 ): Record<string, { answers: string[] }> {
-  const questions = extractRecord(value ?? {})?.questions;
+  const questions = asRecord(value ?? {})?.questions;
   if (!Array.isArray(questions)) return {};
   const answers: Record<string, { answers: string[] }> = {};
   for (const question of questions) {
-    const id = extractRecord(question)?.id;
+    const id = asRecord(question)?.id;
     if (typeof id === "string" && id) answers[id] = { answers: [] };
   }
   return answers;
@@ -1465,7 +1208,7 @@ function logServerNotification(message: JsonRpcMessage): void {
     return;
   }
   if (message.method === "turn/completed") {
-    const turn = extractRecord(extractRecord(message.params)?.turn);
+    const turn = asRecord(asRecord(message.params)?.turn);
     console.error(
       `[codex-app-server] turn completed (${String(turn?.status ?? "unknown")})`,
     );
@@ -1473,7 +1216,7 @@ function logServerNotification(message: JsonRpcMessage): void {
   }
   if (message.method !== "item/started" && message.method !== "item/completed")
     return;
-  const item = extractRecord(extractRecord(message.params)?.item);
+  const item = asRecord(asRecord(message.params)?.item);
   if (!item) return;
   const type = typeof item.type === "string" ? item.type : "item";
   const tool = typeof item.tool === "string" ? ` ${item.tool}` : "";
@@ -1549,7 +1292,7 @@ class AgentMessageStreamer {
         // turn a healthy Codex turn into a failed phone session; the final
         // complete_session call remains authoritative.
         console.error(
-          `[phone-assistant-companion] could not stream agent message: ${error instanceof Error ? error.message : String(error)}`,
+          `[phone-assistant-companion] could not stream agent message: ${errorMessage(error)}`,
         );
       }
     }
@@ -1599,7 +1342,7 @@ async function maintainCompanionHeartbeat(
     } catch (error) {
       if (lastHealthy !== false) {
         console.error(
-          `[phone-assistant-companion] phone bridge heartbeat unavailable: ${error instanceof Error ? error.message : String(error)}`,
+          `[phone-assistant-companion] phone bridge heartbeat unavailable: ${errorMessage(error)}`,
         );
       }
       lastHealthy = false;
@@ -1611,7 +1354,7 @@ async function maintainCompanionHeartbeat(
 export async function runAssistantCompanion(
   codexClient = new CodexAppServerClient(),
 ): Promise<void> {
-  const pollIntervalMs = parsePollInterval(process.env.PHONE_ASSISTANT_POLL_MS);
+  const pollIntervalMs = parsePollInterval(pollIntervalSetting());
   let stopping = false;
   let pendingRun: Promise<void> | null = null;
   const stop = () => {
@@ -1620,7 +1363,7 @@ export async function runAssistantCompanion(
     if (active) {
       void active.client.interrupt().catch((error) => {
         console.error(
-          `[phone-assistant-companion] could not interrupt on shutdown: ${error instanceof Error ? error.message : String(error)}`,
+          `[phone-assistant-companion] could not interrupt on shutdown: ${errorMessage(error)}`,
         );
       });
     }
@@ -1641,7 +1384,7 @@ export async function runAssistantCompanion(
       },
       (error) => {
         console.error(
-          `[phone-assistant-companion] Codex warmup runner failed: ${error instanceof Error ? error.message : String(error)}`,
+          `[phone-assistant-companion] Codex warmup runner failed: ${errorMessage(error)}`,
         );
         if (codexWarmup === operation) codexWarmup = null;
       },
@@ -1672,14 +1415,14 @@ export async function runAssistantCompanion(
     scheduleCodexWarmup("codex-prewarm");
     while (!stopping) {
       const pollStartedAt = performance.now();
-      if (debugTimingEnabled()) logCompanionPhase("poll:start");
+      if (isDebugTimingEnabled()) logCompanionPhase("poll:start");
       try {
         if (!pendingRun && !activeCodexTurn) {
           const pending = await requestBridge(
             { type: "pending_request", requestId: randomUUID() },
             { timeoutMs: BRIDGE_POLL_TIMEOUT_MS },
           );
-          if (debugTimingEnabled()) {
+          if (isDebugTimingEnabled()) {
             logCompanionPhase(
               "poll:complete",
               `durationMs=${Math.round(performance.now() - pollStartedAt)} available=${pending.available === true}`,
@@ -1697,7 +1440,7 @@ export async function runAssistantCompanion(
             pendingRun = processPendingRequest(pending, codexClient)
               .catch((error) => {
                 console.error(
-                  `[phone-assistant-companion] phone request runner failed: ${error instanceof Error ? error.message : String(error)}`,
+                  `[phone-assistant-companion] phone request runner failed: ${errorMessage(error)}`,
                 );
               })
               .finally(() => {
@@ -1719,7 +1462,7 @@ export async function runAssistantCompanion(
         // The phone may be disconnected or the bridge may not be running yet.
         // Keep polling so reconnecting the device does not require a restart.
         console.error(
-          `[phone-assistant-companion] ${error instanceof Error ? error.message : String(error)}`,
+          `[phone-assistant-companion] ${errorMessage(error)}`,
         );
       }
       if (!stopping) await delay(pollIntervalMs);
@@ -1747,7 +1490,7 @@ async function prewarmCodexClient(
       timing.log("error", `attempt=${attempt}`);
       console.error(
         `[phone-assistant-companion] Codex prewarm attempt ${attempt}/${PREWARM_ATTEMPTS} failed: ` +
-          `${error instanceof Error ? error.message : String(error)}`,
+          `${errorMessage(error)}`,
       );
       if (attempt < PREWARM_ATTEMPTS) await delay(PREWARM_RETRY_DELAY_MS);
     }
@@ -1892,18 +1635,18 @@ export async function processPendingRequest(
     }
   } catch (error) {
     console.error(
-      `[phone-assistant-companion] Codex turn failed: ${error instanceof Error ? error.message : String(error)}`,
+      `[phone-assistant-companion] Codex turn failed: ${errorMessage(error)}`,
     );
     try {
       await requestBridge({
         type: "fail_session",
         requestId: randomUUID(),
         sessionId,
-        reason: error instanceof Error ? error.message : String(error),
+        reason: errorMessage(error),
       });
     } catch (failureError) {
       console.error(
-        `[phone-assistant-companion] could not mark the phone session failed: ${failureError instanceof Error ? failureError.message : String(failureError)}`,
+        `[phone-assistant-companion] could not mark the phone session failed: ${errorMessage(failureError)}`,
       );
     }
   } finally {
@@ -1935,7 +1678,7 @@ export async function processPendingSteer(active: ActiveCodexTurn): Promise<void
   if (shouldInterruptForPhoneStop(pending) && active.client.isTurnInFlight) {
     await active.client.interrupt().catch((error) => {
       console.error(
-        `[phone-assistant-companion] could not interrupt stopped phone session: ${error instanceof Error ? error.message : String(error)}`,
+        `[phone-assistant-companion] could not interrupt stopped phone session: ${errorMessage(error)}`,
       );
     });
     return;
@@ -1991,7 +1734,7 @@ export async function processPendingSteer(active: ActiveCodexTurn): Promise<void
     );
   } catch (error) {
     console.error(
-      `[phone-assistant-companion] Codex steer failed: ${error instanceof Error ? error.message : String(error)}`,
+      `[phone-assistant-companion] Codex steer failed: ${errorMessage(error)}`,
     );
     await releaseSteer(steerId, active.sessionId);
   }
@@ -2007,7 +1750,7 @@ async function releaseSteer(steerId: string, sessionId: string): Promise<void> {
     });
   } catch (error) {
     console.error(
-      `[phone-assistant-companion] could not release steer ${steerId}: ${error instanceof Error ? error.message : String(error)}`,
+      `[phone-assistant-companion] could not release steer ${steerId}: ${errorMessage(error)}`,
     );
   }
 }
@@ -2021,7 +1764,7 @@ async function releaseRequest(sessionId: string): Promise<void> {
     });
   } catch (error) {
     console.error(
-      `[phone-assistant-companion] could not release request: ${error instanceof Error ? error.message : String(error)}`,
+      `[phone-assistant-companion] could not release request: ${errorMessage(error)}`,
     );
   }
 }
@@ -2036,22 +1779,19 @@ function normalizeAgentFeedback(text: string): string {
 }
 
 export function extractThreadId(value: unknown): string | null {
-  if (!value || typeof value !== "object") return null;
-  const record = value as Record<string, unknown>;
-  const thread = record.thread;
-  if (thread && typeof thread === "object") {
-    const id = (thread as Record<string, unknown>).id;
-    if (typeof id === "string" && id) return id;
-  }
+  const record = asRecord(value);
+  if (!record) return null;
+  const threadId = asRecord(record.thread)?.id;
+  if (typeof threadId === "string" && threadId) return threadId;
   if (typeof record.threadId === "string" && record.threadId)
     return record.threadId;
   return typeof record.id === "string" && record.id ? record.id : null;
 }
 
 export function extractTurnId(value: unknown): string | null {
-  const record = extractRecord(value);
+  const record = asRecord(value);
   if (!record) return null;
-  const turn = extractRecord(record.turn);
+  const turn = asRecord(record.turn);
   if (turn && typeof turn.id === "string" && turn.id) return turn.id;
   return typeof record.id === "string" && record.id ? record.id : null;
 }
@@ -2066,12 +1806,12 @@ export function extractCompanionTokenUsageEvent(
   value: unknown,
   timestamp = Date.now(),
 ): CompanionTokenUsageEvent | null {
-  const message = extractRecord(value);
+  const message = asRecord(value);
   if (message?.method !== "thread/tokenUsage/updated") return null;
 
-  const params = extractRecord(message.params);
-  const tokenUsage = extractRecord(params?.tokenUsage);
-  const last = extractRecord(tokenUsage?.last);
+  const params = asRecord(message.params);
+  const tokenUsage = asRecord(params?.tokenUsage);
+  const last = asRecord(tokenUsage?.last);
   const threadId = typeof params?.threadId === "string" ? params.threadId : "";
   const turnId = typeof params?.turnId === "string" ? params.turnId : "";
   if (!threadId || !turnId || !last) return null;
@@ -2117,17 +1857,15 @@ export function extractCompanionTokenUsageEvent(
 }
 
 export function extractText(value: unknown): string {
-  const record = extractRecord(value);
+  const record = asRecord(value);
   if (!record) return "";
   for (const key of ["delta", "text", "message"]) {
     if (typeof record[key] === "string") return record[key] as string;
   }
-  const item = record.item;
-  if (item && typeof item === "object") {
-    const itemRecord = extractRecord(item);
-    if (!itemRecord) return "";
+  const item = asRecord(record.item);
+  if (item) {
     for (const key of ["text", "message"]) {
-      if (typeof itemRecord[key] === "string") return itemRecord[key] as string;
+      if (typeof item[key] === "string") return item[key] as string;
     }
   }
   return "";
@@ -2247,16 +1985,16 @@ function touchAgentMessage(
 function extractAgentMessageItem(
   value: unknown,
 ): Record<string, unknown> | null {
-  const record = extractRecord(value);
-  const item = extractRecord(record?.item) || record;
+  const record = asRecord(value);
+  const item = asRecord(record?.item) || record;
   return item?.type === "agentMessage" ? item : null;
 }
 
 function extractAgentMessageId(value: unknown): string | null {
-  const record = extractRecord(value);
+  const record = asRecord(value);
   if (!record) return null;
   if (typeof record.itemId === "string" && record.itemId) return record.itemId;
-  const item = extractRecord(record.item);
+  const item = asRecord(record.item);
   if (typeof item?.id === "string" && item.id) return item.id;
   if (
     record.type === "agentMessage" &&
@@ -2268,29 +2006,28 @@ function extractAgentMessageId(value: unknown): string | null {
 }
 
 function extractAgentMessagePhase(value: unknown): string | null {
-  const record = extractRecord(value);
+  const record = asRecord(value);
   if (!record) return null;
   if (typeof record.phase === "string" && record.phase) return record.phase;
-  const item = extractRecord(record.item);
+  const item = asRecord(record.item);
   return typeof item?.phase === "string" && item.phase ? item.phase : null;
 }
 
 export function extractTurnError(value: unknown): string {
-  const record = extractRecord(value);
-  const nestedError = extractRecord(record?.error);
+  const record = asRecord(value);
+  const nestedError = asRecord(record?.error);
   if (typeof nestedError?.message === "string") return nestedError.message;
-  const turn = extractRecord(record?.turn);
-  const turnError = extractRecord(turn?.error);
+  const turn = asRecord(record?.turn);
+  const turnError = asRecord(turn?.error);
   if (typeof turnError?.message === "string") return turnError.message;
   return typeof record?.message === "string" ? record.message : "";
 }
 
 export function resolveCodexBin(): string {
-  const configured = process.env.PHONE_ASSISTANT_CODEX_BIN?.trim();
+  const configured = codexBinSetting();
   if (configured) return configured;
   if (process.platform === "win32") {
-    const localAppData = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
-    const binDirectory = join(localAppData, "OpenAI", "Codex", "bin");
+    const binDirectory = join(windowsLocalAppDataDirectory(), "OpenAI", "Codex", "bin");
     try {
       const installed = readdirSync(binDirectory, { withFileTypes: true })
         .filter((entry) => entry.isDirectory())
@@ -2318,17 +2055,17 @@ export function extractCompanionPlanUpdatedEvent(
   expectedTurnId: string | null,
   timestamp = Date.now(),
 ): CompanionPlanUpdatedEvent | null {
-  const message = extractRecord(value);
+  const message = asRecord(value);
   if (message?.method !== "turn/plan/updated" || !threadId) return null;
 
-  const params = extractRecord(message.params);
+  const params = asRecord(message.params);
   const turnId = typeof params?.turnId === "string" ? params.turnId : "";
   if (!turnId || (expectedTurnId && expectedTurnId !== turnId)) return null;
   if (!Array.isArray(params?.plan)) return null;
 
   const steps: CompanionPlanUpdatedEvent["steps"] = [];
   for (const rawStep of params.plan) {
-    const step = extractRecord(rawStep);
+    const step = asRecord(rawStep);
     const text = typeof step?.step === "string" ? step.step : null;
     const rawStatus = step?.status;
     const status =
@@ -2356,16 +2093,6 @@ export function extractCompanionPlanUpdatedEvent(
   };
 }
 
-function resolveCodexHome(): string {
-  const configured = process.env.PHONE_ASSISTANT_CODEX_HOME?.trim();
-  return configured ? resolve(configured) : DEFAULT_CODEX_HOME;
-}
-
-function resolveCodexRuntimeCwd(): string {
-  const configured = process.env.PHONE_ASSISTANT_CODEX_CWD?.trim();
-  return configured ? resolve(configured) : DEFAULT_CODEX_RUNTIME_CWD;
-}
-
 /**
  * Codex merges table-valued `-c` overrides with the selected home config.
  * Explicitly disable each MCP server configured in that same home as well as
@@ -2389,12 +2116,6 @@ export function disabledConfiguredMcpOverrides(codexHome: string): string[] {
   return [...names].sort().map((name) => `mcp_servers.${name}.enabled=false`);
 }
 
-function extractRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object"
-    ? (value as Record<string, unknown>)
-    : null;
-}
-
 export function parsePollInterval(value: string | undefined): number {
   if (!value?.trim()) return DEFAULT_POLL_INTERVAL_MS;
   if (!/^\d+$/.test(value.trim()))
@@ -2407,13 +2128,11 @@ export function parsePollInterval(value: string | undefined): number {
 }
 
 function resolveCodexModel(): string {
-  return process.env.PHONE_ASSISTANT_CODEX_MODEL?.trim() || DEFAULT_CODEX_MODEL;
+  return codexModelSetting() ?? DEFAULT_CODEX_MODEL;
 }
 
 function resolveCodexEffort(): string {
-  return normalizeCodexEffort(
-    process.env.PHONE_ASSISTANT_CODEX_REASONING_EFFORT,
-  );
+  return normalizeCodexEffort(codexReasoningEffortSetting());
 }
 
 export function normalizeCodexEffort(value: string | undefined): string {
@@ -2441,14 +2160,10 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-const isMainModule =
-  process.argv[1]?.endsWith("assistant-companion.ts") ||
-  process.argv[1]?.endsWith("assistant-companion.js");
-
-if (isMainModule) {
+if (isMainModule("assistant-companion")) {
   runAssistantCompanion().catch((error: unknown) => {
     console.error(
-      `[phone-assistant-companion] ${error instanceof Error ? error.message : String(error)}`,
+      `[phone-assistant-companion] ${errorMessage(error)}`,
     );
     process.exitCode = 1;
   });

@@ -3,8 +3,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, watch } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import http from "node:http";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 
@@ -18,19 +17,18 @@ import {
   type CompanionTokenUsageEvent,
   type CompanionToolCallEvent,
 } from "../companion-events.js";
+import { parsePort, requestBridge } from "../phone/bridge-client.js";
 import {
   DEFAULT_BRIDGE_HOST,
   DEFAULT_BRIDGE_PORT,
-  parsePort,
-  requestBridge,
-  type BridgeMessage
-} from "../phone-assistant-bridge.js";
+  type BridgeMessage,
+} from "../phone/protocol.js";
 import {
   DEFAULT_PHONE_DISCOVERY_TIMEOUT_MS,
   discoverPhones,
   requestPairingApproval,
   type DiscoveredPhone,
-} from "../pairing.js";
+} from "../phone/pairing.js";
 import type {
   BridgeCheckResult,
   BridgeStatus,
@@ -45,6 +43,18 @@ import type {
   CompanionTokenUsageSnapshot,
   DiscoveredPhoneSnapshot,
 } from "./api.js";
+import { compactBase64, parseBase64DataUrl } from "../shared/base64.js";
+import { errorMessage, toError } from "../shared/errors.js";
+import { isPlainRecord, isRecord } from "../shared/guards.js";
+import { isMainModule } from "../shared/is-main-module.js";
+import {
+  bridgeHostSetting,
+  bridgePortSetting,
+  bridgeTokenSetting,
+  companionSettingsPath,
+  dashboardHostSetting,
+  dashboardPortSetting,
+} from "../config/env.js";
 
 export interface ConnectionConfig {
   host: string;
@@ -112,7 +122,7 @@ const sseClients = new Set<http.ServerResponse>();
 
 function readEnvPort(): number {
   try {
-    return parsePort(process.env.PHONE_ASSISTANT_BRIDGE_PORT ?? `${DEFAULT_BRIDGE_PORT}`);
+    return parsePort(bridgePortSetting() ?? `${DEFAULT_BRIDGE_PORT}`);
   } catch {
     return DEFAULT_BRIDGE_PORT;
   }
@@ -120,17 +130,13 @@ function readEnvPort(): number {
 
 function initialConnection(): ConnectionConfig {
   return {
-    host: process.env.PHONE_ASSISTANT_BRIDGE_HOST?.trim() || DEFAULT_BRIDGE_HOST,
+    host: bridgeHostSetting() ?? DEFAULT_BRIDGE_HOST,
     port: readEnvPort(),
-    token: process.env.PHONE_ASSISTANT_BRIDGE_TOKEN?.trim() || ""
+    token: bridgeTokenSetting() ?? ""
   };
 }
 
-function settingsPath(): string {
-  return join(homedir(), ".dhd", "companion-connection.json");
-}
-
-export async function loadConnection(path = settingsPath()): Promise<ConnectionConfig> {
+export async function loadConnection(path = companionSettingsPath()): Promise<ConnectionConfig> {
   const defaults = initialConnection();
   let stored: StoredConnectionSettings = {};
   try {
@@ -154,13 +160,13 @@ export async function loadConnection(path = settingsPath()): Promise<ConnectionC
     // or unpaired configurations.
     host: hasStoredPairing
       ? stored.host?.trim() || DEFAULT_BRIDGE_HOST
-      : process.env.PHONE_ASSISTANT_BRIDGE_HOST?.trim() || stored.host?.trim() || defaults.host,
+      : bridgeHostSetting() || stored.host?.trim() || defaults.host,
     port: hasStoredPairing
       ? port
-      : process.env.PHONE_ASSISTANT_BRIDGE_PORT ? defaults.port : port,
+      : bridgePortSetting() ? defaults.port : port,
     token: hasStoredPairing
       ? stored.token?.trim() || ""
-      : process.env.PHONE_ASSISTANT_BRIDGE_TOKEN?.trim() || stored.token?.trim() || "",
+      : bridgeTokenSetting() || stored.token?.trim() || "",
     ...(stored.deviceId ? { deviceId: stored.deviceId.trim() } : {})
   };
 }
@@ -172,8 +178,8 @@ async function saveConnection(): Promise<void> {
     token: connection.token,
     ...(connection.deviceId ? { deviceId: connection.deviceId } : {})
   };
-  await mkdir(dirname(settingsPath()), { recursive: true });
-  await writeFile(settingsPath(), `${JSON.stringify(stored, null, 2)}\n`, {
+  await mkdir(dirname(companionSettingsPath()), { recursive: true });
+  await writeFile(companionSettingsPath(), `${JSON.stringify(stored, null, 2)}\n`, {
     encoding: "utf8",
     mode: 0o600
   });
@@ -264,11 +270,8 @@ export function toJsonValue(value: unknown): CompanionJsonValue {
 
 export function decodeImage(value: string): Buffer | undefined {
   const raw = value.trim();
-  const dataUrlMatch = raw.match(/^data:([^;,]+);base64,([\s\S]*)$/i);
-  const base64 = (dataUrlMatch ? dataUrlMatch[2] : raw).replace(/\s+/g, "");
-  if (!base64 || !/^[A-Za-z0-9+/]+={0,2}$/.test(base64) || base64.length % 4 !== 0) {
-    return undefined;
-  }
+  const base64 = compactBase64(parseBase64DataUrl(raw)?.base64 ?? raw);
+  if (!base64) return undefined;
   const bytes = Buffer.from(base64, "base64");
   return bytes.length > 0 ? bytes : undefined;
 }
@@ -277,15 +280,14 @@ export function dashboardToolResponse(
   callId: string,
   value: unknown,
 ): CompanionToolCallResponse | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const result = value as Record<string, unknown>;
+  if (!isRecord(value)) return undefined;
+  const result = value;
   removeToolImages(callId);
   const images: CompanionToolCallResponse["images"] = [];
   const rawContent = Array.isArray(result.content) ? result.content : [];
 
-  rawContent.forEach((value, index) => {
-    if (!value || typeof value !== "object") return;
-    const item = value as Record<string, unknown>;
+  rawContent.forEach((item, index) => {
+    if (!isRecord(item)) return;
     if (
       item.type !== "image" ||
       typeof item.data !== "string" ||
@@ -311,9 +313,8 @@ export function dashboardToolResponse(
   const response: CompanionToolCallResponse = { images };
   const debugImages: NonNullable<CompanionToolCallResponse["debugImages"]> = [];
   const rawDebugImages = Array.isArray(result.debugImages) ? result.debugImages : [];
-  rawDebugImages.forEach((value, index) => {
-    if (!value || typeof value !== "object") return;
-    const item = value as Record<string, unknown>;
+  rawDebugImages.forEach((item, index) => {
+    if (!isRecord(item)) return;
     if (
       item.type !== "image" ||
       (item.label !== "before" && item.label !== "after") ||
@@ -339,7 +340,7 @@ export function dashboardToolResponse(
   });
   if (debugImages.length > 0) response.debugImages = debugImages;
   if (result.isError === true) response.isError = true;
-  if (result.structuredContent && typeof result.structuredContent === "object" && !Array.isArray(result.structuredContent)) {
+  if (isPlainRecord(result.structuredContent)) {
     response.structuredContent = toJsonValue(result.structuredContent) as { [key: string]: CompanionJsonValue };
   }
   return response;
@@ -384,7 +385,7 @@ export function ingestCompanionToolCallEvent(value: unknown): void {
     try {
       response = dashboardToolResponse(event.callId, event.result);
     } catch (error) {
-      conversionError = error instanceof Error ? error.message : String(error);
+      conversionError = errorMessage(error);
     }
   }
   const error = event.error || conversionError;
@@ -657,10 +658,6 @@ function bridgeOptions(timeoutMs: number, target: ConnectionConfig = connection)
   };
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 function statusCheckError(result: BridgeMessage): Error {
   return new Error(
     typeof result.message === "string"
@@ -754,7 +751,7 @@ async function requestStatusWithRetry(
       }
     }
   }
-  throw (lastError instanceof Error ? lastError : new Error(String(lastError)));
+  throw toError(lastError);
 }
 
 /** Tell the phone that the worker owning the liveness lease has stopped. */
@@ -1087,13 +1084,13 @@ async function applyPairedConnection(
 }
 
 async function pairWithDiscoveredDevice(value: unknown): Promise<CompanionState> {
-  if (!value || typeof value !== "object" || typeof (value as { deviceId?: unknown }).deviceId !== "string") {
+  if (!isRecord(value) || typeof value.deviceId !== "string") {
     throw new Error("A discovered phone must be selected.");
   }
-  const deviceId = (value as { deviceId: string }).deviceId.trim();
+  const deviceId = value.deviceId.trim();
   if (!deviceId) throw new Error("A discovered phone must be selected.");
   const expectedConnection = connection;
-  const replacePairing = (value as { replacePairing?: unknown }).replacePairing === true;
+  const replacePairing = value.replacePairing === true;
   if (targetHasSavedPairing(expectedConnection, deviceId) && !replacePairing && bridgeStatus === "connected") {
     return snapshot();
   }
@@ -1308,7 +1305,7 @@ export function createCompanionWebServer(): http.Server {
         res.end(JSON.stringify(response));
       } catch (err) {
         res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ message: err instanceof Error ? err.message : String(err) }));
+        res.end(JSON.stringify({ message: errorMessage(err) }));
       }
       return;
     }
@@ -1321,7 +1318,7 @@ export function createCompanionWebServer(): http.Server {
         res.end(JSON.stringify(nextState));
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ message: err instanceof Error ? err.message : String(err) }));
+        res.end(JSON.stringify({ message: errorMessage(err) }));
       }
       return;
     }
@@ -1336,7 +1333,7 @@ export function createCompanionWebServer(): http.Server {
         res.end(JSON.stringify(result));
       } catch (err) {
         res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, message: err instanceof Error ? err.message : String(err) }));
+        res.end(JSON.stringify({ ok: false, message: errorMessage(err) }));
       }
       return;
     }
@@ -1348,7 +1345,7 @@ export function createCompanionWebServer(): http.Server {
         res.end(JSON.stringify(nextState));
       } catch (err) {
         res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ message: err instanceof Error ? err.message : String(err) }));
+        res.end(JSON.stringify({ message: errorMessage(err) }));
       }
       return;
     }
@@ -1360,7 +1357,7 @@ export function createCompanionWebServer(): http.Server {
         res.end(JSON.stringify(nextState));
       } catch (err) {
         res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ message: err instanceof Error ? err.message : String(err) }));
+        res.end(JSON.stringify({ message: errorMessage(err) }));
       }
       return;
     }
@@ -1488,7 +1485,7 @@ function shutdownDashboard(exitCode: number): void {
     .catch((error: unknown) => {
       console.error(
         "Failed to stop the companion worker during dashboard shutdown:",
-        error instanceof Error ? error.message : String(error),
+        errorMessage(error),
       );
     })
     .then(() => {
@@ -1497,9 +1494,9 @@ function shutdownDashboard(exitCode: number): void {
     });
 }
 
-if (process.argv[1] && (process.argv[1].endsWith("server.ts") || process.argv[1].endsWith("server.js"))) {
-  const port = Number(process.env.COMPANION_PORT || DEFAULT_WEB_PORT);
-  const host = process.env.COMPANION_HOST || DEFAULT_WEB_HOST;
+if (isMainModule("server")) {
+  const port = Number(dashboardPortSetting() || DEFAULT_WEB_PORT);
+  const host = dashboardHostSetting() || DEFAULT_WEB_HOST;
   process.once("SIGINT", () => shutdownDashboard(0));
   process.once("SIGTERM", () => shutdownDashboard(0));
   startCompanionWebServer(port, host).catch((err) => {
