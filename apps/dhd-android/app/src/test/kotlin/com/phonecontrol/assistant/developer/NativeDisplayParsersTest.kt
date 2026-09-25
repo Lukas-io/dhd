@@ -24,13 +24,24 @@ class NativeDisplayParsersTest {
     """.trimIndent()
 
     @Test
-    fun `logical unique id is read from the requested display and unquoted ids stop at a comma`() {
+    fun `logical unique id is read from the requested display including unquoted virtual ids`() {
         assertEquals(taskUniqueId, SurfaceFlingerIds.findLogicalUniqueId(getDisplaysSingleLine, 7))
         assertEquals("local:4619827259835644672", SurfaceFlingerIds.findLogicalUniqueId(getDisplaysSingleLine, 0))
         assertEquals(taskUniqueId, SurfaceFlingerIds.findLogicalUniqueId(getDisplaysMultiLine, 7))
         assertEquals(
-            "virtual:com.android.shell",
+            "virtual:com.android.shell,2000,dhd-task-def,0",
             SurfaceFlingerIds.findLogicalUniqueId(getDisplaysMultiLine, 8),
+        )
+        assertEquals(
+            "virtual:com.android.shell,2000,DHD run-1,3",
+            SurfaceFlingerIds.findLogicalUniqueId(
+                "Display id 9: DisplayInfo{\"DHD run-1\", displayId 9, uniqueId virtual:com.android.shell,2000,DHD run-1,3, app 720 x 1560}",
+                9,
+            ),
+        )
+        assertEquals(
+            "local:4619827259835644672",
+            SurfaceFlingerIds.findLogicalUniqueId("Display id 0: DisplayInfo{uniqueId local:4619827259835644672, app 1080 x 2340}", 0),
         )
         assertNull(SurfaceFlingerIds.findLogicalUniqueId(getDisplaysSingleLine, 9))
         assertNull(SurfaceFlingerIds.findLogicalUniqueId(null, 7))
@@ -169,8 +180,12 @@ class NativeDisplayParsersTest {
             create("task-1", "com.example.shop", "720", "1560", "420", "30", "2000000", "100"),
         )
         assertEquals(
+            "DHD display operation failed: appDensityDpi is out of range.",
+            create("task-1", "com.example.shop", "720", "1560", "420", "30", "2000000", "100", "720", "1560"),
+        )
+        assertEquals(
             "DHD display operation failed: appDisplayWidth is out of range.",
-            create("task-1", "com.example.shop", "720", "1560", "420", "30", "2000000", "100", "5000", "1000"),
+            create("task-1", "com.example.shop", "720", "1560", "420", "30", "2000000", "320", "5000", "1000"),
         )
     }
 }
