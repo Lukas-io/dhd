@@ -2,6 +2,7 @@
 
 package com.phonecontrol.assistant.ui.settings
 
+import android.os.Build
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -41,11 +42,13 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.phonecontrol.assistant.BuildConfig
 import com.phonecontrol.assistant.R
 import com.phonecontrol.assistant.adb.DeveloperConnectionState
 import com.phonecontrol.assistant.adb.DeveloperModeStatus
 import com.phonecontrol.assistant.apps.AppPermissionRepository
 import com.phonecontrol.assistant.apps.InstalledUserApp
+import com.phonecontrol.assistant.display.taskDisplayUnsupportedReason
 import com.phonecontrol.assistant.domain.ReasoningEffort
 import com.phonecontrol.assistant.ui.components.CircleIconButton
 import com.phonecontrol.assistant.ui.components.SettingsCard
@@ -315,7 +318,11 @@ fun SettingsScreen(
                             SettingsRow(
                                 title = stringResource(R.string.settings_dhd_phone_access),
                                 subtitle = when (developerStatus.state) {
-                                    DeveloperConnectionState.READY -> "Phone access is active"
+                                    DeveloperConnectionState.READY -> if (taskDisplayUnsupportedReason(Build.VERSION.SDK_INT) != null) {
+                                        stringResource(R.string.settings_task_displays_need_android_16)
+                                    } else {
+                                        "Phone access is active"
+                                    }
                                     DeveloperConnectionState.CONNECTING,
                                     DeveloperConnectionState.CHECKING -> "Connecting phone access automatically…"
 
@@ -357,7 +364,11 @@ fun SettingsScreen(
                 SettingsCard {
                     SettingsRow(
                         title = stringResource(R.string.settings_version),
-                        subtitle = stringResource(R.string.settings_0_1_0_android_sdk_35),
+                        subtitle = stringResource(
+                            R.string.settings_version_summary,
+                            BuildConfig.VERSION_NAME,
+                            Build.VERSION.SDK_INT,
+                        ),
                         leading = { SettingsRowIcon(R.drawable.ic_info, "Version") },
                     )
                 }
