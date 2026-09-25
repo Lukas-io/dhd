@@ -6,14 +6,19 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.phonecontrol.assistant.app.AppContainer
+import com.phonecontrol.assistant.apps.InstalledUserApp
 import com.phonecontrol.assistant.core.sessionIdOrNull
 import com.phonecontrol.assistant.display.TaskPreviewState
 import com.phonecontrol.assistant.domain.ActivityEvent
-import com.phonecontrol.assistant.domain.TaskPointerEvent
 import com.phonecontrol.assistant.execution.TaskDisplayRecord
 import com.phonecontrol.assistant.execution.TaskDisplaySession
 import com.phonecontrol.assistant.session.SessionState
 import com.phonecontrol.assistant.ui.displays.DisplayUiSources
+import com.phonecontrol.assistant.ui.displays.DisplayUiState
+import com.phonecontrol.assistant.ui.displays.mapDisplayUi
+import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -21,8 +26,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 internal data class AppUiState(
     val displaySources: DisplayUiSources,
@@ -42,9 +51,17 @@ class AppViewModel internal constructor(
     displayRecords: StateFlow<List<TaskDisplayRecord>>,
     sessionState: StateFlow<SessionState>,
     events: StateFlow<List<ActivityEvent>>,
-    pointerEvent: StateFlow<TaskPointerEvent?>,
     resolveDisplay: suspend (String) -> TaskDisplaySession?,
+    appLabelFor: (String) -> String?,
+    mappingDispatcher: CoroutineDispatcher = Dispatchers.Default,
+    private val listLaunchableApps: () -> List<InstalledUserApp> = { emptyList() },
+    private val appListDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : ViewModel() {
+    private val appLabels = ConcurrentHashMap<String, CachedAppLabel>()
+    private val cachedAppLabelFor: (String) -> String? = { packageName ->
+        appLabels.getOrPut(packageName) { CachedAppLabel(appLabelFor(packageName)) }.label
+    }
+
     // A new coordinator run can claim a retained display whose native
     // owner key belongs to the previous run. Resolve that binding for
     // the inline viewer so the UI follows the selected display rather
@@ -67,7 +84,7 @@ class AppViewModel internal constructor(
 
     internal val uiState: StateFlow<AppUiState> = combine(
         combine(activeSession, previewState, previewStates, displayRecords, ::BackendDisplaySources),
-        combine(sessionState, events, pointerEvent, resolvedDisplayForRun, ::CoordinatorDisplaySources),
+        combine(sessionState, events, resolvedDisplayForRun, ::CoordinatorDisplaySources),
     ) { backend, coordinator -> AppUiState(displayUiSources(backend, coordinator)) }
         .stateIn(
             viewModelScope,
@@ -75,10 +92,29 @@ class AppViewModel internal constructor(
             AppUiState(
                 displayUiSources(
                     BackendDisplaySources(activeSession.value, previewState.value, previewStates.value, displayRecords.value),
-                    CoordinatorDisplaySources(sessionState.value, events.value, pointerEvent.value, resolvedDisplayForRun.value),
+                    CoordinatorDisplaySources(sessionState.value, events.value, resolvedDisplayForRun.value),
                 ),
             ),
         )
+
+    val displayUi: StateFlow<DisplayUiState> = uiState
+        .map { state -> mapDisplayUi(state.displaySources, cachedAppLabelFor) }
+        .flowOn(mappingDispatcher)
+        .distinctUntilChanged()
+        .stateIn(
+            viewModelScope,
+            SharingStarted.Eagerly,
+            mapDisplayUi(uiState.value.displaySources, cachedAppLabelFor),
+        )
+
+    private val _launchableApps = MutableStateFlow<List<InstalledUserApp>>(emptyList())
+    val launchableApps: StateFlow<List<InstalledUserApp>> = _launchableApps.asStateFlow()
+
+    fun refreshLaunchableApps() {
+        viewModelScope.launch {
+            _launchableApps.value = withContext(appListDispatcher) { listLaunchableApps() }
+        }
+    }
 
     private var requestAwaitingNotificationPermission: PendingRunRequest? = null
     private val _restoredRequest = MutableStateFlow<String?>(null)
@@ -101,7 +137,7 @@ class AppViewModel internal constructor(
     }
 
     companion object {
-        fun factory(container: AppContainer): ViewModelProvider.Factory =
+        fun factory(container: AppContainer, appLabelFor: (String) -> String?): ViewModelProvider.Factory =
             viewModelFactory {
                 initializer {
                     AppViewModel(
@@ -111,8 +147,9 @@ class AppViewModel internal constructor(
                         displayRecords = container.taskDisplayBackend.displayRecords,
                         sessionState = container.sessionCoordinator.state,
                         events = container.sessionCoordinator.events,
-                        pointerEvent = container.sessionCoordinator.pointerEvent,
                         resolveDisplay = { sessionKey -> container.taskDisplayBackend.current(sessionKey) },
+                        appLabelFor = appLabelFor,
+                        listLaunchableApps = container.installedAppsRepository::listLaunchableUserApps,
                     )
                 }
             }
@@ -135,9 +172,10 @@ private data class BackendDisplaySources(
 private data class CoordinatorDisplaySources(
     val sessionState: SessionState,
     val events: List<ActivityEvent>,
-    val pointerEvent: TaskPointerEvent?,
     val resolvedDisplayForRun: TaskDisplaySession?,
 )
+
+private class CachedAppLabel(val label: String?)
 
 private fun displayUiSources(
     backend: BackendDisplaySources,
@@ -149,6 +187,5 @@ private fun displayUiSources(
     records = backend.records,
     sessionState = coordinator.sessionState,
     events = coordinator.events,
-    pointerEvent = coordinator.pointerEvent,
     resolvedDisplayForRun = coordinator.resolvedDisplayForRun,
 )
