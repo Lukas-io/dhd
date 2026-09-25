@@ -1,12 +1,15 @@
 package com.phonecontrol.assistant.display
 
 import com.phonecontrol.assistant.adb.PhoneAccessController
+import com.phonecontrol.assistant.core.runCatchingUnlessCancelled
 import com.phonecontrol.assistant.execution.PhoneProcessResult
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 private val DHD_SESSION_KEY_PATTERN = Regex("[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}")
 private val DHD_PACKAGE_PATTERN = Regex("[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+")
@@ -138,9 +141,17 @@ interface NativeDisplayManager {
  * The facade deliberately never infers display 0. Every operation carries the
  * session key and validates the exact display id returned by the daemon.
  */
-class DhdVirtualDisplayManager(
-    private val controller: PhoneAccessController,
+internal fun interface DisplayCommandExecutor {
+    suspend fun execute(command: List<String>, binaryOutput: Boolean): PhoneProcessResult
+}
+
+class DhdVirtualDisplayManager internal constructor(
+    private val commands: DisplayCommandExecutor,
 ) : NativeDisplayManager {
+    constructor(controller: PhoneAccessController) : this(
+        DisplayCommandExecutor { command, binaryOutput -> controller.execute(command, binaryOutput) },
+    )
+
     private val stateMutex = Mutex()
     private val sessions = LinkedHashMap<String, DhdVirtualDisplaySession>()
     /** Cancellation tombstones are process-local and intentionally retained. */
@@ -199,7 +210,7 @@ class DhdVirtualDisplayManager(
             if (validation != null) return@withLock validation
 
             val result = try {
-                controller.execute(
+                execute(
                     command = buildList {
                         add(DhdVirtualDisplayProtocol.COMMAND)
                         add(DhdVirtualDisplayProtocol.CREATE)
@@ -218,13 +229,7 @@ class DhdVirtualDisplayManager(
                     },
                 )
             } catch (cancelledError: CancellationException) {
-                if (cancelled.contains(sessionKey)) {
-                    runCatching {
-                        controller.execute(
-                            listOf(DhdVirtualDisplayProtocol.COMMAND, DhdVirtualDisplayProtocol.CLOSE, sessionKey),
-                        )
-                    }
-                }
+                if (cancelled.contains(sessionKey)) closeByKeyAfterStop(sessionKey)
                 throw cancelledError
             }
             val session = parseCreatedSession(result, sessionKey, packageName)
@@ -233,9 +238,7 @@ class DhdVirtualDisplayManager(
                 if (stopped) {
                     // Creation may have crossed the stop request. Always clean
                     // up by key so a late daemon response cannot orphan a display.
-                    controller.execute(
-                        listOf(DhdVirtualDisplayProtocol.COMMAND, DhdVirtualDisplayProtocol.CLOSE, sessionKey),
-                    )
+                    closeByKeyAfterStop(sessionKey)
                     return@withLock DhdVirtualDisplayResult.Failed(
                         DhdVirtualDisplayResult.Code.STOPPED,
                         "The virtual display session was stopped while it was starting.",
@@ -256,9 +259,7 @@ class DhdVirtualDisplayManager(
                 }
             }
             if (stopAfterCreate) {
-                controller.execute(
-                    listOf(DhdVirtualDisplayProtocol.COMMAND, DhdVirtualDisplayProtocol.CLOSE, sessionKey),
-                )
+                closeByKeyAfterStop(sessionKey)
                 DhdVirtualDisplayResult.Failed(
                     DhdVirtualDisplayResult.Code.STOPPED,
                     "The virtual display session was stopped while it was starting.",
@@ -273,7 +274,7 @@ class DhdVirtualDisplayManager(
         session: DhdVirtualDisplaySession,
     ): DhdLivePreviewHandle {
         require(isCurrentSession(session)) { "The virtual display session is not active." }
-        val result = controller.execute(
+        val result = execute(
             listOf(
                 DhdVirtualDisplayProtocol.COMMAND,
                 DhdVirtualDisplayProtocol.ATTACH,
@@ -288,7 +289,7 @@ class DhdVirtualDisplayManager(
 
     override suspend fun capture(session: DhdVirtualDisplaySession): DhdVirtualDisplayCapture {
         require(isCurrentSession(session)) { "The virtual display session is not active." }
-        val result = controller.execute(
+        val result = execute(
             command = listOf(
                 DhdVirtualDisplayProtocol.COMMAND,
                 DhdVirtualDisplayProtocol.CAPTURE,
@@ -308,12 +309,24 @@ class DhdVirtualDisplayManager(
         // create response is then closed by key and can never be published.
         cancelled += sessionKey
         val operationLock = operationLocks.getOrPut(sessionKey) { Mutex() }
-        operationLock.withLock {
-            stateMutex.withLock {
-                sessions.remove(sessionKey)
+        withContext(NonCancellable) {
+            operationLock.withLock {
+                stateMutex.withLock {
+                    sessions.remove(sessionKey)
+                }
+                runCatchingUnlessCancelled {
+                    execute(
+                        listOf(DhdVirtualDisplayProtocol.COMMAND, DhdVirtualDisplayProtocol.CLOSE, sessionKey),
+                    )
+                }
             }
-            runCatching {
-                controller.execute(
+        }
+    }
+
+    private suspend fun closeByKeyAfterStop(sessionKey: String) {
+        withContext(NonCancellable) {
+            runCatchingUnlessCancelled {
+                execute(
                     listOf(DhdVirtualDisplayProtocol.COMMAND, DhdVirtualDisplayProtocol.CLOSE, sessionKey),
                 )
             }
@@ -326,16 +339,18 @@ class DhdVirtualDisplayManager(
     }
 
     override suspend fun closeAll() {
-        val keys = stateMutex.withLock {
-            val current = sessions.keys.toList()
-            sessions.clear()
-            current
-        }
-        cancelled += keys
-        runCatching {
-            controller.execute(
-                listOf(DhdVirtualDisplayProtocol.COMMAND, DhdVirtualDisplayProtocol.CLOSE_ALL),
-            )
+        withContext(NonCancellable) {
+            val keys = stateMutex.withLock {
+                val current = sessions.keys.toList()
+                sessions.clear()
+                current
+            }
+            cancelled += keys
+            runCatchingUnlessCancelled {
+                execute(
+                    listOf(DhdVirtualDisplayProtocol.COMMAND, DhdVirtualDisplayProtocol.CLOSE_ALL),
+                )
+            }
         }
     }
 
@@ -354,7 +369,7 @@ class DhdVirtualDisplayManager(
             if (daemonResetComplete) {
                 return@withLock stateMutex.withLock { sessions.toMap() }
             }
-            val result = controller.execute(
+            val result = execute(
                 listOf(DhdVirtualDisplayProtocol.COMMAND, DhdVirtualDisplayProtocol.LIST),
             )
             if (result.exitCode != 0 || result.timedOut || result.stdout.isEmpty()) {
@@ -374,8 +389,8 @@ class DhdVirtualDisplayManager(
             val adopted = parsed.filterKeys { it in validKeys }
             val orphaned = parsed.keys - adopted.keys
             orphaned.forEach { key ->
-                runCatching {
-                    controller.execute(
+                runCatchingUnlessCancelled {
+                    execute(
                         listOf(DhdVirtualDisplayProtocol.COMMAND, DhdVirtualDisplayProtocol.CLOSE, key),
                     )
                 }
@@ -403,7 +418,7 @@ class DhdVirtualDisplayManager(
             // reconciliation with its persisted keys first). The legacy
             // close-all path remains only as a safe fallback for an older or
             // malformed daemon response.
-            val result = controller.execute(
+            val result = execute(
                 listOf(DhdVirtualDisplayProtocol.COMMAND, DhdVirtualDisplayProtocol.LIST),
             )
             val listed = if (result.exitCode == 0 && !result.timedOut && result.stdout.isNotEmpty()) {
@@ -415,8 +430,8 @@ class DhdVirtualDisplayManager(
                 closeAllNativeSessionsLocked()
             } else {
                 listed.keys.forEach { key ->
-                    runCatching {
-                        controller.execute(
+                    runCatchingUnlessCancelled {
+                        execute(
                             listOf(DhdVirtualDisplayProtocol.COMMAND, DhdVirtualDisplayProtocol.CLOSE, key),
                         )
                     }
@@ -428,13 +443,16 @@ class DhdVirtualDisplayManager(
     }
 
     private suspend fun closeAllNativeSessionsLocked() {
-        val result = controller.execute(
+        val result = execute(
             listOf(DhdVirtualDisplayProtocol.COMMAND, DhdVirtualDisplayProtocol.CLOSE_ALL),
         )
         if (result.timedOut || result.exitCode != 0) {
             throw IOException(result.stderr.ifBlank { "exit ${result.exitCode}" })
         }
     }
+
+    private suspend fun execute(command: List<String>, binaryOutput: Boolean = false): PhoneProcessResult =
+        commands.execute(command, binaryOutput)
 
     private suspend fun isCurrentSession(session: DhdVirtualDisplaySession): Boolean = stateMutex.withLock {
         sessions[session.sessionKey] == session && session.displayId > 0
