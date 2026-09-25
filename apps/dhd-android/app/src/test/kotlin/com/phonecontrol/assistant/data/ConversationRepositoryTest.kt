@@ -25,14 +25,14 @@ class ConversationRepositoryTest {
         override fun timeline(conversationId: String): StateFlow<List<TimelineItem>> =
             flows.getOrPut(conversationId) { MutableStateFlow(rows.toList()) }.asStateFlow()
 
-        override fun deleteConversation(conversationId: String): Boolean {
+        override suspend fun deleteConversation(conversationId: String): Boolean {
             rows.clear()
             flows[conversationId]?.value = emptyList()
             flows.remove(conversationId)
             return true
         }
 
-        override fun promptForInactiveConversation(): Boolean {
+        override suspend fun promptForInactiveConversation(): Boolean {
             calls += "prompt"
             prompt.value = true
             return true
@@ -43,14 +43,18 @@ class ConversationRepositoryTest {
             prompt.value = false
         }
 
-        override fun keepInactiveConversation(): Boolean {
+        override suspend fun keepInactiveConversation(): Boolean {
             calls += "keep"
             return true
         }
 
-        override fun expireInactiveConversation(): Boolean {
+        var expired = false
+
+        override suspend fun expireInactiveConversation(): Boolean {
             calls += "expire"
-            return false
+            if (!expired) return false
+            deleteConversation(DHD_CONVERSATION_ID)
+            return true
         }
 
         fun write(item: TimelineItem) {
@@ -76,7 +80,21 @@ class ConversationRepositoryTest {
     }
 
     @Test
-    fun `a flow taken from the store before a delete stops updating`() {
+    fun `timeline keeps publishing after an inactive conversation is cleared`() = runTest(UnconfinedTestDispatcher()) {
+        val source = CachingSource().apply { expired = true }
+        val repository = ConversationRepository(source)
+        val seen = mutableListOf<List<String>>()
+        backgroundScope.launch { repository.timeline.collect { items -> seen += items.map(TimelineItem::id) } }
+
+        source.write(message("before"))
+        assertTrue(repository.expireInactiveConversation())
+        source.write(message("after"))
+
+        assertEquals(listOf(emptyList(), listOf("before"), emptyList(), listOf("after")), seen)
+    }
+
+    @Test
+    fun `a flow taken from the store before a delete stops updating`() = runTest {
         val source = CachingSource()
         val stale = source.timeline(DHD_CONVERSATION_ID)
 
@@ -87,7 +105,7 @@ class ConversationRepositoryTest {
     }
 
     @Test
-    fun `expiry calls delegate to the store in order`() {
+    fun `expiry calls delegate to the store in order`() = runTest {
         val source = CachingSource()
         val repository = ConversationRepository(source)
 
