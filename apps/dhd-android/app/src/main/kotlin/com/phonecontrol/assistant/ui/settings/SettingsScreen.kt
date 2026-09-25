@@ -36,6 +36,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -53,6 +54,7 @@ import com.phonecontrol.assistant.ui.components.SettingsRow
 import com.phonecontrol.assistant.ui.components.SettingsRowIcon
 import com.phonecontrol.assistant.ui.components.SettingsSetUpAction
 import com.phonecontrol.assistant.ui.components.reasoning.ReasoningMeterIcon
+import com.phonecontrol.assistant.ui.theme.DhdPalette
 import com.phonecontrol.assistant.ui.theme.LocalAssistantColors
 import com.phonecontrol.assistant.ui.theme.ThemeMode
 
@@ -95,11 +97,11 @@ fun SettingsScreen(
                     navigationIconContentColor = colors.textPrimary,
                     actionIconContentColor = colors.textPrimary,
                 ),
-                title = { Text("Settings", fontWeight = FontWeight.SemiBold, fontSize = 17.sp) },
+                title = { Text(stringResource(R.string.common_settings), fontWeight = FontWeight.SemiBold, fontSize = 17.sp) },
                 navigationIcon = {
                     CircleIconButton(
                         icon = R.drawable.ic_arrow_back,
-                        contentDescription = "Back",
+                        contentDescription = stringResource(R.string.common_back),
                         onClick = onBack,
                         modifier = Modifier.padding(start = 12.dp),
                     )
@@ -117,12 +119,12 @@ fun SettingsScreen(
         ) {
             // Preferences Section
             item {
-                SettingsSectionHeader("Preferences")
+                SettingsSectionHeader(stringResource(R.string.settings_preferences))
                 SettingsCard {
                     Column {
                         // Appearance Selector Row (with DropdownMenu anchored to right side)
                         SettingsRow(
-                            title = "Appearance",
+                            title = stringResource(R.string.settings_appearance),
                             subtitle = themeMode.label,
                             leading = { SettingsRowIcon(R.drawable.ic_sun, "Appearance") },
                             modifier = Modifier
@@ -132,7 +134,7 @@ fun SettingsScreen(
                             Box(modifier = Modifier.wrapContentSize(Alignment.TopEnd)) {
                                 Icon(
                                     painter = painterResource(if (isAppearanceMenuOpen) R.drawable.ic_chevron_up else R.drawable.ic_chevron_down),
-                                    contentDescription = "Select appearance",
+                                    contentDescription = stringResource(R.string.settings_select_appearance),
                                     tint = colors.textSecondary,
                                     modifier = Modifier.size(18.dp),
                                 )
@@ -141,10 +143,10 @@ fun SettingsScreen(
                                     expanded = isAppearanceMenuOpen,
                                     onDismissRequest = { isAppearanceMenuOpen = false },
                                     shape = RoundedCornerShape(16.dp),
-                                    containerColor = if (colors.isDark) Color(0xFF262628) else Color(0xFFFFFFFF),
+                                    containerColor = if (colors.isDark) DhdPalette.MenuSurfaceDark else DhdPalette.White,
                                     border = BorderStroke(
                                         1.dp,
-                                        if (colors.isDark) Color(0xFF38383B) else Color(0xFFE5E7EB)
+                                        if (colors.isDark) DhdPalette.MenuBorderDark else DhdPalette.Gray200
                                     ),
                                     modifier = Modifier.width(220.dp),
                                 ) {
@@ -162,7 +164,7 @@ fun SettingsScreen(
                                                 if (themeMode == mode) {
                                                     Icon(
                                                         painter = painterResource(R.drawable.ic_check),
-                                                        contentDescription = "Selected",
+                                                        contentDescription = stringResource(R.string.settings_selected),
                                                         tint = colors.textPrimary,
                                                         modifier = Modifier.size(18.dp),
                                                     )
@@ -182,7 +184,7 @@ fun SettingsScreen(
 
                         // Reasoning Levels Selector Row (with multi-select DropdownMenu anchored to right side)
                         SettingsRow(
-                            title = "Reasoning levels",
+                            title = stringResource(R.string.settings_reasoning_levels),
                             subtitle = "${visibleReasoningEfforts.size} of ${ReasoningEffort.entries.size} enabled",
                             leading = {
                                 ReasoningMeterIcon(
@@ -196,7 +198,7 @@ fun SettingsScreen(
                             Box(modifier = Modifier.wrapContentSize(Alignment.TopEnd)) {
                                 Icon(
                                     painter = painterResource(if (isReasoningMenuOpen) R.drawable.ic_chevron_up else R.drawable.ic_chevron_down),
-                                    contentDescription = "Select reasoning levels",
+                                    contentDescription = stringResource(R.string.settings_select_reasoning_levels),
                                     tint = colors.textSecondary,
                                     modifier = Modifier.size(18.dp),
                                 )
@@ -205,10 +207,10 @@ fun SettingsScreen(
                                     expanded = isReasoningMenuOpen,
                                     onDismissRequest = { isReasoningMenuOpen = false },
                                     shape = RoundedCornerShape(16.dp),
-                                    containerColor = if (colors.isDark) Color(0xFF262628) else Color(0xFFFFFFFF),
+                                    containerColor = if (colors.isDark) DhdPalette.MenuSurfaceDark else DhdPalette.White,
                                     border = BorderStroke(
                                         1.dp,
-                                        if (colors.isDark) Color(0xFF38383B) else Color(0xFFE5E7EB)
+                                        if (colors.isDark) DhdPalette.MenuBorderDark else DhdPalette.Gray200
                                     ),
                                     modifier = Modifier.width(220.dp),
                                 ) {
@@ -230,7 +232,7 @@ fun SettingsScreen(
                                                 if (isVisible) {
                                                     Icon(
                                                         painter = painterResource(R.drawable.ic_check),
-                                                        contentDescription = "Selected",
+                                                        contentDescription = stringResource(R.string.settings_selected),
                                                         tint = colors.textPrimary,
                                                         modifier = Modifier.size(18.dp),
                                                     )
@@ -251,14 +253,14 @@ fun SettingsScreen(
 
                         // Approved Apps Row
                         SettingsRow(
-                            title = "Approved apps",
+                            title = stringResource(R.string.settings_approved_apps_2),
                             subtitle = if (isFullAccess) "Full access enabled" else "$enabledCount of ${apps.size} enabled",
                             leading = { SettingsRowIcon(R.drawable.ic_apps, "Approved Apps") },
                             modifier = Modifier
                                 .clip(RoundedCornerShape(bottomStart = 20.dp, bottomEnd = 20.dp))
                                 .clickable { onOpenApprovedApps() },
                         ) {
-                            SettingsChevron("Open Approved Apps")
+                            SettingsChevron(stringResource(R.string.settings_open_approved_apps))
                         }
                     }
                 }
@@ -266,12 +268,12 @@ fun SettingsScreen(
 
             // Integrations & System Section
             item {
-                SettingsSectionHeader("Integrations")
+                SettingsSectionHeader(stringResource(R.string.settings_integrations))
                 SettingsCard {
                     Column {
                         // Display-over-other-apps overlay
                         SettingsRow(
-                            title = "Display over other apps",
+                            title = stringResource(R.string.settings_display_over_other_apps),
                             subtitle = if (overlayPermissionGranted) {
                                 "Floating DHD bubble is ${if (overlayEnabled) "available" else "off"}"
                             } else {
@@ -295,14 +297,14 @@ fun SettingsScreen(
                         if (!companionConnected) {
                             HorizontalDivider(thickness = 2.dp, color = colors.cardDivider)
                             SettingsRow(
-                                title = "Connect desktop companion",
-                                subtitle = "View connection instructions",
+                                title = stringResource(R.string.common_connect_desktop_companion),
+                                subtitle = stringResource(R.string.common_view_connection_instructions),
                                 leading = {
                                     SettingsRowIcon(R.drawable.ic_laptop, "Desktop companion connection instructions")
                                 },
                                 modifier = Modifier.clickable { onOpenCompanion() },
                             ) {
-                                SettingsSetUpAction("Open connection instructions")
+                                SettingsSetUpAction(stringResource(R.string.settings_open_connection_instructions))
                             }
                         }
 
@@ -311,7 +313,7 @@ fun SettingsScreen(
 
                             // DHD local phone connection row
                             SettingsRow(
-                                title = "DHD phone access",
+                                title = stringResource(R.string.settings_dhd_phone_access),
                                 subtitle = when (developerStatus.state) {
                                     DeveloperConnectionState.READY -> "Phone access is active"
                                     DeveloperConnectionState.CONNECTING,
@@ -342,7 +344,7 @@ fun SettingsScreen(
                                 subtitleMaxLines = 2,
                                 subtitleLineHeight = 17.sp,
                             ) {
-                                SettingsSetUpAction("Open phone access instructions")
+                                SettingsSetUpAction(stringResource(R.string.settings_open_phone_access_instructions))
                             }
                         }
                     }
@@ -351,11 +353,11 @@ fun SettingsScreen(
 
             // About Section
             item {
-                SettingsSectionHeader("About")
+                SettingsSectionHeader(stringResource(R.string.settings_about))
                 SettingsCard {
                     SettingsRow(
-                        title = "Version",
-                        subtitle = "0.1.0 • Android SDK 35",
+                        title = stringResource(R.string.settings_version),
+                        subtitle = stringResource(R.string.settings_0_1_0_android_sdk_35),
                         leading = { SettingsRowIcon(R.drawable.ic_info, "Version") },
                     )
                 }
