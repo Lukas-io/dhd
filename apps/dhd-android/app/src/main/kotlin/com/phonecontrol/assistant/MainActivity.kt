@@ -11,30 +11,22 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.produceState
 import androidx.lifecycle.lifecycleScope
-import com.phonecontrol.assistant.core.sessionIdOrNull
 import com.phonecontrol.assistant.data.PermissionSetupRepository
-import com.phonecontrol.assistant.execution.TaskDisplaySession
 import com.phonecontrol.assistant.overlay.OverlayPreferences
 import com.phonecontrol.assistant.overlay.OverlayVisibilityGate
-import com.phonecontrol.assistant.session.AssistantForegroundService
+import com.phonecontrol.assistant.session.SessionCommands
 import com.phonecontrol.assistant.session.SessionState
+import com.phonecontrol.assistant.ui.AppViewModel
 import com.phonecontrol.assistant.ui.PhoneControlApp
-import com.phonecontrol.assistant.ui.displays.activeDisplayUiRecord
 import com.phonecontrol.assistant.ui.displays.applicationLabel
-import com.phonecontrol.assistant.ui.displays.currentPackageForSession
-import com.phonecontrol.assistant.ui.displays.displayPurpose
-import com.phonecontrol.assistant.ui.displays.latestToolNameForRun
-import com.phonecontrol.assistant.ui.displays.livePreviewForRun
-import com.phonecontrol.assistant.ui.displays.mergeActiveDisplayRecord
-import com.phonecontrol.assistant.ui.displays.selectDisplayForRun
-import com.phonecontrol.assistant.ui.displays.toUiRecord
+import com.phonecontrol.assistant.ui.displays.mapDisplayUi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -57,6 +49,10 @@ class MainActivity : ComponentActivity() {
     private var notificationSetupStepHandled = false
     private var overlayActivityToken: OverlayVisibilityGate.Token? = null
     private var conversationExpiryMonitor: Job? = null
+    private val sessionCommands = SessionCommands(this)
+    private val appViewModel: AppViewModel by viewModels {
+        AppViewModel.factory((application as PhoneControlApplication).container)
+    }
     private val permissionSetup: PermissionSetupRepository
         get() = (application as PhoneControlApplication).container.permissionSetupRepository
     private val notificationPermissionLauncher = registerForActivityResult(
@@ -98,81 +94,12 @@ class MainActivity : ComponentActivity() {
         val app = (application as PhoneControlApplication).container
         val appPackageManager = packageManager
         setContent {
-            val display by app.taskDisplayBackend.activeSession.collectAsState()
-            val playback by app.taskDisplayBackend.previewState.collectAsState()
-            val previewStates by app.taskDisplayBackend.previewStates.collectAsState()
-            val backendDisplayRecords by app.taskDisplayBackend.displayRecords.collectAsState()
-            val sessionState by app.sessionCoordinator.state.collectAsState()
-            val events by app.sessionCoordinator.events.collectAsState()
-            val pointerEvent by app.sessionCoordinator.pointerEvent.collectAsState()
-            val purpose = sessionState.displayPurpose()
-            val coordinatorSessionKey = sessionState.sessionIdOrNull
-            // A new coordinator run can claim a retained display whose native
-            // owner key belongs to the previous run. Resolve that binding for
-            // the inline viewer so the UI follows the selected display rather
-            // than assuming the two keys are identical.
-            val resolvedDisplayForRun by produceState<TaskDisplaySession?>(
-                initialValue = null,
-                key1 = coordinatorSessionKey,
-                key2 = display?.sessionKey,
-                // Selecting a retained display with displayRef publishes its
-                // updated registry record after the initial lookup. Include
-                // the registry in the keys so the suspended lookup retries
-                // once that binding becomes visible to the UI.
-                key3 = backendDisplayRecords,
-            ) {
-                value = coordinatorSessionKey?.let { app.taskDisplayBackend.current(it) }
-            }
-            val displayForRun = selectDisplayForRun(
-                resolvedDisplayForRun = resolvedDisplayForRun,
-                activeDisplay = display,
-                coordinatorSessionKey = coordinatorSessionKey,
-                sessionState = sessionState,
+            val uiState by appViewModel.uiState.collectAsState()
+            val displayUi = mapDisplayUi(
+                sources = uiState.displaySources,
+                appLabelFor = { packageName -> packageName.applicationLabel(appPackageManager) },
             )
-            val activeDisplayOwnerKey = displayForRun?.sessionKey
-            val currentToolName = latestToolNameForRun(events, coordinatorSessionKey)
-            val preview = displayForRun?.let { session ->
-                livePreviewForRun(
-                    session = session,
-                    previewStates = previewStates,
-                    playback = playback,
-                    records = backendDisplayRecords,
-                    coordinatorSessionKey = coordinatorSessionKey,
-                    pointerEvent = pointerEvent,
-                    purpose = purpose,
-                    currentToolName = currentToolName,
-                    appLabelFor = { packageName -> packageName.applicationLabel(appPackageManager) },
-                )
-            }
-            val mappedRecords = backendDisplayRecords.map { record ->
-                record.toUiRecord(
-                    preview = previewStates[record.sessionKey],
-                    packageManager = appPackageManager,
-                    currentToolName = currentToolName.takeIf { record.sessionKey == activeDisplayOwnerKey },
-                )
-            }
-            // A newly created session may be visible through activeSession a
-            // frame before its durable registry record is published. Keep the
-            // manager populated during that small handoff window.
-            val displayRecordsForUi = displayForRun?.let { session ->
-                val currentPackage = currentPackageForSession(session, backendDisplayRecords)
-                mergeActiveDisplayRecord(
-                    records = mappedRecords,
-                    activeRecord = activeDisplayUiRecord(
-                        session = session,
-                        currentPackage = currentPackage,
-                        appLabel = currentPackage.applicationLabel(appPackageManager),
-                        sessionState = sessionState,
-                        purpose = purpose,
-                        currentToolName = currentToolName,
-                        preview = preview,
-                    ),
-                    runIsActive = sessionState is SessionState.Running || sessionState is SessionState.Paused,
-                    purpose = purpose,
-                    currentToolName = currentToolName,
-                    preview = preview,
-                )
-            } ?: mappedRecords
+            val displayForRun = displayUi.displayForRun
             PhoneControlApp(
                 initialConversationId = initialConversationId,
                 initialRoute = intent.getStringExtra(EXTRA_OPEN_ROUTE),
@@ -185,8 +112,8 @@ class MainActivity : ComponentActivity() {
                 onNotificationVisibilityChanged = { mainConversationVisible, attentionVisible ->
                     app.notificationVisibility.updateUi(mainConversationVisible, attentionVisible)
                 },
-                previewState = preview,
-                displayRecords = displayRecordsForUi,
+                previewState = displayUi.previewState,
+                displayRecords = displayUi.displayRecords,
                 onPreviewSurfaceAvailable = { surface ->
                     displayForRun?.let { app.attachTaskPreview(it, surface) }
                 },
@@ -406,43 +333,23 @@ class MainActivity : ComponentActivity() {
         reasoningEffort: String? = null,
         fastMode: Boolean = false,
     ) {
-        val intent = Intent(this, AssistantForegroundService::class.java)
-            .setAction(AssistantForegroundService.ACTION_START)
-            .putExtra(AssistantForegroundService.EXTRA_REQUEST, request)
-        if (!conversationId.isNullOrBlank()) {
-            intent.putExtra(AssistantForegroundService.EXTRA_CONVERSATION_ID, conversationId)
-        }
-        if (!reasoningEffort.isNullOrBlank()) {
-            intent.putExtra(AssistantForegroundService.EXTRA_REASONING_EFFORT, reasoningEffort)
-        }
-        intent.putExtra(AssistantForegroundService.EXTRA_FAST_MODE, fastMode)
-        ContextCompat.startForegroundService(this, intent)
+        sessionCommands.start(request, conversationId, reasoningEffort, fastMode)
     }
 
     private fun stopSession() {
-        startService(
-            Intent(this, AssistantForegroundService::class.java)
-                .setAction(AssistantForegroundService.ACTION_STOP_USER),
-        )
+        sessionCommands.stop()
     }
 
     private fun startFresh() {
         val app = (application as PhoneControlApplication).container
         app.startFresh()
-        startService(
-            Intent(this, AssistantForegroundService::class.java)
-                .setAction(AssistantForegroundService.ACTION_START_FRESH),
-        )
+        sessionCommands.startFresh()
     }
 
     private fun continueSession() {
         val app = (application as PhoneControlApplication).container
         if (app.sessionCoordinator.state.value !is SessionState.Stopped) return
-        ContextCompat.startForegroundService(
-            this,
-            Intent(this, AssistantForegroundService::class.java)
-                .setAction(AssistantForegroundService.ACTION_CONTINUE),
-        )
+        sessionCommands.continueStopped()
     }
 
     private fun steerSession(text: String): Boolean =
@@ -459,10 +366,7 @@ class MainActivity : ComponentActivity() {
                 updatePermissionSetupStep()
             }
         } else if (overlayEnabled) {
-            startService(
-                Intent(this, AssistantForegroundService::class.java)
-                    .setAction(AssistantForegroundService.ACTION_ENABLE_OVERLAY),
-            )
+            sessionCommands.enableOverlay()
         }
     }
 
@@ -471,10 +375,7 @@ class MainActivity : ComponentActivity() {
             pendingOverlayEnable = false
             OverlayPreferences.setEnabled(this, false)
             overlayEnabled = false
-            startService(
-                Intent(this, AssistantForegroundService::class.java)
-                    .setAction(AssistantForegroundService.ACTION_DISABLE_OVERLAY),
-            )
+            sessionCommands.disableOverlay()
             return
         }
 
@@ -500,10 +401,7 @@ class MainActivity : ComponentActivity() {
         OverlayPreferences.setEnabled(this, true)
         overlayEnabled = true
         overlayPermissionGranted = true
-        startService(
-            Intent(this, AssistantForegroundService::class.java)
-                .setAction(AssistantForegroundService.ACTION_ENABLE_OVERLAY),
-        )
+        sessionCommands.enableOverlay()
     }
 
     companion object {
