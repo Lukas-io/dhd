@@ -5,6 +5,7 @@ import { errorMessage } from "../../shared/errors.js";
 import type { CompanionDashboard } from "./dashboard.js";
 import { discoveredPhoneSnapshot } from "./pairing-service.js";
 import { readRequestBody } from "./request-body.js";
+import { isTrustedDashboardRequest } from "./request-guard.js";
 import { serveStaticFile, staticAssetFor } from "./static.js";
 
 const TOOL_IMAGE_PATH = /^\/api\/tool-calls\/([^/]+)\/images\/(\d+)$/;
@@ -117,21 +118,34 @@ function serveToolImage(
   res.end(image.bytes);
 }
 
+function requestUrl(req: http.IncomingMessage): URL | undefined {
+  try {
+    return new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
+  } catch {
+    return undefined;
+  }
+}
+
 async function handleRequest(
   dashboard: CompanionDashboard,
   routes: Record<string, JsonRoute>,
   req: http.IncomingMessage,
   res: http.ServerResponse,
 ): Promise<void> {
-  const url = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
+  const url = requestUrl(req);
+  if (!url) {
+    writeText(res, 400, "Bad Request");
+    return;
+  }
   const pathname = url.pathname;
 
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (!isTrustedDashboardRequest(req)) {
+    writeText(res, 403, "Forbidden");
+    return;
+  }
 
   if (req.method === "OPTIONS") {
-    res.writeHead(204);
+    res.writeHead(204, { "Allow": "GET, POST, OPTIONS" });
     res.end();
     return;
   }
@@ -165,5 +179,11 @@ async function handleRequest(
 
 export function createCompanionWebServer(dashboard: CompanionDashboard): http.Server {
   const routes = jsonPostRoutes(dashboard);
-  return http.createServer((req, res) => handleRequest(dashboard, routes, req, res));
+  return http.createServer((req, res) => {
+    handleRequest(dashboard, routes, req, res).catch((error: unknown) => {
+      console.error(`Companion dashboard request failed: ${errorMessage(error)}`);
+      if (!res.headersSent) writeText(res, 500, "Internal Server Error");
+      else res.end();
+    });
+  });
 }

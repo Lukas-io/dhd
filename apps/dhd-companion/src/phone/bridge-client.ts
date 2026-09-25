@@ -18,14 +18,17 @@ export interface BridgeRequestOptions {
   timeoutMs?: number;
   /** Keep waiting after the phone has accepted a user-dependent request. */
   keepOpenAfterAccepted?: boolean;
+  acceptedTimeoutMs?: number;
   host?: string;
   port?: number;
   token?: string;
 }
 
-export const bridgeHost = bridgeHostSetting() ?? DEFAULT_BRIDGE_HOST;
-export const bridgePort = parsePort(bridgePortSetting() ?? `${DEFAULT_BRIDGE_PORT}`);
-export const bridgeToken = bridgeTokenSetting();
+export interface BridgeTarget {
+  host: string;
+  port: number;
+  token: string | undefined;
+}
 
 export function parsePort(value: string): number {
   if (!/^\d+$/.test(value)) throw new Error("PHONE_ASSISTANT_BRIDGE_PORT must be an integer.");
@@ -34,6 +37,22 @@ export function parsePort(value: string): number {
     throw new Error("PHONE_ASSISTANT_BRIDGE_PORT must be between 1 and 65535.");
   }
   return port;
+}
+
+export function bridgePortFromEnvironment(): number {
+  try {
+    return parsePort(bridgePortSetting() ?? `${DEFAULT_BRIDGE_PORT}`);
+  } catch {
+    return DEFAULT_BRIDGE_PORT;
+  }
+}
+
+export function environmentBridgeTarget(): BridgeTarget {
+  return {
+    host: bridgeHostSetting() ?? DEFAULT_BRIDGE_HOST,
+    port: bridgePortFromEnvironment(),
+    token: bridgeTokenSetting(),
+  };
 }
 
 export function isLoopbackBridgeHost(host: string): boolean {
@@ -45,14 +64,14 @@ export function buildBridgePayload(
   request: BridgeRequest,
   token?: string,
 ): BridgeRequest {
-  const effectiveToken = arguments.length > 1 ? token : bridgeToken;
+  const effectiveToken = arguments.length > 1 ? token : bridgeTokenSetting();
   const safeToken = effectiveToken?.trim();
   return safeToken ? { ...request, authToken: safeToken } : { ...request };
 }
 
 export function bridgeConfigurationError(
-  host: string = bridgeHost,
-  token: string | undefined = bridgeToken,
+  host: string = environmentBridgeTarget().host,
+  token: string | undefined = bridgeTokenSetting(),
 ): string | null {
   if (!isLoopbackBridgeHost(host) && !token?.trim()) {
     return "PHONE_ASSISTANT_BRIDGE_TOKEN is required when PHONE_ASSISTANT_BRIDGE_HOST is not loopback.";
@@ -65,9 +84,10 @@ export function requestBridge(
   request: BridgeRequest,
   options: BridgeRequestOptions = {}
 ): Promise<BridgeMessage> {
-  const host = options.host ?? bridgeHost;
-  const port = options.port ?? bridgePort;
-  const token = options.token ?? bridgeToken;
+  const target = environmentBridgeTarget();
+  const host = options.host ?? target.host;
+  const port = options.port ?? target.port;
+  const token = options.token ?? target.token;
   const configurationError = bridgeConfigurationError(host, token);
   if (configurationError) return Promise.reject(new Error(configurationError));
   return new Promise((resolve, reject) => {
@@ -86,17 +106,19 @@ export function requestBridge(
       else resolve(message!);
     };
 
+    const timeOut = () => finish(new Error("Timed out waiting for the phone assistant bridge."));
+    const startDeadline = (milliseconds: number) => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      timeoutTimer = setTimeout(timeOut, milliseconds);
+    };
+
     const timeoutMs = options.timeoutMs ?? DEFAULT_BRIDGE_TIMEOUT_MS;
     if (timeoutMs > 0) {
       // Socket inactivity timeouts do not consistently cover a TCP connect
       // that is stuck in SYN-SENT. Keep a wall-clock deadline as well so a
       // filtered or unreachable phone cannot leave callers in CHECKING forever.
-      timeoutTimer = setTimeout(() => {
-        finish(new Error("Timed out waiting for the phone assistant bridge."));
-      }, timeoutMs);
-      socket.setTimeout(timeoutMs, () => {
-        finish(new Error("Timed out waiting for the phone assistant bridge."));
-      });
+      startDeadline(timeoutMs);
+      socket.setTimeout(timeoutMs, timeOut);
     }
     socket.once("error", (error) => {
       finish(new Error(`Could not connect to the phone assistant bridge at ${host}:${port}: ${error.message}`));
@@ -134,6 +156,9 @@ export function requestBridge(
               timeoutTimer = undefined;
             }
             socket.setTimeout(0);
+          } else if (options.acceptedTimeoutMs !== undefined) {
+            startDeadline(options.acceptedTimeoutMs);
+            socket.setTimeout(options.acceptedTimeoutMs);
           }
           continue;
         }
@@ -141,6 +166,9 @@ export function requestBridge(
           finish(undefined, message);
           return;
         }
+        console.error(
+          `[phone-assistant-bridge] ignored unexpected bridge message type: ${typeof message.type === "string" ? message.type : "(missing)"}`,
+        );
       }
     });
   });

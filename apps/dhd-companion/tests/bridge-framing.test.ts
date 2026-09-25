@@ -96,6 +96,15 @@ describe("phone bridge NDJSON framing", () => {
     await expect(result).resolves.toEqual({ type: "observation", ok: true });
   });
 
+  it("keeps a multibyte character that is split across chunks", async () => {
+    const { result, socket } = connect();
+    const line = Buffer.from('{"type":"completed","ok":true,"text":"caf\u00e9 \ud83d\ude42"}\n', "utf8");
+    const emojiStart = line.indexOf(Buffer.from("\ud83d\ude42", "utf8"));
+    socket.receive(line.subarray(0, emojiStart + 2), line.subarray(emojiStart + 2));
+
+    await expect(result).resolves.toEqual({ type: "completed", ok: true, text: "caf\u00e9 \ud83d\ude42" });
+  });
+
   it("ignores unknown non-terminal message types until a terminal line arrives", async () => {
     const { result, socket } = connect();
     let settled = false;
@@ -150,6 +159,39 @@ describe("phone bridge NDJSON framing", () => {
     await vi.advanceTimersByTimeAsync(100);
     await rejection;
     expect(socket.inactivityTimeoutMs).toBe(100);
+  });
+
+  it("bounds an accepted request by the post-acceptance timeout", async () => {
+    vi.useFakeTimers();
+    const { result, socket } = connect({ timeoutMs: 100, acceptedTimeoutMs: 1_000 });
+    let settled = false;
+    const rejection = expect(result).rejects.toThrow("Timed out waiting for the phone assistant bridge.");
+    void result.then(() => { settled = true; }, () => { settled = true; });
+    socket.receive('{"type":"accepted"}\n');
+
+    await vi.advanceTimersByTimeAsync(999);
+    expect(settled).toBe(false);
+    expect(socket.inactivityTimeoutMs).toBe(1_000);
+    await vi.advanceTimersByTimeAsync(1);
+    await rejection;
+  });
+
+  it("logs unexpected message types without extending the timeout", async () => {
+    vi.useFakeTimers();
+    const errors: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    });
+    const { result, socket } = connect({ timeoutMs: 100 });
+    const rejection = expect(result).rejects.toThrow("Timed out waiting for the phone assistant bridge.");
+    socket.receive('{"type":"progress","step":1}\n', '{"ok":true}\n');
+
+    await vi.advanceTimersByTimeAsync(100);
+    await rejection;
+    expect(errors).toEqual([
+      "[phone-assistant-bridge] ignored unexpected bridge message type: progress",
+      "[phone-assistant-bridge] ignored unexpected bridge message type: (missing)",
+    ]);
   });
 
   it("times out on socket inactivity", async () => {

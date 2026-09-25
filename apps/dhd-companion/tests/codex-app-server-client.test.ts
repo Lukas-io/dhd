@@ -526,3 +526,107 @@ describe("App Server turn control", () => {
     );
   });
 });
+
+describe("turn completion rejections", () => {
+  async function unhandledRejectionsDuring(run: () => Promise<void>): Promise<unknown[]> {
+    const reasons: unknown[] = [];
+    const record = (reason: unknown) => reasons.push(reason);
+    process.on("unhandledRejection", record);
+    try {
+      await run();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    } finally {
+      process.off("unhandledRejection", record);
+    }
+    return reasons;
+  }
+
+  it("observes the completion when turn/start fails", async () => {
+    server.handle("turn/start", () => new JsonRpcFailure({ message: "turn rejected" }));
+
+    const reasons = await unhandledRejectionsDuring(async () => {
+      await expect(client.runTurn("open the store")).rejects.toThrow("turn rejected");
+    });
+
+    expect(reasons).toEqual([]);
+  });
+
+  it("observes the completion when Stop arrives before turn/start", async () => {
+    server.handle("thread/start", () => undefined);
+    const reasons = await unhandledRejectionsDuring(async () => {
+      const turn = client.runTurn("open the store");
+      const threadStart = await server.nextRequest("thread/start");
+      await client.interrupt();
+      server.writeLine({ id: threadStart.id, result: { thread: { id: "thread-1" } } });
+      await expect(turn).rejects.toThrow("Codex App Server turn was interrupted.");
+    });
+
+    expect(reasons).toEqual([]);
+    expect(server.requests("turn/start")).toEqual([]);
+  });
+
+  it("observes the completion when the App Server exits during turn/start", async () => {
+    server.handle("turn/start", () => {
+      server.exit(1);
+      return undefined;
+    });
+
+    const reasons = await unhandledRejectionsDuring(async () => {
+      await expect(client.runTurn("open the store")).rejects.toThrow(
+        "Codex App Server exited before completing the turn (code=1, signal=?).",
+      );
+    });
+
+    expect(reasons).toEqual([]);
+  });
+});
+
+describe("terminal turn notifications", () => {
+  async function startTurn(): Promise<{ turn: ReturnType<CodexAppServerClient["runTurn"]> }> {
+    const turn = client.runTurn("open the store");
+    await waitUntilSteerable();
+    return { turn };
+  }
+
+  it("keeps the turn running through a retryable error", async () => {
+    const { turn } = await startTurn();
+    server.notify("error", {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      willRetry: true,
+      error: { message: "stream disconnected; retrying" },
+    });
+    server.notify(...completed);
+
+    await expect(turn).resolves.toMatchObject({ threadId: "thread-1" });
+    await vi.waitFor(() =>
+      expect(errorLog).toContain("[codex-app-server] retrying after error: stream disconnected; retrying"),
+    );
+  });
+
+  it.each([
+    ["turn/completed", { threadId: "thread-1", turn: { id: "turn-old", status: "failed" } }],
+    ["turn/completed", { threadId: "thread-other", turn: { id: "turn-1", status: "interrupted" } }],
+    ["turn/failed", { threadId: "thread-1", turnId: "turn-old", error: { message: "old turn failed" } }],
+    ["error", { threadId: "thread-other", turnId: "turn-1", willRetry: false, error: { message: "other thread" } }],
+  ])("ignores %s for a different turn %j", async (method, params) => {
+    const { turn } = await startTurn();
+    server.notify(method, params);
+    server.notify("turn/completed", { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } });
+
+    await expect(turn).resolves.toMatchObject({ threadId: "thread-1" });
+  });
+
+  it("still fails the turn on a final error for the active turn", async () => {
+    const { turn } = await startTurn();
+    const rejection = expect(turn).rejects.toThrow("quota exhausted");
+    server.notify("error", {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      willRetry: false,
+      error: { message: "quota exhausted" },
+    });
+
+    await rejection;
+  });
+});
