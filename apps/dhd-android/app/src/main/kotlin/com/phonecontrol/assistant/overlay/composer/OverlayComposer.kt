@@ -46,6 +46,7 @@ import androidx.compose.ui.window.PopupProperties
 import com.phonecontrol.assistant.domain.ReasoningEffort
 import com.phonecontrol.assistant.overlay.bubble.DhdIdentity
 import com.phonecontrol.assistant.overlay.effects.ComposerPerimeterGlow
+import com.phonecontrol.assistant.ui.components.GlassSurface
 import com.phonecontrol.assistant.ui.components.reasoning.FastModeButton
 import com.phonecontrol.assistant.ui.components.reasoning.ReasoningEffortButton
 import com.phonecontrol.assistant.ui.components.reasoning.ReasoningEffortTrack
@@ -94,14 +95,9 @@ internal fun DhdComposerPreview(
             hasRecovery = false,
             capsule = true,
         )
-        Surface(
+        GlassSurface(
             modifier = Modifier.fillMaxSize(),
             shape = CircleShape,
-            color = colors.composerBackground.copy(alpha = if (colors.isDark) 0.98f else 0.97f),
-            border = BorderStroke(
-                width = 0.8.dp,
-                color = colors.borderColor.copy(alpha = if (colors.isDark) 0.9f else 0.95f),
-            ),
         ) {
             Composer(
                 onSubmit = {},
@@ -285,7 +281,7 @@ internal fun Composer(
                 Spacer(Modifier.width(8.dp))
                 GlyphButton(
                     label = "Send request",
-                    glyph = "send",
+                    glyph = Glyph.SEND,
                     onClick = ::submit,
                     enabled = draft.isNotBlank(),
                     filled = true,
@@ -319,7 +315,7 @@ internal fun Composer(
                 Spacer(Modifier.width(10.dp))
                 GlyphButton(
                     label = "Send request",
-                    glyph = "send",
+                    glyph = Glyph.SEND,
                     onClick = ::submit,
                     enabled = draft.isNotBlank(),
                     filled = true,

@@ -27,7 +27,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -62,6 +61,11 @@ import androidx.compose.ui.unit.sp
 import com.phonecontrol.assistant.R
 import com.phonecontrol.assistant.apps.AppPermissionRepository
 import com.phonecontrol.assistant.apps.InstalledUserApp
+import com.phonecontrol.assistant.ui.components.CircleIconButton
+import com.phonecontrol.assistant.ui.components.FullAccessConfirmDialog
+import com.phonecontrol.assistant.ui.components.SettingsCard
+import com.phonecontrol.assistant.ui.components.SettingsRow
+import com.phonecontrol.assistant.ui.components.SettingsRowIcon
 import com.phonecontrol.assistant.ui.theme.LocalAssistantColors
 import com.phonecontrol.assistant.ui.theme.assistantSwitchColors
 
@@ -90,13 +94,7 @@ fun ApprovedAppsScreen(
         }
     }
 
-    val filteredApps = remember(apps, searchQuery) {
-        if (searchQuery.isBlank()) apps
-        else apps.filter {
-            it.label.contains(searchQuery, ignoreCase = true) ||
-                    it.packageName.contains(searchQuery, ignoreCase = true)
-        }
-    }
+    val filteredApps = remember(apps, searchQuery) { filterAppsByQuery(apps, searchQuery) }
 
     Scaffold(
         containerColor = colors.background,
@@ -207,46 +205,20 @@ fun ApprovedAppsScreen(
                         ),
                         title = { Text("Approved Apps", fontWeight = FontWeight.SemiBold, fontSize = 17.sp) },
                         navigationIcon = {
-                            Surface(
-                                shape = CircleShape,
-                                color = colors.composerBackground,
-                                border = BorderStroke(1.dp, colors.borderColor),
-                                modifier = Modifier
-                                    .padding(start = 12.dp)
-                                    .size(40.dp)
-                                    .clip(CircleShape)
-                                    .clickable { onBack() },
-                            ) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Icon(
-                                        painter = painterResource(R.drawable.ic_arrow_back),
-                                        contentDescription = "Back",
-                                        tint = colors.textPrimary,
-                                        modifier = Modifier.size(18.dp),
-                                    )
-                                }
-                            }
+                            CircleIconButton(
+                                icon = R.drawable.ic_arrow_back,
+                                contentDescription = "Back",
+                                onClick = onBack,
+                                modifier = Modifier.padding(start = 12.dp),
+                            )
                         },
                         actions = {
-                            Surface(
-                                shape = CircleShape,
-                                color = colors.composerBackground,
-                                border = BorderStroke(1.dp, colors.borderColor),
-                                modifier = Modifier
-                                    .padding(end = 12.dp)
-                                    .size(40.dp)
-                                    .clip(CircleShape)
-                                    .clickable { isSearchOpen = true },
-                            ) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Icon(
-                                        painter = painterResource(R.drawable.ic_search),
-                                        contentDescription = "Search",
-                                        tint = colors.textPrimary,
-                                        modifier = Modifier.size(18.dp),
-                                    )
-                                }
-                            }
+                            CircleIconButton(
+                                icon = R.drawable.ic_search,
+                                contentDescription = "Search",
+                                onClick = { isSearchOpen = true },
+                                modifier = Modifier.padding(end = 12.dp),
+                            )
                         },
                     )
                 }
@@ -264,44 +236,12 @@ fun ApprovedAppsScreen(
             // Full Access Section
             item {
                 SettingsSectionHeader("Global access")
-                Surface(
-                    shape = RoundedCornerShape(20.dp),
-                    color = colors.settingsCard,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                SettingsCard {
+                    SettingsRow(
+                        title = "Full access",
+                        subtitle = "Allow access to all installed apps",
+                        leading = { SettingsRowIcon(R.drawable.ic_apps, "Apps") },
                     ) {
-                        Icon(
-                            painter = painterResource(R.drawable.ic_apps),
-                            contentDescription = "Apps",
-                            tint = colors.textPrimary,
-                            modifier = Modifier.size(22.dp),
-                        )
-                        Column(
-                            modifier = Modifier
-                                .weight(1f)
-                                .padding(start = 14.dp),
-                        ) {
-                            Text(
-                                text = "Full access",
-                                fontWeight = FontWeight.Medium,
-                                color = colors.textPrimary,
-                                fontSize = 15.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                text = "Allow access to all installed apps",
-                                fontSize = 12.sp,
-                                color = colors.textSecondary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
                         Switch(
                             checked = isFullAccess,
                             onCheckedChange = { checked ->
@@ -330,11 +270,7 @@ fun ApprovedAppsScreen(
                     )
                 } else {
                     // Continuous joined card container for all apps with black dividers
-                    Surface(
-                        shape = RoundedCornerShape(20.dp),
-                        color = colors.settingsCard,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
+                    SettingsCard {
                         Column {
                             filteredApps.forEachIndexed { index, app ->
                                 val enabled = if (isFullAccess) true else (app.packageName in enabledPackages)
@@ -375,37 +311,13 @@ fun ApprovedAppsScreen(
     }
 
     if (showFullAccessConfirmDialog) {
-        AlertDialog(
-            onDismissRequest = { showFullAccessConfirmDialog = false },
-            containerColor = colors.surfaceCard,
-            titleContentColor = colors.textPrimary,
-            textContentColor = colors.textSecondary,
-            shape = RoundedCornerShape(20.dp),
-            title = { Text("Enable Full Access?", fontWeight = FontWeight.SemiBold) },
-            text = {
-                Text(
-                    "Full Access allows DHD to open, inspect, and operate any application installed on this device.\n\n" +
-                            "This bypasses the per-app allowlist and lets DHD carry out tasks across all your apps.",
-                    fontSize = 14.sp,
-                    lineHeight = 20.sp,
-                )
+        FullAccessConfirmDialog(
+            onConfirm = {
+                showFullAccessConfirmDialog = false
+                permissions.setFullAccessEnabled(true)
+                isFullAccess = true
             },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showFullAccessConfirmDialog = false
-                        permissions.setFullAccessEnabled(true)
-                        isFullAccess = true
-                    },
-                ) {
-                    Text("Enable", color = colors.accentBlue, fontWeight = FontWeight.SemiBold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showFullAccessConfirmDialog = false }) {
-                    Text("Cancel", color = colors.textSecondary)
-                }
-            },
+            onDismiss = { showFullAccessConfirmDialog = false },
         )
     }
 }

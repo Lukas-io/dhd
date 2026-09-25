@@ -34,12 +34,15 @@ import com.phonecontrol.assistant.core.ToolNames
 import com.phonecontrol.assistant.core.needsAttention
 import com.phonecontrol.assistant.core.sessionIdOrNull
 import com.phonecontrol.assistant.overlay.bubble.DhdIdentity
+import com.phonecontrol.assistant.overlay.composer.Glyph
 import com.phonecontrol.assistant.overlay.composer.GlyphButton
 import com.phonecontrol.assistant.overlay.effects.GeminiHorizonGlow
 import com.phonecontrol.assistant.session.DhdToolCall
 import com.phonecontrol.assistant.session.DhdToolCallStatus
 import com.phonecontrol.assistant.session.SessionState
 import com.phonecontrol.assistant.ui.components.THINKING_WORDS
+import com.phonecontrol.assistant.ui.components.THINKING_WORD_INTERVAL_MS
+import com.phonecontrol.assistant.ui.components.nextThinkingWordIndex
 import com.phonecontrol.assistant.ui.theme.AssistantColorScheme
 import com.phonecontrol.assistant.ui.theme.LocalAssistantColors
 import kotlin.random.Random
@@ -54,21 +57,12 @@ private fun rememberPreToolStatus(enabled: Boolean): String {
             return@LaunchedEffect
         }
         while (true) {
-            delay(4_000L)
-            index = nextPreToolStatusIndex(index)
+            delay(THINKING_WORD_INTERVAL_MS)
+            index = nextThinkingWordIndex(index)
         }
     }
 
     return THINKING_WORDS[index]
-}
-
-private fun nextPreToolStatusIndex(previous: Int): Int {
-    if (THINKING_WORDS.size < 2) return 0
-    var next: Int
-    do {
-        next = Random.nextInt(THINKING_WORDS.size)
-    } while (next == previous)
-    return next
 }
 
 @Composable
@@ -169,7 +163,7 @@ internal fun WorkingRow(
 
             GlyphButton(
                 label = "Stop assistant",
-                glyph = "stop",
+                glyph = Glyph.STOP,
                 onClick = onStop,
                 filled = true,
                 buttonSize = 44.dp,
@@ -283,7 +277,7 @@ private fun WorkingContent(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.End,
         ) {
-            GlyphButton(label = "Stop assistant", glyph = "stop", onClick = onStop)
+            GlyphButton(label = "Stop assistant", glyph = Glyph.STOP, onClick = onStop)
         }
     }
 }
