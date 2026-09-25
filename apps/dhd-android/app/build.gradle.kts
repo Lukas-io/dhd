@@ -50,10 +50,27 @@ android {
         baseline = file("lint-baseline.xml")
     }
 
+    testOptions {
+        unitTests.all { test ->
+            val contractsDir = rootProject.file("../../contracts")
+            test.systemProperty("dhd.contractsDir", contractsDir.absolutePath)
+            test.systemProperty("dhd.moduleDir", projectDir.absolutePath)
+            test.systemProperty(
+                "dhd.updateGoldens",
+                providers.gradleProperty("updateGoldens").getOrElse("false"),
+            )
+            test.inputs.files(fileTree(contractsDir)).withPropertyName("contracts")
+        }
+    }
+
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
         resources.excludes += "/META-INF/versions/**"
     }
+}
+
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
 }
 
 dependencies {
