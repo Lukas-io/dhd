@@ -51,7 +51,7 @@ class AppContainer(context: Context) {
     val taskDisplayLayoutPreferences = TaskDisplayLayoutPreferences(context)
     val taskDisplayBackend = DhdTaskDisplayBackend(
         context,
-        DhdVirtualDisplayManager(context, phoneAccessController),
+        DhdVirtualDisplayManager(phoneAccessController),
         processRunner,
         taskDisplayLayoutPreferences,
         conversationStore,
@@ -110,7 +110,6 @@ class AppContainer(context: Context) {
             preferencesName = BridgeCredentials.PREFERENCES_NAME,
             installedAppsRepository = installedAppsRepository,
             taskDisplayLayoutPreferences = taskDisplayLayoutPreferences,
-            overlayVisibilityGate = overlayVisibilityGate,
         ),
         coordinator = sessionCoordinator,
         observationProvider = observationProvider,
