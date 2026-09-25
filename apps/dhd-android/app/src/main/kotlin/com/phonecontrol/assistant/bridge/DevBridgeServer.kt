@@ -1,6 +1,48 @@
 package com.phonecontrol.assistant.bridge
 
 import com.phonecontrol.assistant.apps.InstalledUserApp
+import com.phonecontrol.assistant.bridge.protocol.BridgeErrorCodes
+import com.phonecontrol.assistant.bridge.auth.BridgeCredentials
+import com.phonecontrol.assistant.bridge.pairing.PairingProtocol
+import com.phonecontrol.assistant.bridge.pairing.PairingReturnAddress
+import com.phonecontrol.assistant.bridge.pairing.PairingUdpServer
+import com.phonecontrol.assistant.bridge.pairing.PendingCompanionPairing
+import com.phonecontrol.assistant.bridge.presence.CompanionPresence
+import com.phonecontrol.assistant.bridge.protocol.ActionParser.optionalDisplayRef
+import com.phonecontrol.assistant.bridge.protocol.ActionParser.parseGuardRegions
+import com.phonecontrol.assistant.bridge.protocol.ActionParser.parsePhoneAction
+import com.phonecontrol.assistant.bridge.protocol.ActionParser.parseSequenceRequest
+import com.phonecontrol.assistant.bridge.protocol.ActionParser.wireActionName
+import com.phonecontrol.assistant.bridge.protocol.BridgeJson
+import com.phonecontrol.assistant.bridge.protocol.BridgeLimits.CAPTURE_ATTEMPTS
+import com.phonecontrol.assistant.bridge.protocol.BridgeLimits.CAPTURE_RETRY_DELAY_MS
+import com.phonecontrol.assistant.bridge.protocol.BridgeLimits.MAX_AGENT_FEEDBACK_CHARS
+import com.phonecontrol.assistant.bridge.protocol.BridgeLimits.MAX_APP_BROWSE_RESULTS
+import com.phonecontrol.assistant.bridge.protocol.BridgeLimits.MAX_APP_QUERY_CHARS
+import com.phonecontrol.assistant.bridge.protocol.BridgeLimits.MAX_OBSERVATIONS
+import com.phonecontrol.assistant.bridge.protocol.BridgeLimits.MAX_REQUEST_CHARS
+import com.phonecontrol.assistant.bridge.protocol.BridgeLimits.MAX_TEXT_CHARS
+import com.phonecontrol.assistant.bridge.protocol.BridgeLimits.OPEN_SETTLE_DELAY_MS
+import com.phonecontrol.assistant.bridge.protocol.BridgeLimits.PACKAGE_PATTERN
+import com.phonecontrol.assistant.bridge.protocol.BridgeLimits.POST_ACTION_SETTLE_DELAY_MS
+import com.phonecontrol.assistant.bridge.protocol.InvalidSequencePayloadException
+import com.phonecontrol.assistant.bridge.protocol.addDisplayLimitRecovery
+import com.phonecontrol.assistant.bridge.protocol.beforeScreenshotOrNull
+import com.phonecontrol.assistant.bridge.protocol.buildAllowedAppsResponse
+import com.phonecontrol.assistant.bridge.protocol.buildAppDisplayLayoutResponse
+import com.phonecontrol.assistant.bridge.protocol.buildBrowseAppsResponse
+import com.phonecontrol.assistant.bridge.protocol.errorResponse
+import com.phonecontrol.assistant.bridge.protocol.failedActionCompletion
+import com.phonecontrol.assistant.bridge.protocol.failureCode
+import com.phonecontrol.assistant.bridge.protocol.isSuccessful
+import com.phonecontrol.assistant.bridge.protocol.resultMessage
+import com.phonecontrol.assistant.bridge.protocol.sessionStateName
+import com.phonecontrol.assistant.bridge.protocol.staleDetailsOrNull
+import com.phonecontrol.assistant.bridge.protocol.unstartedSequenceFailure
+import com.phonecontrol.assistant.bridge.routing.PhoneActionLock
+import com.phonecontrol.assistant.bridge.routing.ToolCallScope
+import com.phonecontrol.assistant.bridge.transport.BridgeReply
+import com.phonecontrol.assistant.bridge.transport.NdjsonWriter
 import com.phonecontrol.assistant.core.AndroidBase64Codec
 import com.phonecontrol.assistant.core.Base64Codec
 import com.phonecontrol.assistant.core.BuildDeviceInfo
@@ -78,13 +120,6 @@ import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
 
-data class PendingCompanionPairing(
-    val requestId: String,
-    val deviceId: String,
-    val desktopName: String,
-    val expiresAtEpochMs: Long,
-)
-
 /**
  * Authenticated LAN NDJSON bridge used by the development desktop companion.
  *
@@ -136,65 +171,50 @@ class DevBridgeServer internal constructor(
         lanAddressProvider = ::systemLanIpv4Addresses,
     )
 
-    val authenticationToken: String = platform.storedString(KEY_AUTH_TOKEN)
-        ?.trim()
-        ?.takeIf(String::isNotEmpty)
-        ?: newUuid().toString().replace("-", "").also { token ->
-            platform.storeString(KEY_AUTH_TOKEN, token)
-        }
-    val deviceId: String = platform.storedString(KEY_DEVICE_ID)
-        ?.trim()
-        ?.takeIf(String::isNotEmpty)
-        ?: newUuid().toString().also { id ->
-            platform.storeString(KEY_DEVICE_ID, id)
-        }
+    private val credentials = BridgeCredentials(platform, newUuid)
+    val authenticationToken: String
+        get() = credentials.authenticationToken
+    val deviceId: String
+        get() = credentials.deviceId
     val listeningPort: Int = port
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile private var serverSocket: ServerSocket? = null
-    @Volatile private var pairingSocket: DatagramSocket? = null
     @Volatile private var started = false
-  @Volatile private var lastCompanionSeenElapsedMs: Long = 0L
-  private val _companionConnected = MutableStateFlow(false)
-  private val pairingStateLock = Any()
-    private val discoveryNonces = LinkedHashMap<String, Long>()
-  private val completedPairingResponses = LinkedHashMap<String, CompletedCompanionPairingResponse>()
-  @Volatile private var pendingCompanionPairingRequest: PendingCompanionPairingRequest? = null
-  private val _pendingCompanionPairing = MutableStateFlow<PendingCompanionPairing?>(null)
-  private val codexWarmupRequested = AtomicBoolean(false)
-    private val phoneActionMutex = Mutex()
-    private val overlayVisibilityGate
-        get() = platform.overlayVisibilityGate()
-    private val observations = Collections.synchronizedMap(
-        object : LinkedHashMap<String, ObservationSnapshot>(MAX_OBSERVATIONS + 1, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ObservationSnapshot>?): Boolean =
-                size > MAX_OBSERVATIONS
-        },
+    private val presence = CompanionPresence(clock)
+    private val pairing = PairingProtocol<PairingReturnAddress>(
+        deviceId = deviceId,
+        authenticationToken = authenticationToken,
+        listeningPort = listeningPort,
+        deviceInfo = deviceInfo,
+        clock = clock,
+        newUuid = newUuid,
+        lanAddresses = lanAddressProvider,
     )
-
-    private data class PendingCompanionPairingRequest(
-        val publicRequest: PendingCompanionPairing,
-        val pairingNonce: String,
-        val address: InetAddress,
-        val port: Int,
-        val socket: DatagramSocket,
+    internal val pairingServer = PairingUdpServer(
+        protocol = pairing,
+        platform = platform,
+        scope = scope,
+        bindHost = LAN_BIND_HOST,
+        port = PAIRING_DISCOVERY_PORT,
+        tag = TAG,
     )
+    private val phoneActionLock = PhoneActionLock()
+    private val toolCalls = ToolCallScope(coordinator, platform)
+    private val bridgeJson = BridgeJson(base64)
+    private val captures = CaptureService(coordinator, observationProvider, taskDisplayRequiredProvider)
+    private val displayTargets = DisplayTargetResolver(taskDisplayBackend, coordinator, taskDisplayRequiredProvider, clock, platform)
 
-    private data class CompletedCompanionPairingResponse(
-        val pairingNonce: String,
-        val expiresAtEpochMs: Long,
-        val response: JSONObject,
-    )
+    val companionConnected: StateFlow<Boolean>
+        get() = presence.companionConnected
 
-    val companionConnected: StateFlow<Boolean> = _companionConnected.asStateFlow()
-
-    val pendingCompanionPairing: StateFlow<PendingCompanionPairing?> =
-        _pendingCompanionPairing.asStateFlow()
+    val pendingCompanionPairing: StateFlow<PendingCompanionPairing?>
+        get() = pairing.pendingCompanionPairing
 
     /** Approve the pending desktop request and release the LAN auth token once. */
-    fun approvePendingCompanionPairing(): Boolean = respondToPendingCompanionPairing(approved = true)
+    fun approvePendingCompanionPairing(): Boolean = pairingServer.respond(approved = true)
 
     /** Reject the pending desktop request without revealing the LAN auth token. */
-    fun rejectPendingCompanionPairing(): Boolean = respondToPendingCompanionPairing(approved = false)
+    fun rejectPendingCompanionPairing(): Boolean = pairingServer.respond(approved = false)
 
     fun start() {
         if (started) return
@@ -217,316 +237,17 @@ class DevBridgeServer internal constructor(
                 platform.logError(TAG, "Development bridge stopped", error)
             }
         }
-        scope.launch { runPairingDiscovery() }
-        scope.launch { monitorCompanionPresence() }
+        scope.launch { pairingServer.run() }
+        scope.launch { presence.monitor() }
     }
 
     fun stop() {
         started = false
         serverSocket?.close()
         serverSocket = null
-        pairingSocket?.close()
-        pairingSocket = null
-        clearPendingCompanionPairing()
-        lastCompanionSeenElapsedMs = 0L
-        _companionConnected.value = false
+        pairingServer.stop()
+        presence.release()
         scope.coroutineContext[Job]?.cancel()
-    }
-
-    private suspend fun monitorCompanionPresence() {
-        while (currentCoroutineContext().isActive) {
-            val lastSeen = lastCompanionSeenElapsedMs
-            val connected = lastSeen > 0L &&
-                clock.elapsedMillis() - lastSeen <= COMPANION_PRESENCE_TIMEOUT_MS
-            if (_companionConnected.value != connected) {
-                _companionConnected.value = connected
-            }
-            delay(COMPANION_PRESENCE_CHECK_INTERVAL_MS)
-        }
-    }
-
-    private fun markCompanionSeen() {
-        lastCompanionSeenElapsedMs = clock.elapsedMillis()
-        _companionConnected.value = true
-    }
-
-    private fun runPairingDiscovery() {
-        try {
-            val socket = DatagramSocket(PAIRING_DISCOVERY_PORT, InetAddress.getByName(LAN_BIND_HOST))
-            pairingSocket = socket
-            val buffer = ByteArray(MAX_REQUEST_CHARS)
-            while (!socket.isClosed) {
-                val packet = DatagramPacket(buffer, buffer.size)
-                socket.receive(packet)
-                runCatching { handlePairingRequest(socket, packet) }
-                    .onFailure { error ->
-                        if (!socket.isClosed) {
-                            platform.logWarning(TAG, "Could not handle a pairing discovery packet", error)
-                        }
-                    }
-            }
-        } catch (_: SocketException) {
-            // Closing the pairing socket is the normal shutdown path.
-        } catch (error: Throwable) {
-            platform.logWarning(TAG, "Pairing discovery stopped", error)
-        } finally {
-            pairingSocket = null
-        }
-    }
-
-    internal fun handlePairingRequest(socket: DatagramSocket, packet: DatagramPacket) {
-        val request = try {
-            JSONObject(
-                String(packet.data, packet.offset, packet.length, Charsets.UTF_8),
-            )
-        } catch (_: Throwable) {
-            return
-        }
-        if (request.optInt("version", -1) != PAIRING_PROTOCOL_VERSION) return
-        when (request.optString("type")) {
-            "dhd_discover_request" -> handlePhoneDiscoveryRequest(socket, packet, request)
-            "dhd_pair_approval_request" -> handlePairingApprovalRequest(socket, packet, request)
-        }
-    }
-
-    private fun handlePhoneDiscoveryRequest(
-        socket: DatagramSocket,
-        packet: DatagramPacket,
-        request: JSONObject,
-    ) {
-        val requestId = request.optString("requestId").trim()
-        if (requestId.isBlank()) return
-
-        val pairingNonce = newUuid().toString().replace("-", "")
-        rememberDiscoveryNonce(pairingNonce)
-        val response = JSONObject()
-            .put("type", "dhd_discover_offer")
-            .put("version", PAIRING_PROTOCOL_VERSION)
-            .put("requestId", requestId)
-            .put("deviceId", deviceId)
-            .put("deviceName", companionDeviceName())
-            .put("model", deviceInfo.model.trim())
-            .put("port", listeningPort)
-            .put("pairingNonce", pairingNonce)
-        addLanAddresses(response)
-        sendPairingResponse(socket, packet, response)
-    }
-
-    private fun handlePairingApprovalRequest(
-        socket: DatagramSocket,
-        packet: DatagramPacket,
-        request: JSONObject,
-    ) {
-        val requestId = request.optString("requestId").trim()
-        val candidateDeviceId = request.optString("deviceId").trim()
-        val pairingNonce = request.optString("pairingNonce").trim()
-        if (requestId.isBlank() || candidateDeviceId != deviceId || pairingNonce.isBlank()) return
-
-        val completedResponse = synchronized(pairingStateLock) {
-            val now = clock.wallMillis()
-            completedPairingResponses.entries.removeIf { (_, value) -> value.expiresAtEpochMs <= now }
-            completedPairingResponses[requestId]
-                ?.takeIf { it.pairingNonce == pairingNonce }
-        }
-        if (completedResponse != null) {
-            sendPairingResponse(socket, packet, completedResponse.response)
-            return
-        }
-
-        val now = clock.wallMillis()
-        val expiresAt = now + PAIRING_APPROVAL_TIMEOUT_MS
-        val desktopName = request.optString("desktopName").trim()
-            .ifBlank { "DHD Companion" }
-            .take(MAX_DESKTOP_NAME_CHARS)
-        val publicRequest = PendingCompanionPairing(
-            requestId = requestId,
-            deviceId = deviceId,
-            desktopName = desktopName,
-            expiresAtEpochMs = expiresAt,
-        )
-        val pending = PendingCompanionPairingRequest(
-            publicRequest = publicRequest,
-            pairingNonce = pairingNonce,
-            address = packet.address,
-            port = packet.port,
-            socket = socket,
-        )
-
-        val existing = synchronized(pairingStateLock) { pendingCompanionPairingRequest }
-        if (existing != null && existing.publicRequest.expiresAtEpochMs > now) {
-            if (existing.publicRequest.requestId == requestId && existing.pairingNonce == pairingNonce) {
-                // UDP retries from the same desktop are expected. Re-send the
-                // acknowledgement instead of turning a lost packet into a
-                // false pairing rejection.
-                sendPairingResponse(
-                    socket,
-                    packet,
-                    JSONObject()
-                        .put("type", "dhd_pair_approval_pending")
-                        .put("version", PAIRING_PROTOCOL_VERSION)
-                        .put("requestId", requestId)
-                        .put("deviceId", deviceId)
-                        .put("expiresAtEpochMs", existing.publicRequest.expiresAtEpochMs),
-                )
-                return
-            }
-            sendPairingResponse(
-                socket,
-                packet,
-                approvalRejection(requestId, "Another desktop pairing request is already waiting for approval."),
-            )
-            return
-        }
-
-        if (!consumeDiscoveryNonce(pairingNonce)) {
-            sendPairingResponse(
-                socket,
-                packet,
-                approvalRejection(requestId, "This discovery request has expired. Refresh the phone list and try again."),
-            )
-            return
-        }
-
-        synchronized(pairingStateLock) {
-            pendingCompanionPairingRequest = pending
-            _pendingCompanionPairing.value = publicRequest
-        }
-
-        sendPairingResponse(
-            socket,
-            packet,
-            JSONObject()
-                .put("type", "dhd_pair_approval_pending")
-                .put("version", PAIRING_PROTOCOL_VERSION)
-                .put("requestId", requestId)
-                .put("deviceId", deviceId)
-                .put("expiresAtEpochMs", expiresAt),
-        )
-        scope.launch {
-            delay(PAIRING_APPROVAL_TIMEOUT_MS)
-            synchronized(pairingStateLock) {
-                if (pendingCompanionPairingRequest?.publicRequest?.requestId == requestId) {
-                    pendingCompanionPairingRequest = null
-                    _pendingCompanionPairing.value = null
-                }
-            }
-        }
-    }
-
-    private fun addLanAddresses(response: JSONObject) {
-        val addresses = JSONArray()
-        lanIpv4Addresses().forEach(addresses::put)
-        response.put("addresses", addresses)
-    }
-
-    private fun sendPairingResponse(
-        socket: DatagramSocket,
-        packet: DatagramPacket,
-        response: JSONObject,
-    ) {
-        val bytes = response.toString().toByteArray(Charsets.UTF_8)
-        socket.send(DatagramPacket(bytes, bytes.size, packet.address, packet.port))
-    }
-
-    private fun approvalRejection(requestId: String, message: String): JSONObject = JSONObject()
-        .put("type", "dhd_pair_approval_rejected")
-        .put("version", PAIRING_PROTOCOL_VERSION)
-        .put("requestId", requestId)
-        .put("deviceId", deviceId)
-        .put("message", message)
-
-    private fun rememberDiscoveryNonce(nonce: String) {
-        val now = clock.wallMillis()
-        synchronized(pairingStateLock) {
-            discoveryNonces.entries.removeIf { (_, expiresAt) -> expiresAt <= now }
-            discoveryNonces[nonce] = now + DISCOVERY_NONCE_TTL_MS
-            while (discoveryNonces.size > MAX_DISCOVERY_NONCES) {
-                discoveryNonces.remove(discoveryNonces.keys.first())
-            }
-        }
-    }
-
-    private fun consumeDiscoveryNonce(nonce: String): Boolean {
-        val now = clock.wallMillis()
-        synchronized(pairingStateLock) {
-            discoveryNonces.entries.removeIf { (_, expiresAt) -> expiresAt <= now }
-            return discoveryNonces.remove(nonce)?.let { it > now } == true
-        }
-    }
-
-    private fun clearPendingCompanionPairing() {
-        synchronized(pairingStateLock) {
-            pendingCompanionPairingRequest = null
-            _pendingCompanionPairing.value = null
-            discoveryNonces.clear()
-            completedPairingResponses.clear()
-        }
-    }
-
-    private fun respondToPendingCompanionPairing(approved: Boolean): Boolean {
-        val pending = synchronized(pairingStateLock) {
-            val current = pendingCompanionPairingRequest
-            if (current == null || current.publicRequest.expiresAtEpochMs <= clock.wallMillis()) {
-                pendingCompanionPairingRequest = null
-                _pendingCompanionPairing.value = null
-                null
-            } else {
-                pendingCompanionPairingRequest = null
-                _pendingCompanionPairing.value = null
-                current
-            }
-        } ?: return false
-
-        val response = if (approved) {
-            JSONObject()
-                .put("type", "dhd_pair_approval_offer")
-                .put("version", PAIRING_PROTOCOL_VERSION)
-                .put("requestId", pending.publicRequest.requestId)
-                .put("deviceId", deviceId)
-                .put("port", listeningPort)
-                .put("token", authenticationToken)
-                .also(::addLanAddresses)
-        } else {
-            approvalRejection(
-                pending.publicRequest.requestId,
-                "The phone declined the desktop companion pairing request.",
-            )
-        }
-        synchronized(pairingStateLock) {
-            completedPairingResponses[pending.publicRequest.requestId] = CompletedCompanionPairingResponse(
-                pairingNonce = pending.pairingNonce,
-                expiresAtEpochMs = clock.wallMillis() + COMPLETED_PAIRING_RESPONSE_TTL_MS,
-                response = response,
-            )
-            while (completedPairingResponses.size > MAX_COMPLETED_PAIRING_RESPONSES) {
-                completedPairingResponses.remove(completedPairingResponses.keys.first())
-            }
-        }
-        // The approval callback is invoked by Compose on the main thread;
-        // keep the UDP write on the bridge's IO scope so Android never blocks
-        // or rejects it as network work on the UI thread.
-        scope.launch {
-            runCatching {
-                sendPairingResponse(
-                    pending.socket,
-                    DatagramPacket(ByteArray(0), 0, pending.address, pending.port),
-                    response,
-                )
-            }.onFailure { error ->
-                platform.logWarning(TAG, "Could not send the companion pairing response", error)
-            }
-        }
-        return true
-    }
-
-    private fun companionDeviceName(): String {
-        val manufacturer = deviceInfo.manufacturer.trim()
-        val model = deviceInfo.model.trim()
-        return listOf(manufacturer, model)
-            .filter(String::isNotBlank)
-            .distinct()
-            .joinToString(" ")
-            .ifBlank { "DHD phone" }
     }
 
     /**
@@ -535,14 +256,14 @@ class DevBridgeServer internal constructor(
      * the background, without making the Android app wait for the desktop.
      */
     fun requestCodexWarmup() {
-        codexWarmupRequested.set(true)
+        presence.requestCodexWarmup()
     }
 
     private suspend fun handleClient(client: Socket) {
         client.use { socket ->
             val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
             val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
-            handleRequestLine(reader.readLine(), socket.inetAddress, writer)
+            handleRequestLine(reader.readLine(), socket.inetAddress, NdjsonWriter(writer))
         }
     }
 
@@ -551,30 +272,37 @@ class DevBridgeServer internal constructor(
         peerAddress: InetAddress,
         writer: BufferedWriter,
     ) {
+        handleRequestLine(line, peerAddress, NdjsonWriter(writer))
+    }
+
+    private suspend fun handleRequestLine(
+        line: String?,
+        peerAddress: InetAddress,
+        reply: BridgeReply,
+    ) {
         if (line == null) {
-            write(writer, errorResponse(null, "The bridge received an empty request."))
+            reply.write(errorResponse(null, "The bridge received an empty request."))
             return
         }
         if (line.length > MAX_REQUEST_CHARS) {
-            write(writer, errorResponse(null, "The bridge request is too large."))
+            reply.write(errorResponse(null, "The bridge request is too large."))
             return
         }
         val json = try {
             JSONObject(line)
         } catch (error: IllegalArgumentException) {
-            write(writer, errorResponse(null, error.message ?: "Invalid bridge request."))
+            reply.write(errorResponse(null, error.message ?: "Invalid bridge request."))
             return
         } catch (error: JSONException) {
-            write(writer, errorResponse(null, "The bridge request must be valid JSON."))
+            reply.write(errorResponse(null, "The bridge request must be valid JSON."))
             return
         }
         val requestId = json.optString("requestId").ifBlank { newUuid().toString() }
 
-        if (!isAuthorized(peerAddress, json)) {
-            write(
-                writer,
+        if (!credentials.isAuthorized(peerAddress, json)) {
+            reply.write(
                 errorResponse(requestId, "The phone bridge rejected this network connection. Pair the desktop companion in DHD settings.")
-                    .put("code", "AUTH_REQUIRED"),
+                    .put("code", BridgeErrorCodes.AUTH_REQUIRED),
             )
             return
         }
@@ -585,10 +313,9 @@ class DevBridgeServer internal constructor(
         // current task or Codex polling phase.
         val requestType = json.optString("type")
         if (requestType != "status" && requestType != "companion_disconnected") {
-            markCompanionSeen()
+            presence.markSeen()
         }
-        write(
-            writer,
+        reply.write(
             JSONObject()
                 .put("type", "accepted")
                 .put("requestId", requestId)
@@ -596,178 +323,75 @@ class DevBridgeServer internal constructor(
         )
         try {
             when (requestType) {
-                "demo_run" -> phoneActionMutex.withLock { runDemo(parseRequest(json), writer) }
-                "start_session" -> startSession(requestId, json, writer)
-                "status" -> status(requestId, writer)
-                "heartbeat" -> heartbeat(requestId, writer)
-                "companion_disconnected" -> companionDisconnected(requestId, writer)
-                "pending_request" -> pendingRequest(requestId, writer)
-                "claim_request" -> claimRequest(requestId, json, writer)
-                "pending_steer" -> pendingSteer(requestId, json, writer)
-                "claim_steer" -> claimSteer(requestId, json, writer)
-                "release_steer" -> releaseSteer(requestId, json, writer)
-                "complete_steer" -> completeSteer(requestId, json, writer)
-                "bind_codex_thread" -> bindCodexThread(requestId, json, writer)
-                "release_request" -> releaseRequest(requestId, json, writer)
-                "stream_agent_message" -> streamAgentMessage(requestId, json, writer)
-                "complete_session" -> completeSession(requestId, json, writer)
-                "fail_session" -> failSession(requestId, json, writer)
-                "allowed_apps" -> withDhdTool(json, ToolNames.LIST_ALLOWED_APPS) {
-                    allowedApps(requestId, json, writer)
+                "demo_run" -> phoneActionLock.withLock { runDemo(parseRequest(json), reply) }
+                "start_session" -> startSession(requestId, json, reply)
+                "status" -> status(requestId, reply)
+                "heartbeat" -> heartbeat(requestId, reply)
+                "companion_disconnected" -> companionDisconnected(requestId, reply)
+                "pending_request" -> pendingRequest(requestId, reply)
+                "claim_request" -> claimRequest(requestId, json, reply)
+                "pending_steer" -> pendingSteer(requestId, json, reply)
+                "claim_steer" -> claimSteer(requestId, json, reply)
+                "release_steer" -> releaseSteer(requestId, json, reply)
+                "complete_steer" -> completeSteer(requestId, json, reply)
+                "bind_codex_thread" -> bindCodexThread(requestId, json, reply)
+                "release_request" -> releaseRequest(requestId, json, reply)
+                "stream_agent_message" -> streamAgentMessage(requestId, json, reply)
+                "complete_session" -> completeSession(requestId, json, reply)
+                "fail_session" -> failSession(requestId, json, reply)
+                "allowed_apps" -> toolCalls.withDhdTool(json, ToolNames.LIST_ALLOWED_APPS) {
+                    allowedApps(requestId, json, reply)
                 }
-                "browse_apps" -> withDhdTool(json, ToolNames.BROWSE_APP) {
-                    browseApps(requestId, json, writer)
+                "browse_apps" -> toolCalls.withDhdTool(json, ToolNames.BROWSE_APP) {
+                    browseApps(requestId, json, reply)
                 }
-                "set_app_display_layout" -> withDhdTool(json, ToolNames.SET_APP_DISPLAY_LAYOUT) {
-                    setAppDisplayLayout(requestId, json, writer)
+                "set_app_display_layout" -> toolCalls.withDhdTool(json, ToolNames.SET_APP_DISPLAY_LAYOUT) {
+                    setAppDisplayLayout(requestId, json, reply)
                 }
-                "list_displays" -> listDisplays(requestId, writer)
-                "close_display" -> closeDisplay(requestId, json, writer)
-                "foreground_app" -> withDhdTool(json, ToolNames.FOREGROUND_APP) {
-                    foregroundApp(requestId, json, writer)
+                "list_displays" -> listDisplays(requestId, reply)
+                "close_display" -> closeDisplay(requestId, json, reply)
+                "foreground_app" -> toolCalls.withDhdTool(json, ToolNames.FOREGROUND_APP) {
+                    foregroundApp(requestId, json, reply)
                 }
-                "observe" -> withDhdTool(
+                "observe" -> toolCalls.withDhdTool(
                     json = json,
                     fallbackToolName = ToolNames.OBSERVE,
                 ) {
-                    observe(requestId, json, writer)
+                    observe(requestId, json, reply)
                 }
-                "execute_action" -> withDhdTool(
+                "execute_action" -> toolCalls.withDhdTool(
                     json = json,
-                    fallbackToolName = fallbackActionToolName(json),
+                    fallbackToolName = toolCalls.fallbackActionToolName(json),
                 ) {
-                    phoneActionMutex.withLock { executeAction(requestId, json, writer) }
+                    phoneActionLock.withLock { executeAction(requestId, json, reply) }
                 }
-                "execute_sequence" -> withDhdTool(
+                "execute_sequence" -> toolCalls.withDhdTool(
                     json = json,
                     fallbackToolName = ToolNames.EXECUTE_SEQUENCE,
                 ) {
-                    phoneActionMutex.withLock { executeSequence(requestId, json, writer) }
+                    phoneActionLock.withLock { executeSequence(requestId, json, reply) }
                 }
-                "request_attention" -> withDhdTool(
+                "request_attention" -> toolCalls.withDhdTool(
                     json = json,
                     fallbackToolName = ToolNames.REQUEST_ATTENTION,
                     terminalStatus = DhdToolCallStatus.ATTENTION,
                 ) {
-                    requestAttention(requestId, json, writer)
+                    requestAttention(requestId, json, reply)
                 }
-                "stop_session" -> stopSession(requestId, json, writer)
-                else -> write(writer, errorResponse(requestId, "Unsupported bridge request type."))
+                "stop_session" -> stopSession(requestId, json, reply)
+                else -> reply.write(errorResponse(requestId, "Unsupported bridge request type."))
             }
         } catch (error: Throwable) {
             val message = error.message ?: error::class.java.simpleName
             platform.logError(TAG, "Bridge request failed", error)
-            write(writer, errorResponse(requestId, "The phone bridge failed: $message"))
-        }
-    }
-
-    private suspend fun withDhdTool(
-        json: JSONObject,
-        fallbackToolName: String,
-        hideDuringObservation: Boolean = false,
-        terminalStatus: DhdToolCallStatus = DhdToolCallStatus.COMPLETED,
-        block: suspend () -> Unit,
-    ) {
-        val toolName = json.optString("tool").trim().ifBlank { fallbackToolName }
-        val callId = coordinator.beginToolCall(toolName, toolPurpose(toolName, json))
-        val visibilityToken = if (hideDuringObservation) {
-            overlayVisibilityGate?.acquire(OverlayHideReason.OBSERVATION)
-        } else {
-            null
-        }
-        try {
-            block()
-            coordinator.finishToolCall(callId, terminalStatus)
-        } catch (error: Throwable) {
-            coordinator.finishToolCall(callId, DhdToolCallStatus.FAILED)
-            throw error
-        } finally {
-            visibilityToken?.close()
-        }
-    }
-
-    internal fun fallbackActionToolName(json: JSONObject): String {
-        val actionType = json.optJSONObject("action")?.optString("type")?.lowercase()
-        return if (actionType == "open_app") ToolNames.OPEN_APP else ToolNames.EXECUTE
-    }
-
-    internal fun toolPurpose(toolName: String, json: JSONObject): String =
-        metadataPurpose(json) ?: when (toolName) {
-            ToolNames.OBSERVE -> json.optString("purpose").trim().takeIf(String::isNotBlank)
-                ?: defaultDhdToolPurpose(toolName)
-            ToolNames.OPEN_APP -> openingAppPurpose(json)
-            ToolNames.SET_APP_DISPLAY_LAYOUT -> appDisplayLayoutPurpose(json)
-            ToolNames.EXECUTE -> {
-                val action = json.optJSONObject("action")
-                if (action?.optString("type")?.equals("open_app", ignoreCase = true) == true) {
-                    openingAppPurpose(json)
-                } else {
-                    defaultDhdToolPurpose(toolName)
-                }
-            }
-            ToolNames.REQUEST_ATTENTION -> defaultDhdToolPurpose(toolName)
-            else -> defaultDhdToolPurpose(toolName)
-        }
-
-    /** Read the user-visible purpose from each tool's metadata shape. */
-    internal fun metadataPurpose(json: JSONObject): String? {
-        val directPurpose = json.optJSONObject("metadata")
-            ?.optString("purpose")
-            ?.trim()
-            ?.takeIf(String::isNotBlank)
-        if (directPurpose != null) return directPurpose
-
-        val actionPurpose = json.optJSONObject("action")
-            ?.optJSONObject("metadata")
-            ?.optString("purpose")
-            ?.trim()
-            ?.takeIf(String::isNotBlank)
-        if (actionPurpose != null) return actionPurpose
-
-        val actions = json.optJSONArray("actions")
-        for (index in 0 until (actions?.length() ?: 0)) {
-            val purpose = actions
-                ?.optJSONObject(index)
-                ?.optJSONObject("metadata")
-                ?.optString("purpose")
-                ?.trim()
-                ?.takeIf(String::isNotBlank)
-            if (purpose != null) return purpose
-        }
-        return null
-    }
-
-    private fun openingAppPurpose(json: JSONObject): String {
-        val packageName = json.optJSONObject("action")
-            ?.optString("packageName")
-            ?.trim()
-            ?.takeIf(String::isNotBlank)
-        val label = packageName
-            ?.let(::appLabel)
-            ?.takeIf { it.isNotBlank() && !it.equals(packageName, ignoreCase = true) }
-        return label?.let { "Opening $it" } ?: defaultDhdToolPurpose(ToolNames.OPEN_APP)
-    }
-
-    private fun appDisplayLayoutPurpose(json: JSONObject): String {
-        val packageName = json.optString("packageName")
-            .trim()
-            .takeIf(String::isNotBlank)
-        val label = packageName
-            ?.let(::appLabel)
-            ?.takeIf { it.isNotBlank() && !it.equals(packageName, ignoreCase = true) }
-        return when (json.optString("layout").trim().lowercase(Locale.ROOT)) {
-            "full_size" -> label?.let { "Fitting $it to the task display" }
-                ?: "Fitting the app to the task display"
-            "standard" -> label?.let { "Restoring ${it}'s standard task layout" }
-                ?: "Restoring the standard task layout"
-            else -> defaultDhdToolPurpose(ToolNames.SET_APP_DISPLAY_LAYOUT)
+            reply.write(errorResponse(requestId, "The phone bridge failed: $message"))
         }
     }
 
     private fun startSession(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val request = json.optString("request").trim()
         require(request.isNotEmpty() && request.length <= MAX_REQUEST_CHARS) {
@@ -779,7 +403,7 @@ class DevBridgeServer internal constructor(
             .ifBlank { ReasoningEffort.default.codexValue }
         val fastMode = json.optBoolean("fastMode", false)
         if (!coordinator.start(request, conversationId, reasoningEffort, fastMode)) {
-            write(writer, errorResponse(requestId, "The phone already has an active session."))
+            reply.write(errorResponse(requestId, "The phone already has an active session."))
             return
         }
         val state = coordinator.state.value
@@ -792,8 +416,7 @@ class DevBridgeServer internal constructor(
         }.onFailure { error ->
             platform.logWarning(TAG, "Could not start the foreground notification for the bridge session", error)
         }
-        write(
-            writer,
+        reply.write(
             JSONObject()
                 .put("type", "started")
                 .put("requestId", requestId)
@@ -808,14 +431,14 @@ class DevBridgeServer internal constructor(
 
     private fun status(
         requestId: String,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val state = coordinator.state.value
         val response = JSONObject()
             .put("type", "status")
             .put("requestId", requestId)
             .put("ok", true)
-            .put("state", stateName(state))
+            .put("state", sessionStateName(state))
             .put("active", state is SessionState.Running || state is SessionState.Paused)
             .put("companionConnected", companionConnected.value)
         when (state) {
@@ -834,18 +457,17 @@ class DevBridgeServer internal constructor(
                 .put("fastMode", state.fastMode)
             else -> Unit
         }
-        write(writer, response)
+        reply.write(response)
     }
 
     private fun heartbeat(
         requestId: String,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         // Keep the phone-side companion lease independent from pending work,
         // Codex startup, or a long-running task request.
-        markCompanionSeen()
-        write(
-            writer,
+        presence.markSeen()
+        reply.write(
             JSONObject()
                 .put("type", "heartbeat")
                 .put("requestId", requestId)
@@ -856,12 +478,10 @@ class DevBridgeServer internal constructor(
 
     private fun companionDisconnected(
         requestId: String,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
-        lastCompanionSeenElapsedMs = 0L
-        _companionConnected.value = false
-        write(
-            writer,
+        presence.release()
+        reply.write(
             JSONObject()
                 .put("type", "companion_disconnected")
                 .put("requestId", requestId)
@@ -872,19 +492,19 @@ class DevBridgeServer internal constructor(
 
     private fun pendingRequest(
         requestId: String,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         // The companion's normal pending-request poll doubles as its
         // heartbeat. The phone uses this to render the existing recovery card
         // without exposing the request or requiring another protocol.
-        markCompanionSeen()
+        presence.markSeen()
         val pending = coordinator.pendingRequest()
         val response = JSONObject()
             .put("type", "pending_request")
             .put("requestId", requestId)
             .put("ok", true)
             .put("available", pending != null)
-            .put("warmupRequested", codexWarmupRequested.getAndSet(false))
+            .put("warmupRequested", presence.consumeCodexWarmupRequest())
         if (pending != null) {
             response
                 .put("sessionId", pending.sessionId)
@@ -895,26 +515,24 @@ class DevBridgeServer internal constructor(
                 .put("continuation", pending.isContinuation)
                 .put("request", pending.request)
         }
-        write(writer, response)
+        reply.write(response)
     }
 
     private fun claimRequest(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val expectedSessionId = json.optString("sessionId").trim().ifBlank { null }
         val claimed = coordinator.claimRequest(expectedSessionId)
         if (claimed == null) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "No unclaimed running phone request matched the supplied sessionId.")
-                    .put("code", "REQUEST_NOT_AVAILABLE"),
+                    .put("code", BridgeErrorCodes.REQUEST_NOT_AVAILABLE),
             )
             return
         }
-        write(
-            writer,
+        reply.write(
             JSONObject()
                 .put("type", "request_claimed")
                 .put("requestId", requestId)
@@ -933,9 +551,9 @@ class DevBridgeServer internal constructor(
     private fun pendingSteer(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
-        markCompanionSeen()
+        presence.markSeen()
         val expectedSessionId = json.optString("sessionId").trim().ifBlank { null }
         val state = coordinator.state.value
         val pending = coordinator.pendingSteer(expectedSessionId)
@@ -951,13 +569,13 @@ class DevBridgeServer internal constructor(
                 .put("steerId", pending.steerId)
                 .put("sessionId", pending.sessionId)
         }
-        write(writer, response)
+        reply.write(response)
     }
 
     private fun claimSteer(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val sessionId = json.optString("sessionId").trim()
         val steerId = json.optString("steerId").trim()
@@ -965,15 +583,13 @@ class DevBridgeServer internal constructor(
         require(steerId.isNotEmpty()) { "steerId is required." }
         val claimed = coordinator.claimSteer(sessionId, steerId)
         if (claimed == null) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "No unclaimed steer matched the supplied session and steer id.")
-                    .put("code", "STEER_NOT_AVAILABLE"),
+                    .put("code", BridgeErrorCodes.STEER_NOT_AVAILABLE),
             )
             return
         }
-        write(
-            writer,
+        reply.write(
             JSONObject()
                 .put("type", "steer_claimed")
                 .put("requestId", requestId)
@@ -987,15 +603,14 @@ class DevBridgeServer internal constructor(
     private fun releaseSteer(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val sessionId = json.optString("sessionId").trim()
         val steerId = json.optString("steerId").trim()
         require(sessionId.isNotEmpty()) { "sessionId is required." }
         require(steerId.isNotEmpty()) { "steerId is required." }
         val released = coordinator.releaseSteer(sessionId, steerId)
-        write(
-            writer,
+        reply.write(
             JSONObject()
                 .put("type", "steer_released")
                 .put("requestId", requestId)
@@ -1009,15 +624,14 @@ class DevBridgeServer internal constructor(
     private fun completeSteer(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val sessionId = json.optString("sessionId").trim()
         val steerId = json.optString("steerId").trim()
         require(sessionId.isNotEmpty()) { "sessionId is required." }
         require(steerId.isNotEmpty()) { "steerId is required." }
         val completed = coordinator.completeSteer(sessionId, steerId)
-        write(
-            writer,
+        reply.write(
             JSONObject()
                 .put("type", "steer_completed")
                 .put("requestId", requestId)
@@ -1031,13 +645,12 @@ class DevBridgeServer internal constructor(
     private fun releaseRequest(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val sessionId = json.optString("sessionId").trim()
         require(sessionId.isNotEmpty()) { "sessionId is required." }
         val released = coordinator.releaseRequest(sessionId)
-        write(
-            writer,
+        reply.write(
             JSONObject()
                 .put("type", "request_released")
                 .put("requestId", requestId)
@@ -1050,15 +663,14 @@ class DevBridgeServer internal constructor(
     private fun bindCodexThread(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val conversationId = json.optString("conversationId").trim()
         val codexThreadId = json.optString("codexThreadId").trim()
         require(conversationId.isNotEmpty()) { "conversationId is required." }
         require(codexThreadId.isNotEmpty()) { "codexThreadId is required." }
         val bound = coordinator.bindCodexThread(conversationId, codexThreadId)
-        write(
-            writer,
+        reply.write(
             JSONObject()
                 .put("type", "codex_thread_bound")
                 .put("requestId", requestId)
@@ -1071,15 +683,14 @@ class DevBridgeServer internal constructor(
     private fun failSession(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val sessionId = json.optString("sessionId").trim()
         require(sessionId.isNotEmpty()) { "sessionId is required." }
         if (coordinator.state.value.sessionIdOrNull != sessionId) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "The phone session is no longer active.")
-                    .put("code", "SESSION_NOT_RUNNING"),
+                    .put("code", BridgeErrorCodes.SESSION_NOT_RUNNING),
             )
             return
         }
@@ -1095,8 +706,7 @@ class DevBridgeServer internal constructor(
             )
         }
         platform.reconcileServiceLifetime()
-        write(
-            writer,
+        reply.write(
             JSONObject()
                 .put("type", "session_failed")
                 .put("requestId", requestId)
@@ -1108,9 +718,9 @@ class DevBridgeServer internal constructor(
     private fun streamAgentMessage(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
-        markCompanionSeen()
+        presence.markSeen()
         val sessionId = json.optString("sessionId").trim()
         val messageId = json.optString("messageId").trim()
         val text = json.optString("text")
@@ -1122,16 +732,14 @@ class DevBridgeServer internal constructor(
             "text must be at most $MAX_AGENT_FEEDBACK_CHARS characters."
         }
         if (coordinator.state.value.sessionIdOrNull != sessionId) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "The phone session is no longer active.")
-                    .put("code", "SESSION_NOT_RUNNING"),
+                    .put("code", BridgeErrorCodes.SESSION_NOT_RUNNING),
             )
             return
         }
         val streamed = coordinator.streamAgentMessage(sessionId, messageId, text)
-        write(
-            writer,
+        reply.write(
             JSONObject()
                 .put("type", "agent_message_streamed")
                 .put("requestId", requestId)
@@ -1144,7 +752,7 @@ class DevBridgeServer internal constructor(
     private fun completeSession(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val sessionId = json.optString("sessionId").trim()
         require(sessionId.isNotEmpty()) { "sessionId is required." }
@@ -1162,10 +770,9 @@ class DevBridgeServer internal constructor(
             ?.take(MAX_TEXT_CHARS)
         val activeSessionId = coordinator.state.value.sessionIdOrNull
         if (activeSessionId != sessionId) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "The phone session is no longer active.")
-                    .put("code", "SESSION_NOT_RUNNING"),
+                    .put("code", BridgeErrorCodes.SESSION_NOT_RUNNING),
             )
             return
         }
@@ -1180,8 +787,7 @@ class DevBridgeServer internal constructor(
         }
         platform.removeAttentionNotification()
         platform.reconcileServiceLifetime()
-        write(
-            writer,
+        reply.write(
             JSONObject()
                 .put("type", "session_completed")
                 .put("requestId", requestId)
@@ -1196,7 +802,7 @@ class DevBridgeServer internal constructor(
     private suspend fun requestAttention(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val reason = json.optString("reason")
             .trim()
@@ -1204,20 +810,18 @@ class DevBridgeServer internal constructor(
             .take(MAX_TEXT_CHARS)
         val sessionId = coordinator.activeSessionId()
         if (sessionId == null) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "The phone assistant has no active session to interrupt.")
-                    .put("code", "SESSION_NOT_RUNNING"),
+                    .put("code", BridgeErrorCodes.SESSION_NOT_RUNNING),
             )
             return
         }
         val requestedDisplayRef = optionalDisplayRef(json)
         val target = if (taskDisplayRequiredProvider() || requestedDisplayRef != null) {
-            when (val resolution = resolveDisplayTarget(displayRef = requestedDisplayRef)) {
+            when (val resolution = displayTargets.resolve(displayRef = requestedDisplayRef)) {
                 is TaskDisplayResolution.Ready -> resolution.target
                 is TaskDisplayResolution.Unavailable -> {
-                    write(
-                        writer,
+                    reply.write(
                         errorResponse(requestId, resolution.message).put("code", resolution.code),
                     )
                     return
@@ -1228,23 +832,21 @@ class DevBridgeServer internal constructor(
         }
         val attention = coordinator.requestAttentionWaiter(reason)
         if (attention == null) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "The phone assistant is already waiting for the user's attention.")
-                    .put("code", "ATTENTION_ALREADY_PENDING"),
+                    .put("code", BridgeErrorCodes.ATTENTION_ALREADY_PENDING),
             )
             return
         }
         platform.showAttentionNotification(reason, coordinator.state.value.conversationIdOrNull)
         when (attention.await()) {
-            AttentionResolution.Cancelled -> write(
-                writer,
+            AttentionResolution.Cancelled -> reply.write(
                 JSONObject()
                     .put("type", "attention_cancelled")
                     .put("requestId", requestId)
                     .put("ok", false)
                     .put("sessionId", sessionId)
-                    .put("code", "SESSION_STOPPED")
+                    .put("code", BridgeErrorCodes.SESSION_STOPPED)
                     .put("message", "The attention step was cancelled because the phone session stopped."),
             )
 
@@ -1257,7 +859,7 @@ class DevBridgeServer internal constructor(
                     .put("sessionId", sessionId)
                     .put("acknowledged", true)
                     .put("message", "The user confirmed that the attention step is complete. Observe the phone before taking the next action.")
-                when (val captured = captureWithRetry(
+                when (val captured = captures.captureWithRetry(
                     expectedPackageName = null,
                     guardRegions = emptyList(),
                     taskSessionKey = target?.session?.sessionKey ?: sessionId,
@@ -1268,14 +870,14 @@ class DevBridgeServer internal constructor(
                         .put("observationError", captured.message)
                         .put("observationErrorCode", captured.code)
                     is ObservationCaptureResult.Succeeded -> {
-                        remember(captured.snapshot)
+                        captures.remember(captured.snapshot)
                         response
-                            .put("observation", snapshotJson(captured.snapshot))
+                            .put("observation", bridgeJson.snapshotJson(captured.snapshot))
                             .put("screenshotBase64", base64.encode(captured.screenshot))
                             .put("screenshotMimeType", "image/png")
                     }
                 }
-                write(writer, response)
+                reply.write(response)
             }
         }
     }
@@ -1283,7 +885,7 @@ class DevBridgeServer internal constructor(
     private fun allowedApps(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val fullAccess = fullAccessProvider()
         val includeAll = json.optBoolean("includeAll", false)
@@ -1296,8 +898,7 @@ class DevBridgeServer internal constructor(
             },
             toolName = ToolNames.LIST_ALLOWED_APPS,
         )
-        write(
-            writer,
+        reply.write(
             buildAllowedAppsResponse(
                 requestId = requestId,
                 fullAccess = fullAccess,
@@ -1316,14 +917,13 @@ class DevBridgeServer internal constructor(
     private fun browseApps(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val query = json.optString("query").trim()
         if (query.isEmpty() || query.length > MAX_APP_QUERY_CHARS) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "App search requires a query between 1 and $MAX_APP_QUERY_CHARS characters.")
-                    .put("code", "INVALID_APP_QUERY"),
+                    .put("code", BridgeErrorCodes.INVALID_APP_QUERY),
             )
             return
         }
@@ -1344,8 +944,7 @@ class DevBridgeServer internal constructor(
             }
             .toList()
         val returnedApps = candidates.take(MAX_APP_BROWSE_RESULTS)
-        write(
-            writer,
+        reply.write(
             buildBrowseAppsResponse(
                 requestId = requestId,
                 query = query,
@@ -1360,14 +959,13 @@ class DevBridgeServer internal constructor(
     private fun setAppDisplayLayout(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val packageName = json.optString("packageName").trim()
         if (!PACKAGE_PATTERN.matches(packageName)) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "packageName is not a valid Android package name.")
-                    .put("code", "INVALID_PACKAGE"),
+                    .put("code", BridgeErrorCodes.INVALID_PACKAGE),
             )
             return
         }
@@ -1377,10 +975,9 @@ class DevBridgeServer internal constructor(
             "full_size" -> true
             "standard" -> false
             else -> {
-                write(
-                    writer,
+                reply.write(
                     errorResponse(requestId, "layout must be either full_size or standard.")
-                        .put("code", "INVALID_APP_DISPLAY_LAYOUT"),
+                        .put("code", BridgeErrorCodes.INVALID_APP_DISPLAY_LAYOUT),
                 )
                 return
             }
@@ -1389,10 +986,9 @@ class DevBridgeServer internal constructor(
         val app = platform.launchableApps()
             .firstOrNull { it.packageName == packageName }
         if (app == null) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "No launchable app matches packageName=$packageName.")
-                    .put("code", "APP_NOT_FOUND"),
+                    .put("code", BridgeErrorCodes.APP_NOT_FOUND),
             )
             return
         }
@@ -1400,10 +996,9 @@ class DevBridgeServer internal constructor(
         val fullAccess = fullAccessProvider()
         val allowed = fullAccess || packageName in allowedPackagesProvider()
         if (!allowed) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "The app is not allowed for the current DHD access mode.")
-                    .put("code", "APP_NOT_ALLOWED"),
+                    .put("code", BridgeErrorCodes.APP_NOT_ALLOWED),
             )
             return
         }
@@ -1415,8 +1010,7 @@ class DevBridgeServer internal constructor(
         )
         val changed = platform.isFullSizeLayoutEnabled(packageName) != enabled
         platform.setFullSizeLayoutEnabled(packageName, enabled)
-        write(
-            writer,
+        reply.write(
             buildAppDisplayLayoutResponse(
                 requestId = requestId,
                 packageName = packageName,
@@ -1429,20 +1023,18 @@ class DevBridgeServer internal constructor(
 
     private suspend fun listDisplays(
         requestId: String,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val backend = taskDisplayBackend
         if (backend == null) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "The task display registry is unavailable.")
-                    .put("code", "TASK_DISPLAY_UNAVAILABLE"),
+                    .put("code", BridgeErrorCodes.TASK_DISPLAY_UNAVAILABLE),
             )
             return
         }
-        val displays = currentDisplayJson(backend)
-        write(
-            writer,
+        val displays = displayTargets.currentDisplayJson(backend)
+        reply.write(
             JSONObject()
                 .put("type", "displays")
                 .put("requestId", requestId)
@@ -1456,180 +1048,60 @@ class DevBridgeServer internal constructor(
     private suspend fun closeDisplay(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val backend = taskDisplayBackend
         if (backend == null) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "The task display registry is unavailable.")
-                    .put("code", "TASK_DISPLAY_UNAVAILABLE"),
+                    .put("code", BridgeErrorCodes.TASK_DISPLAY_UNAVAILABLE),
             )
             return
         }
         val displayRef = try {
             optionalDisplayRef(json)
         } catch (error: IllegalArgumentException) {
-            write(writer, errorResponse(requestId, error.message ?: "displayRef is invalid.").put("code", "INVALID_DISPLAY_REF"))
+            reply.write(errorResponse(requestId, error.message ?: "displayRef is invalid.").put("code", BridgeErrorCodes.INVALID_DISPLAY_REF))
             return
         }
         if (displayRef == null) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "displayRef is required to close a display safely. Call dhd_list_displays first and use the matching displayRef.")
-                    .put("code", "DISPLAY_REFERENCE_REQUIRED"),
+                    .put("code", BridgeErrorCodes.DISPLAY_REFERENCE_REQUIRED),
             )
             return
         }
         backend.activeDisplaySessions()
         val record = backend.displayRecords.value.firstOrNull { it.displayRef == displayRef }
         if (record == null) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "No task display matches the supplied displayRef. Call dhd_list_displays to see the available displays.")
-                    .put("code", "DISPLAY_NOT_FOUND"),
+                    .put("code", BridgeErrorCodes.DISPLAY_NOT_FOUND),
             )
             return
         }
         val activeRunKey = coordinator.activeSessionId()
         if (activeRunKey != null && backend.isDisplayClaimedByRun(record.displayId, activeRunKey)) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "The selected task display is being used by an active DHD run. Stop the active run first, then close the display.")
-                    .put("code", "DISPLAY_IN_USE"),
+                    .put("code", BridgeErrorCodes.DISPLAY_IN_USE),
             )
             return
         }
         when (val result = backend.closeTaskDisplay(record.displayId, displayRef)) {
-            is TaskDisplayCloseResult.Rejected -> write(
-                writer,
+            is TaskDisplayCloseResult.Rejected -> reply.write(
                 errorResponse(requestId, result.message).put("code", result.code),
             )
 
-            is TaskDisplayCloseResult.Closed -> write(
-                writer,
+            is TaskDisplayCloseResult.Closed -> reply.write(
                 JSONObject()
                     .put("type", "display_closed")
                     .put("requestId", requestId)
                     .put("ok", true)
                     .put("displayRef", result.record.displayRef)
-                    .put("appLabel", appLabel(result.record.packageName))
+                    .put("appLabel", platform.appLabel(result.record.packageName))
                     .put("status", result.record.status.name.lowercase())
                     .put("message", "The selected task display was ended."),
-            )
-        }
-    }
-
-    /**
-     * Return the same actionable inventory as dhd_list_displays. Keeping this
-     * in one path means a model can use a displayRef from a recovery response
-     * without first making another list call.
-     */
-    private suspend fun currentDisplayJson(
-        backend: TaskDisplayBackend,
-    ): List<JSONObject> {
-        // Joining the registry's reconciliation job here ensures a freshly
-        // started app does not report stale persisted records before native
-        // sessions have been adopted or marked unavailable.
-        backend.activeDisplaySessions()
-        val now = clock.wallMillis()
-        return backend.displayRecords.value
-            .asSequence()
-            .filter { record ->
-                record.status != TaskDisplayStatus.ENDED &&
-                    record.status != TaskDisplayStatus.EXPIRED &&
-                    (record.expiresAtEpochMs == null || record.expiresAtEpochMs > now)
-            }
-            .map { record -> displayJson(record, now) }
-            .toList()
-    }
-
-    private suspend fun displayInventoryForRecovery(
-        backend: TaskDisplayBackend,
-    ): List<JSONObject> = try {
-        currentDisplayJson(backend)
-    } catch (error: CancellationException) {
-        throw error
-    } catch (_: Throwable) {
-        // The limit response is still useful when reconciliation is briefly
-        // unavailable; return an empty, well-formed inventory instead of
-        // replacing the actionable allocator error with a registry error.
-        emptyList()
-    }
-
-    private fun displayJson(
-        record: com.phonecontrol.assistant.execution.TaskDisplayRecord,
-        now: Long = clock.wallMillis(),
-    ): JSONObject = JSONObject()
-        .put("displayRef", record.displayRef)
-        .put("appLabel", appLabel(record.packageName))
-        .put("packageName", record.packageName)
-        .put("status", record.status.name.lowercase())
-        .put("width", record.width)
-        .put("height", record.height)
-        .put("densityDpi", record.densityDpi)
-        .put("createdAtEpochMs", record.createdAtEpochMs)
-        .put("terminalAtEpochMs", record.terminalAtEpochMs ?: JSONObject.NULL)
-        .put("expiresAtEpochMs", record.expiresAtEpochMs ?: JSONObject.NULL)
-        .put(
-            "remainingRetentionMs",
-            record.expiresAtEpochMs?.let { expiresAt -> (expiresAt - now).coerceAtLeast(0L) }
-                ?: JSONObject.NULL,
-        )
-        .put("lastPurpose", record.lastPurpose)
-        .put("error", record.error ?: JSONObject.NULL)
-
-    private fun appLabel(packageName: String): String = runCatching {
-        platform.applicationLabel(packageName)
-    }.getOrDefault(packageName)
-
-    private fun optionalDisplayRef(json: JSONObject): String? {
-        val ref = json.optString("displayRef").trim().takeIf(String::isNotEmpty) ?: return null
-        require(DISPLAY_REF_PATTERN.matches(ref)) {
-            "displayRef must match dsp_ followed by 14 lowercase hexadecimal characters."
-        }
-        return ref
-    }
-
-    private suspend fun resolveDisplayTarget(
-        displayRef: String?,
-        fallbackDisplayId: Int? = null,
-        fallbackDisplayRef: String? = null,
-        claimForRun: Boolean = true,
-    ): TaskDisplayResolution {
-        val backend = taskDisplayBackend
-            ?: return TaskDisplayResolution.Unavailable(
-                code = "TASK_DISPLAY_UNAVAILABLE",
-                message = "The task display registry is unavailable; call dhd_open_app to create a task display.",
-            )
-        val runSessionKey = coordinator.activeSessionId()
-        if (claimForRun && taskDisplayRequiredProvider() && runSessionKey == null) {
-            return TaskDisplayResolution.Unavailable(
-                code = "TASK_DISPLAY_UNAVAILABLE",
-                message = "No active task display run is available. Call dhd_open_app from an active DHD task first.",
-            )
-        }
-        val selectedDisplayRef = displayRef ?: fallbackDisplayRef
-        return if (selectedDisplayRef != null) {
-            backend.activeDisplaySessions()
-            val record = backend.displayRecords.value.firstOrNull { it.displayRef == selectedDisplayRef }
-                ?: return TaskDisplayResolution.Unavailable(
-                    code = "DISPLAY_NOT_FOUND",
-                    message = "No task display matches the supplied displayRef. Call dhd_list_displays to see the available displays.",
-                )
-            backend.resolveDisplay(
-                displayId = record.displayId,
-                claimForSessionKey = if (claimForRun) runSessionKey else null,
-                expectedDisplayRef = selectedDisplayRef,
-            )
-        } else if (fallbackDisplayId != null) {
-            backend.resolveDisplay(
-                displayId = fallbackDisplayId,
-                claimForSessionKey = if (claimForRun) runSessionKey else null,
-            )
-        } else {
-            backend.resolveDefaultDisplay(
-                claimForSessionKey = if (claimForRun) runSessionKey else null,
             )
         }
     }
@@ -1637,7 +1109,7 @@ class DevBridgeServer internal constructor(
     private suspend fun observe(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val purpose = json.optString("purpose").trim().take(MAX_TEXT_CHARS)
             .ifBlank { "Observing current screen" }
@@ -1647,41 +1119,39 @@ class DevBridgeServer internal constructor(
             toolName = ToolNames.OBSERVE,
         )
         if (!coordinator.awaitPhoneAccessForTool()) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "Phone access is no longer available; DHD could not observe the phone.")
-                    .put("code", "DEVELOPER_MODE_UNAVAILABLE"),
+                    .put("code", BridgeErrorCodes.DEVELOPER_MODE_UNAVAILABLE),
             )
             return
         }
         val requestedDisplayRef = optionalDisplayRef(json)
         val target = if (taskDisplayRequiredProvider() || requestedDisplayRef != null) {
-            when (val resolution = resolveDisplayTarget(
+            when (val resolution = displayTargets.resolve(
                 displayRef = requestedDisplayRef,
             )) {
                 is TaskDisplayResolution.Ready -> resolution.target
                 is TaskDisplayResolution.Unavailable -> {
-                    write(writer, errorResponse(requestId, resolution.message).put("code", resolution.code))
+                    reply.write(errorResponse(requestId, resolution.message).put("code", resolution.code))
                     return
                 }
             }
         } else {
             null
         }
-        when (val captured = captureWithRetry(
+        when (val captured = captures.captureWithRetry(
             expectedPackageName = null,
             guardRegions = emptyList(),
             taskSessionKey = target?.session?.sessionKey ?: coordinator.activeSessionId(),
             displayId = target?.session?.displayId,
             expectedDisplayRef = target?.displayRef,
         )) {
-            is ObservationCaptureResult.Failed -> write(
-                writer,
+            is ObservationCaptureResult.Failed -> reply.write(
                 errorResponse(requestId, captured.message).put("code", captured.code),
             )
             is ObservationCaptureResult.Succeeded -> {
-                remember(captured.snapshot)
-                writeObservation(writer, requestId, captured.snapshot, captured.screenshot)
+                captures.remember(captured.snapshot)
+                reply.write(bridgeJson.observationResponse(requestId, captured.snapshot, captured.screenshot))
             }
         }
     }
@@ -1689,28 +1159,27 @@ class DevBridgeServer internal constructor(
     private suspend fun foregroundApp(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         coordinator.recordPurpose(
             purpose = "Checking foreground app",
             toolName = ToolNames.FOREGROUND_APP,
         )
         if (!coordinator.awaitPhoneAccessForTool()) {
-            write(
-                writer,
+            reply.write(
                 errorResponse(requestId, "Phone access is no longer available; DHD could not check the phone.")
-                    .put("code", "DEVELOPER_MODE_UNAVAILABLE"),
+                    .put("code", BridgeErrorCodes.DEVELOPER_MODE_UNAVAILABLE),
             )
             return
         }
         val requestedDisplayRef = optionalDisplayRef(json)
         val target = if (taskDisplayRequiredProvider() || requestedDisplayRef != null) {
-            when (val resolution = resolveDisplayTarget(
+            when (val resolution = displayTargets.resolve(
                 displayRef = requestedDisplayRef,
             )) {
                 is TaskDisplayResolution.Ready -> resolution.target
                 is TaskDisplayResolution.Unavailable -> {
-                    write(writer, errorResponse(requestId, resolution.message).put("code", resolution.code))
+                    reply.write(errorResponse(requestId, resolution.message).put("code", resolution.code))
                     return
                 }
             }
@@ -1722,13 +1191,11 @@ class DevBridgeServer internal constructor(
             displayId = target?.session?.displayId,
             expectedDisplayRef = target?.displayRef,
         )) {
-            is ForegroundAppResult.Failed -> write(
-                writer,
+            is ForegroundAppResult.Failed -> reply.write(
                 errorResponse(requestId, result.message).put("code", result.code),
             )
 
-            is ForegroundAppResult.Succeeded -> write(
-                writer,
+            is ForegroundAppResult.Succeeded -> reply.write(
                 JSONObject()
                     .put("type", "foreground_app")
                     .put("requestId", requestId)
@@ -1755,28 +1222,22 @@ class DevBridgeServer internal constructor(
     private suspend fun executeAction(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val actionJson = json.optJSONObject("action")
             ?: throw IllegalArgumentException("action must be an object.")
         val parsedAction = parsePhoneAction(actionJson)
         val observationId = parsedAction.metadata.observationId.trim()
-        val suppliedObservation = synchronized(observations) {
-            observationId.takeIf(String::isNotBlank)?.let { observations[it] }
-        }
+        val suppliedObservation = observationId.takeIf(String::isNotBlank)?.let(captures::lookup)
         val runSessionKey = coordinator.activeSessionId()
         if (taskDisplayRequiredProvider() && runSessionKey == null) {
-            write(
-                writer,
-                JSONObject()
-                    .put("type", "completed")
-                    .put("requestId", requestId)
-                    .put("ok", false)
-                    .put("action", wireActionName(parsedAction))
-                    .put("outcome", "failed")
-                    .put("executed", false)
-                    .put("code", "TASK_DISPLAY_UNAVAILABLE")
-                    .put("message", "No active task display is available; the physical display was not touched."),
+            reply.write(
+                failedActionCompletion(
+                    requestId = requestId,
+                    action = wireActionName(parsedAction),
+                    code = BridgeErrorCodes.TASK_DISPLAY_UNAVAILABLE,
+                    message = "No active task display is available; the physical display was not touched.",
+                ),
             )
             return
         }
@@ -1785,7 +1246,7 @@ class DevBridgeServer internal constructor(
             suppliedObservation != null ||
             parsedAction !is OpenAppAction
         ) {
-            resolveDisplayTarget(
+            displayTargets.resolve(
                 displayRef = requestedDisplayRef,
                 fallbackDisplayId = suppliedObservation?.displayId,
                 fallbackDisplayRef = suppliedObservation?.taskSessionKey?.let { taskSessionKey ->
@@ -1804,21 +1265,17 @@ class DevBridgeServer internal constructor(
                 // resolution failure is actionable and must reach the model.
                 if (parsedAction is OpenAppAction &&
                     requestedDisplayRef == null &&
-                    targetResolution.code == "TASK_DISPLAY_UNAVAILABLE"
+                    targetResolution.code == BridgeErrorCodes.TASK_DISPLAY_UNAVAILABLE
                 ) {
                     null
                 } else {
-                    write(
-                        writer,
-                        JSONObject()
-                            .put("type", "completed")
-                            .put("requestId", requestId)
-                            .put("ok", false)
-                            .put("action", wireActionName(parsedAction))
-                            .put("outcome", "failed")
-                            .put("executed", false)
-                            .put("code", targetResolution.code)
-                            .put("message", targetResolution.message),
+                    reply.write(
+                        failedActionCompletion(
+                            requestId = requestId,
+                            action = wireActionName(parsedAction),
+                            code = targetResolution.code,
+                            message = targetResolution.message,
+                        ),
                     )
                     return
                 }
@@ -1828,17 +1285,13 @@ class DevBridgeServer internal constructor(
             (suppliedObservation.displayId != target.session.displayId ||
                 suppliedObservation.taskSessionKey != target.session.sessionKey)
         ) {
-            write(
-                writer,
-                JSONObject()
-                    .put("type", "completed")
-                    .put("requestId", requestId)
-                    .put("ok", false)
-                    .put("action", wireActionName(parsedAction))
-                    .put("outcome", "failed")
-                    .put("executed", false)
-                    .put("code", "DISPLAY_CHANGED")
-                    .put("message", "The supplied observation belongs to a different task display; call dhd_observe with the selected display before retrying."),
+            reply.write(
+                failedActionCompletion(
+                    requestId = requestId,
+                    action = wireActionName(parsedAction),
+                    code = BridgeErrorCodes.DISPLAY_CHANGED,
+                    message = "The supplied observation belongs to a different task display; call dhd_observe with the selected display before retrying.",
+                ),
             )
             return
         }
@@ -1853,28 +1306,21 @@ class DevBridgeServer internal constructor(
             // without a task session retain the physical baseline behavior.
             if (taskSessionKey != null) {
                 null
-            } else when (val captured = captureWithRetry(null, emptyList(), null)) {
+            } else when (val captured = captures.captureWithRetry(null, emptyList(), null)) {
                 is ObservationCaptureResult.Failed -> {
-                    write(
-                        writer,
-                        JSONObject()
-                            .put("type", "completed")
-                            .put("requestId", requestId)
-                            .put("ok", false)
-                            .put("action", "open_app")
-                            .put("outcome", "failed")
-                            .put("executed", false)
-                            .put("code", "OBSERVATION_FAILED")
-                            .put(
-                                "message",
-                                "Could not establish a launch baseline; the app was not opened: ${captured.message}",
-                            ),
+                    reply.write(
+                        failedActionCompletion(
+                            requestId = requestId,
+                            action = "open_app",
+                            code = BridgeErrorCodes.OBSERVATION_FAILED,
+                            message = "Could not establish a launch baseline; the app was not opened: ${captured.message}",
+                        ),
                     )
                     return
                 }
 
                 is ObservationCaptureResult.Succeeded -> {
-                    remember(captured.snapshot)
+                    captures.remember(captured.snapshot)
                     captured.snapshot
                 }
             }
@@ -1882,17 +1328,13 @@ class DevBridgeServer internal constructor(
             null
         }
         if (observation == null && parsedAction !is OpenAppAction) {
-            write(
-                writer,
-                JSONObject()
-                    .put("type", "completed")
-                    .put("requestId", requestId)
-                    .put("ok", false)
-                    .put("action", wireActionName(parsedAction))
-                    .put("outcome", "failed")
-                    .put("executed", false)
-                    .put("code", "OBSERVATION_MISSING")
-                    .put("message", "The supplied observationId is missing or expired; observe the phone before retrying."),
+            reply.write(
+                failedActionCompletion(
+                    requestId = requestId,
+                    action = wireActionName(parsedAction),
+                    code = BridgeErrorCodes.OBSERVATION_MISSING,
+                    message = "The supplied observationId is missing or expired; observe the phone before retrying.",
+                ),
             )
             return
         }
@@ -1912,14 +1354,14 @@ class DevBridgeServer internal constructor(
         val activityToolName = json.optString("tool")
             .trim()
             .takeIf(String::isNotBlank)
-            ?: fallbackActionToolName(json)
+            ?: toolCalls.fallbackActionToolName(json)
         val result = coordinator.executeAction(
             action = action,
             observation = observation,
             toolName = activityToolName,
             targetDisplay = target?.session,
         )
-        writeActionResult(writer, requestId, wireActionName(action), result)
+        reply.write(bridgeJson.actionResultResponse(requestId, wireActionName(action), result))
         if (!result.isSuccessful()) {
             val failureCode = result.failureCode()
             val response = JSONObject()
@@ -1927,20 +1369,20 @@ class DevBridgeServer internal constructor(
                 .put("requestId", requestId)
                 .put("ok", false)
                 .put("action", wireActionName(action))
-                .put("message", result.failureMessage())
+                .put("message", result.resultMessage())
             failureCode?.let { response.put("code", it) }
-            addBeforeDebug(
+            bridgeJson.addBeforeDebug(
                 response,
                 observation,
                 result.beforeScreenshotOrNull(),
             )
-            result.staleDetailsOrNull()?.let { details -> addStaleDiagnostics(response, details) }
-            if (failureCode == "DISPLAY_LIMIT_REACHED") {
+            result.staleDetailsOrNull()?.let { details -> bridgeJson.addStaleDiagnostics(response, details) }
+            if (failureCode == BridgeErrorCodes.DISPLAY_LIMIT_REACHED) {
                 val backend = taskDisplayBackend
                 val displays = if (backend == null) {
                     emptyList()
                 } else {
-                    displayInventoryForRecovery(backend)
+                    displayTargets.displayInventoryForRecovery(backend)
                 }
                 addDisplayLimitRecovery(
                     response = response,
@@ -1948,7 +1390,7 @@ class DevBridgeServer internal constructor(
                     displays = displays,
                 )
             }
-            write(writer, response)
+            reply.write(response)
             return
         }
 
@@ -1963,7 +1405,7 @@ class DevBridgeServer internal constructor(
         val postSession = taskSessionKey?.let { key ->
             taskDisplayBackend?.current(key)
         } ?: target?.session
-        when (val captured = captureWithRetry(
+        when (val captured = captures.captureWithRetry(
             expectedPackageName = null,
             guardRegions = emptyList(),
             taskSessionKey = postSession?.sessionKey ?: taskSessionKey,
@@ -1971,17 +1413,15 @@ class DevBridgeServer internal constructor(
             expectedDisplayRef = postSession?.let { taskDisplayReference(it.sessionKey, it.displayId) },
         )) {
             is ObservationCaptureResult.Failed -> {
-                write(
-                    writer,
-                    JSONObject()
-                        .put("type", "completed")
-                        .put("requestId", requestId)
-                        .put("ok", false)
-                        .put("action", wireActionName(action))
-                        .put("outcome", "unknown")
-                        .put("executed", "unknown")
-                        .put("code", if (captured.code == "OBSERVATION_FAILED") "POST_OBSERVATION_FAILED" else captured.code)
-                        .put("message", "The action may have run, but the phone could not produce a post-action observation: ${captured.message}"),
+                reply.write(
+                    failedActionCompletion(
+                        requestId = requestId,
+                        action = wireActionName(action),
+                        code = if (captured.code == BridgeErrorCodes.OBSERVATION_FAILED) BridgeErrorCodes.POST_OBSERVATION_FAILED else captured.code,
+                        message = "The action may have run, but the phone could not produce a post-action observation: ${captured.message}",
+                        outcome = "unknown",
+                        executed = "unknown",
+                    ),
                 )
             }
 
@@ -1991,14 +1431,14 @@ class DevBridgeServer internal constructor(
                 } else {
                     null
                 }
-                remember(captured.snapshot)
+                captures.remember(captured.snapshot)
                 val response = JSONObject()
                     .put("type", "completed")
                     .put("requestId", requestId)
                     .put("ok", true)
                     .put("action", wireActionName(action))
-                    .put("message", result.successMessage())
-                    .put("observation", snapshotJson(captured.snapshot))
+                    .put("message", result.resultMessage())
+                    .put("observation", bridgeJson.snapshotJson(captured.snapshot))
                     .put("screenshotBase64", base64.encode(captured.screenshot))
                     .put("screenshotMimeType", "image/png")
                 initialPointer?.let { pointer ->
@@ -2009,12 +1449,12 @@ class DevBridgeServer internal constructor(
                             .put("y", pointer.y),
                     )
                 }
-                addBeforeDebug(
+                bridgeJson.addBeforeDebug(
                     response,
                     observation,
                     result.beforeScreenshotOrNull(),
                 )
-                write(writer, response)
+                reply.write(response)
             }
         }
     }
@@ -2022,86 +1462,57 @@ class DevBridgeServer internal constructor(
     private suspend fun executeSequence(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val request = try {
             parseSequenceRequest(json)
         } catch (error: InvalidSequencePayloadException) {
-            writeInvalidSequenceResult(writer, requestId, json, error)
+            reply.write(bridgeJson.invalidSequenceResponse(requestId, json, error))
             return
         }
-        val observation = synchronized(observations) {
-            observations[request.observationId]
-        }
+        val observation = captures.lookup(request.observationId)
         if (observation == null) {
-            val firstAction = request.actions.first()
-            val failure = SequenceStepResult(
-                index = 0,
-                action = wireActionName(firstAction),
-                status = SequenceStepResult.Status.FAILED,
-                message = "The supplied observationId is missing or expired; observe the phone before retrying.",
-                code = "OBSERVATION_MISSING",
-                outcome = "failed",
-                executed = false,
-            )
-            writeSequenceResult(
-                writer,
-                requestId,
-                SequenceExecutionResult(
-                    requestedSteps = request.actions.size,
-                    steps = listOf(failure),
-                    failure = failure,
+            reply.write(
+                bridgeJson.sequenceResultResponse(
+                    requestId,
+                    unstartedSequenceFailure(
+                        actions = request.actions,
+                        code = BridgeErrorCodes.OBSERVATION_MISSING,
+                        message = "The supplied observationId is missing or expired; observe the phone before retrying.",
+                    ),
                 ),
             )
             return
         }
         val runSessionKey = coordinator.activeSessionId()
         if (taskDisplayRequiredProvider() && runSessionKey == null) {
-            val firstAction = request.actions.first()
-            val failure = SequenceStepResult(
-                index = 0,
-                action = wireActionName(firstAction),
-                status = SequenceStepResult.Status.FAILED,
-                message = "No active task display is available; the physical display was not touched.",
-                code = "TASK_DISPLAY_UNAVAILABLE",
-                outcome = "failed",
-                executed = false,
-            )
-            writeSequenceResult(
-                writer,
-                requestId,
-                SequenceExecutionResult(
-                    requestedSteps = request.actions.size,
-                    steps = listOf(failure),
-                    failure = failure,
+            reply.write(
+                bridgeJson.sequenceResultResponse(
+                    requestId,
+                    unstartedSequenceFailure(
+                        actions = request.actions,
+                        code = BridgeErrorCodes.TASK_DISPLAY_UNAVAILABLE,
+                        message = "No active task display is available; the physical display was not touched.",
+                    ),
                 ),
             )
             return
         }
         if (!coordinator.awaitPhoneAccessForTool()) {
-            val firstAction = request.actions.first()
-            val failure = SequenceStepResult(
-                index = 0,
-                action = wireActionName(firstAction),
-                status = SequenceStepResult.Status.FAILED,
-                message = "Phone access is no longer available; the sequence was not executed.",
-                code = "DEVELOPER_MODE_UNAVAILABLE",
-                outcome = "failed",
-                executed = false,
-            )
-            writeSequenceResult(
-                writer,
-                requestId,
-                SequenceExecutionResult(
-                    requestedSteps = request.actions.size,
-                    steps = listOf(failure),
-                    failure = failure,
+            reply.write(
+                bridgeJson.sequenceResultResponse(
+                    requestId,
+                    unstartedSequenceFailure(
+                        actions = request.actions,
+                        code = BridgeErrorCodes.DEVELOPER_MODE_UNAVAILABLE,
+                        message = "Phone access is no longer available; the sequence was not executed.",
+                    ),
                 ),
             )
             return
         }
         val target = if (taskDisplayRequiredProvider() || request.displayRef != null || observation.taskSessionKey != null) {
-            when (val resolution = resolveDisplayTarget(
+            when (val resolution = displayTargets.resolve(
                 displayRef = request.displayRef,
                 fallbackDisplayId = observation.displayId,
                 fallbackDisplayRef = observation.taskSessionKey?.let { taskSessionKey ->
@@ -2110,23 +1521,14 @@ class DevBridgeServer internal constructor(
             )) {
                 is TaskDisplayResolution.Ready -> resolution.target
                 is TaskDisplayResolution.Unavailable -> {
-                    val firstAction = request.actions.first()
-                    val failure = SequenceStepResult(
-                        index = 0,
-                        action = wireActionName(firstAction),
-                        status = SequenceStepResult.Status.FAILED,
-                        message = resolution.message,
-                        code = resolution.code,
-                        outcome = "failed",
-                        executed = false,
-                    )
-                    writeSequenceResult(
-                        writer,
-                        requestId,
-                        SequenceExecutionResult(
-                            requestedSteps = request.actions.size,
-                            steps = listOf(failure),
-                            failure = failure,
+                    reply.write(
+                        bridgeJson.sequenceResultResponse(
+                            requestId,
+                            unstartedSequenceFailure(
+                                actions = request.actions,
+                                code = resolution.code,
+                                message = resolution.message,
+                            ),
                         ),
                     )
                     return
@@ -2139,23 +1541,14 @@ class DevBridgeServer internal constructor(
             (observation.taskSessionKey != target.session.sessionKey ||
                 observation.displayId != target.session.displayId)
         ) {
-            val firstAction = request.actions.first()
-            val failure = SequenceStepResult(
-                index = 0,
-                action = wireActionName(firstAction),
-                status = SequenceStepResult.Status.FAILED,
-                message = "The observation belongs to a different task display; no input was sent.",
-                code = "DISPLAY_CHANGED",
-                outcome = "failed",
-                executed = false,
-            )
-            writeSequenceResult(
-                writer,
-                requestId,
-                SequenceExecutionResult(
-                    requestedSteps = request.actions.size,
-                    steps = listOf(failure),
-                    failure = failure,
+            reply.write(
+                bridgeJson.sequenceResultResponse(
+                    requestId,
+                    unstartedSequenceFailure(
+                        actions = request.actions,
+                        code = BridgeErrorCodes.DISPLAY_CHANGED,
+                        message = "The observation belongs to a different task display; no input was sent.",
+                    ),
                 ),
             )
             return
@@ -2171,7 +1564,7 @@ class DevBridgeServer internal constructor(
                 )
             },
             captureAfterAction = { guardRegions ->
-                captureWithRetry(
+                captures.captureWithRetry(
                     expectedPackageName = null,
                     guardRegions = guardRegions,
                     taskSessionKey = target?.session?.sessionKey ?: runSessionKey,
@@ -2179,10 +1572,10 @@ class DevBridgeServer internal constructor(
                     expectedDisplayRef = target?.displayRef,
                 )
             },
-            rememberObservation = ::remember,
+            rememberObservation = captures::remember,
             settleAfterAction = ::settleAfterAction,
         ).execute(observation, request.actions)
-        writeSequenceResult(writer, requestId, result, observation)
+        reply.write(bridgeJson.sequenceResultResponse(requestId, result, observation))
     }
 
     private suspend fun settleAfterAction(action: PhoneAction) {
@@ -2196,7 +1589,7 @@ class DevBridgeServer internal constructor(
     private fun stopSession(
         requestId: String,
         json: JSONObject,
-        writer: BufferedWriter,
+        reply: BridgeReply,
     ) {
         val reason = json.optString("reason", "Stopped by the desktop assistant.")
             .trim()
@@ -2205,8 +1598,7 @@ class DevBridgeServer internal constructor(
         val stopped = coordinator.stop(reason)
         platform.removeAttentionNotification()
         platform.reconcileServiceLifetime()
-        write(
-            writer,
+        reply.write(
             JSONObject()
                 .put("type", "stopped")
                 .put("requestId", requestId)
@@ -2216,348 +1608,10 @@ class DevBridgeServer internal constructor(
         )
     }
 
-    internal fun parseSequenceRequest(json: JSONObject): SequenceRequest {
-        val observationId = json.optString("observationId").trim()
-        if (observationId.isEmpty() || observationId.length > MAX_TEXT_CHARS) {
-            throw InvalidSequencePayloadException(
-                index = null,
-                message = "observationId must be 1-$MAX_TEXT_CHARS characters.",
-            )
-        }
-        val actionsJson = json.optJSONArray("actions")
-            ?: throw InvalidSequencePayloadException(null, "actions must be an array.")
-        if (actionsJson.length() !in 1..MAX_SEQUENCE_ACTIONS) {
-            throw InvalidSequencePayloadException(
-                index = null,
-                message = "A sequence must contain between 1 and $MAX_SEQUENCE_ACTIONS actions.",
-            )
-        }
-        val actions = buildList(actionsJson.length()) {
-            for (index in 0 until actionsJson.length()) {
-                val actionJson = actionsJson.optJSONObject(index)
-                    ?: throw InvalidSequencePayloadException(index, "Sequence action $index must be an object.")
-                val metadata = actionJson.optJSONObject("metadata")
-                if (metadata == null) {
-                    throw InvalidSequencePayloadException(index, "Sequence action $index must include metadata.")
-                }
-                if (metadata.has("observationId")) {
-                    throw InvalidSequencePayloadException(
-                        index,
-                        "Sequence action $index receives observationId from the phone and must not provide one.",
-                    )
-                }
-                val action = try {
-                    parsePhoneAction(actionJson)
-                } catch (error: Exception) {
-                    throw InvalidSequencePayloadException(
-                        index,
-                        "Sequence action $index is invalid: ${error.message ?: "invalid action payload"}",
-                    )
-                }
-                if (action is OpenAppAction) {
-                    throw InvalidSequencePayloadException(
-                        index,
-                        "dhd_execute_sequence does not support open_app; use dhd_open_app first.",
-                    )
-                }
-                add(action)
-            }
-        }
-        return SequenceRequest(
-            observationId = observationId,
-            actions = actions,
-            displayRef = optionalDisplayRef(json),
-        )
-    }
-
-    private fun writeInvalidSequenceResult(
-        writer: BufferedWriter,
-        requestId: String,
-        json: JSONObject,
-        error: InvalidSequencePayloadException,
-    ) {
-        val actions = json.optJSONArray("actions")
-        val response = JSONObject()
-            .put("type", "completed")
-            .put("requestId", requestId)
-            .put("ok", false)
-            .put("action", "sequence")
-            .put("requestedSteps", actions?.length() ?: 0)
-            .put("completedSteps", 0)
-            .put("message", error.message ?: "The sequence payload is invalid.")
-            .put("code", "INVALID_PAYLOAD")
-            .put("outcome", "failed")
-            .put("executed", false)
-        val steps = JSONArray()
-        error.index?.let { index ->
-            val action = actions
-                ?.optJSONObject(index)
-                ?.optString("type")
-                ?.trim()
-                ?.ifBlank { null }
-                ?: "unknown"
-            steps.put(
-                JSONObject()
-                    .put("index", index)
-                    .put("action", action)
-                    .put("status", "failed")
-                    .put("message", error.message ?: "The sequence action is invalid.")
-                    .put("code", "INVALID_PAYLOAD")
-                    .put("outcome", "failed")
-                    .put("executed", false),
-            )
-            response.put("failedStep", index)
-        }
-        response.put("steps", steps)
-        write(writer, response)
-    }
-
-    internal fun parsePhoneAction(json: JSONObject): PhoneAction {
-        val metadata = parseMetadata(json.optJSONObject("metadata"))
-        return when (json.optString("type")) {
-            "open_app" -> {
-                val packageName = json.optString("packageName")
-                require(PACKAGE_PATTERN.matches(packageName)) { "packageName is not a valid Android package name." }
-                OpenAppAction(packageName, metadata)
-            }
-
-            "tap" -> TapAction(
-                x = json.getInt("x"),
-                y = json.getInt("y"),
-                metadata = metadata,
-            )
-
-            "type" -> TypeAction(json.getString("text"), metadata)
-
-            "swipe" -> SwipeAction(
-                startX = json.getInt("startX"),
-                startY = json.getInt("startY"),
-                endX = json.getInt("endX"),
-                endY = json.getInt("endY"),
-                durationMs = json.optLong("durationMs", 350L),
-                metadata = metadata,
-            )
-
-            "back" -> BackAction(metadata)
-
-            "keypress" -> KeypressAction(
-                key = enumValue<KeypressKey>(json.getString("key")),
-                metadata = metadata,
-            )
-
-            "wait" -> WaitAction(json.getLong("durationMs"), metadata)
-
-            else -> throw IllegalArgumentException(
-                "Unsupported action type. Use open_app, tap, type, swipe, back, keypress, or wait.",
-            )
-        }
-    }
-
-    internal fun parseMetadata(json: JSONObject?): ActionMetadata {
-        require(json != null) { "action.metadata is required." }
-        val purpose = json.optString("purpose").trim()
-        // The companion supplies observationId for the pre-action structural
-        // comparison and may supply guardRegions for strict visual checking.
-        val observationId = json.optString("observationId").trim()
-        val targetDescription = json.optString("targetDescription").trim()
-        require(purpose.isNotEmpty() && purpose.length <= MAX_TEXT_CHARS) {
-            "metadata.purpose must be 1-$MAX_TEXT_CHARS characters."
-        }
-        require(observationId.length <= MAX_TEXT_CHARS) {
-            "metadata.observationId must be at most $MAX_TEXT_CHARS characters."
-        }
-        require(targetDescription.isNotEmpty() && targetDescription.length <= MAX_TEXT_CHARS) {
-            "metadata.targetDescription must be 1-$MAX_TEXT_CHARS characters."
-        }
-        return ActionMetadata(
-            purpose = purpose,
-            observationId = observationId,
-            targetDescription = targetDescription,
-            guardRegions = parseGuardRegions(json.optJSONArray("guardRegions")),
-        )
-    }
-
-    private inline fun <reified T : Enum<T>> enumValue(value: String): T =
-        enumValues<T>().firstOrNull { it.name.equals(value, ignoreCase = true) }
-            ?: throw IllegalArgumentException("Unsupported enum value: $value")
-
-    internal fun wireActionName(action: PhoneAction): String = when (action) {
-        is OpenAppAction -> "open_app"
-        is TapAction -> "tap"
-        is TypeAction -> "type"
-        is SwipeAction -> "swipe"
-        is BackAction -> "back"
-        is KeypressAction -> "keypress"
-        is WaitAction -> "wait"
-    }
-
-    private fun remember(snapshot: ObservationSnapshot) {
-        synchronized(observations) {
-            observations[snapshot.id] = snapshot
-        }
-    }
-
-    private fun addBeforeDebug(
-        response: JSONObject,
-        observation: ObservationSnapshot?,
-        screenshot: ByteArray?,
-    ) {
-        if (observation == null || screenshot == null) return
-        response
-            .put("beforeObservation", snapshotJson(observation))
-            .put("beforeScreenshotBase64", base64.encode(screenshot))
-            .put("beforeScreenshotMimeType", "image/png")
-    }
-
-    /** Attach machine-readable freshness diagnostics without changing the
-     * action's safe rejection semantics. */
-    private fun addStaleDiagnostics(
-        response: JSONObject,
-        details: StaleObservationDiagnostics,
-    ) {
-        response
-            .put("inputSent", false)
-            .put("approvedObservationId", details.approvedObservationId)
-        details.currentObservationId?.let { response.put("currentObservationId", it) }
-        response.put(
-            "reasons",
-            JSONArray(details.reasons.map(::staleReasonJson)),
-        )
-    }
-
-    private fun staleReasonJson(reason: StaleObservationReason): JSONObject = JSONObject()
-        .put("code", reason.code.name)
-        .put("approved", staleReasonValue(reason.approved))
-        .put("current", staleReasonValue(reason.current))
-        .also { json ->
-            reason.guardRegion?.let { region ->
-                json.put(
-                    "guardRegion",
-                    JSONObject()
-                        .put("left", region.left)
-                        .put("top", region.top)
-                        .put("right", region.right)
-                        .put("bottom", region.bottom),
-                )
-            }
-        }
-
-    private fun staleReasonValue(value: Any?): Any = when (value) {
-        null -> JSONObject.NULL
-        is ObservationSize -> JSONObject()
-            .put("width", value.width)
-            .put("height", value.height)
-        else -> value
-    }
-
-    private fun writeObservation(
-        writer: BufferedWriter,
-        requestId: String,
-        snapshot: ObservationSnapshot,
-        screenshot: ByteArray,
-    ) {
-        write(
-            writer,
-            JSONObject()
-                .put("type", "observation")
-                .put("requestId", requestId)
-                .put("ok", true)
-                .put("observation", snapshotJson(snapshot))
-                .put("screenshotBase64", base64.encode(screenshot))
-                .put("screenshotMimeType", "image/png"),
-        )
-    }
-
-    private fun writeSequenceResult(
-        writer: BufferedWriter,
-        requestId: String,
-        result: SequenceExecutionResult,
-        beforeObservation: ObservationSnapshot? = null,
-    ) {
-        val response = JSONObject()
-            .put("type", "completed")
-            .put("requestId", requestId)
-            .put("ok", result.ok)
-            .put("action", "sequence")
-            .put("requestedSteps", result.requestedSteps)
-            .put("completedSteps", result.completedSteps)
-            .put(
-                "message",
-                if (result.ok) {
-                    "Executed ${result.requestedSteps} typed phone actions and returned a fresh observation."
-                } else {
-                    result.failure?.message ?: "The phone sequence failed."
-                },
-            )
-        val steps = JSONArray()
-        result.steps.forEach { step ->
-            val stepJson = JSONObject()
-                .put("index", step.index)
-                .put("action", step.action)
-                .put("status", step.status.name.lowercase())
-                .put("message", step.message)
-            step.observationId?.let { stepJson.put("observationId", it) }
-            step.code?.let { stepJson.put("code", it) }
-            step.outcome?.let { stepJson.put("outcome", it) }
-            step.executed?.let { stepJson.put("executed", it) }
-            step.details?.let { addStaleDiagnostics(stepJson, it) }
-            steps.put(stepJson)
-        }
-        response.put("steps", steps)
-        result.failure?.let { failure ->
-            response
-                .put("failedStep", failure.index)
-                .put("code", failure.code ?: "SEQUENCE_FAILED")
-                .put("outcome", failure.outcome ?: "failed")
-                .put("executed", failure.executed ?: "unknown")
-            failure.details?.let { addStaleDiagnostics(response, it) }
-        }
-        result.finalObservation?.let { captured ->
-            response
-                .put("observation", snapshotJson(captured.snapshot))
-                .put("screenshotBase64", base64.encode(captured.screenshot))
-                .put("screenshotMimeType", "image/png")
-            if (beforeObservation != null) {
-                addBeforeDebug(response, beforeObservation, result.beforeScreenshot)
-            }
-        }
-        write(writer, response)
-    }
-
-    private fun snapshotJson(snapshot: ObservationSnapshot): JSONObject = JSONObject()
-        .put("id", snapshot.id)
-        .put("packageName", snapshot.packageName)
-        .put("activityName", snapshot.activityName ?: JSONObject.NULL)
-        .put("rotation", snapshot.rotation)
-        .put("width", snapshot.width)
-        .put("height", snapshot.height)
-        .put("screenshotFingerprint", snapshot.screenshotFingerprint)
-        .put(
-            "screenProtection",
-            JSONObject()
-                .put("status", snapshot.screenProtection.status.name.lowercase())
-                .put("requiresUserAttention", snapshot.screenProtection.requiresUserAttention)
-                .put("signals", JSONArray(snapshot.screenProtection.signals))
-                .put("reason", snapshot.screenProtection.reason ?: JSONObject.NULL),
-        )
-        .also { json ->
-            snapshot.taskSessionKey?.let { sessionKey ->
-                json.put("displayRef", taskDisplayReference(sessionKey, snapshot.displayId))
-            }
-        }
-
-    private fun stateName(state: SessionState): String = when (state) {
-        SessionState.Idle -> "idle"
-        is SessionState.Running -> "running"
-        is SessionState.Paused -> "paused"
-        is SessionState.Stopped -> "stopped"
-        is SessionState.Completed -> "completed"
-    }
-
-    private suspend fun runDemo(request: DemoRequest, writer: BufferedWriter) {
+    private suspend fun runDemo(request: DemoRequest, reply: BridgeReply) {
         val startedSession = coordinator.start("Desktop Codex demo: ${request.purpose}")
         if (!startedSession) {
-            write(writer, errorResponse(request.requestId, "The phone already has an active session."))
+            reply.write(errorResponse(request.requestId, "The phone already has an active session."))
             return
         }
 
@@ -2570,21 +1624,21 @@ class DevBridgeServer internal constructor(
             ),
         )
         val openResult = coordinator.executeAction(open, null)
-        writeActionResult(writer, request.requestId, "open_app", openResult)
+        reply.write(bridgeJson.actionResultResponse(request.requestId, "open_app", openResult))
         if (!openResult.isSuccessful()) {
-            failSession(writer, request, openResult.failureMessage())
+            failSession(reply, request, openResult.resultMessage())
             return
         }
 
         delay(OPEN_SETTLE_DELAY_MS)
-        val afterOpen = captureWithRetry(
+        val afterOpen = captures.captureWithRetry(
             request.packageName,
             request.guardRegions,
             coordinator.activeSessionId(),
         )
         val tapSnapshot = when (afterOpen) {
             is ObservationCaptureResult.Failed -> {
-                failSession(writer, request, afterOpen.message)
+                failSession(reply, request, afterOpen.message)
                 return
             }
 
@@ -2601,24 +1655,23 @@ class DevBridgeServer internal constructor(
             ),
         )
         val tapResult = coordinator.executeAction(tap, tapSnapshot)
-        writeActionResult(writer, request.requestId, "tap", tapResult)
+        reply.write(bridgeJson.actionResultResponse(request.requestId, "tap", tapResult))
         if (!tapResult.isSuccessful()) {
-            failSession(writer, request, tapResult.failureMessage())
+            failSession(reply, request, tapResult.resultMessage())
             return
         }
 
         delay(POST_ACTION_SETTLE_DELAY_MS)
-        val afterTap = captureWithRetry(null, emptyList(), coordinator.activeSessionId())
+        val afterTap = captures.captureWithRetry(null, emptyList(), coordinator.activeSessionId())
         when (afterTap) {
             is ObservationCaptureResult.Failed -> {
-                failSession(writer, request, "Tap completed, but the post-action observation failed: ${afterTap.message}")
+                failSession(reply, request, "Tap completed, but the post-action observation failed: ${afterTap.message}")
                 return
             }
 
             is ObservationCaptureResult.Succeeded -> {
                 coordinator.complete("Demo completed; the phone returned a fresh observation.")
-                write(
-                    writer,
+                reply.write(
                     JSONObject()
                         .put("type", "completed")
                         .put("requestId", request.requestId)
@@ -2631,78 +1684,9 @@ class DevBridgeServer internal constructor(
         }
     }
 
-    private suspend fun captureWithRetry(
-        expectedPackageName: String?,
-        guardRegions: List<GuardRegion>,
-        taskSessionKey: String? = coordinator.activeSessionId(),
-        displayId: Int? = null,
-        expectedDisplayRef: String? = null,
-    ): ObservationCaptureResult {
-        if (taskDisplayRequiredProvider() && taskSessionKey == null) {
-            return ObservationCaptureResult.Failed(
-                message = "No active task display is available; refusing to use the physical display.",
-                code = "TASK_DISPLAY_UNAVAILABLE",
-            )
-        }
-        if (!coordinator.awaitPhoneAccessForTool()) {
-            return ObservationCaptureResult.Failed(
-                message = "Phone access is no longer available; the observation was not captured.",
-                code = "DEVELOPER_MODE_UNAVAILABLE",
-            )
-        }
-        var last: ObservationCaptureResult = ObservationCaptureResult.Failed("No capture attempted.")
-        repeat(CAPTURE_ATTEMPTS) {
-            last = observationProvider.capture(
-                expectedPackageName = expectedPackageName,
-                guardRegions = guardRegions,
-                taskSessionKey = taskSessionKey,
-                displayId = displayId,
-                expectedDisplayRef = expectedDisplayRef,
-            )
-            if (last is ObservationCaptureResult.Succeeded) return last
-            delay(CAPTURE_RETRY_DELAY_MS)
-        }
-        return last
-    }
-
-    private fun failSession(writer: BufferedWriter, request: DemoRequest, message: String) {
+    private fun failSession(reply: BridgeReply, request: DemoRequest, message: String) {
         coordinator.stop("Demo stopped: $message")
-        write(writer, errorResponse(request.requestId, message))
-    }
-
-    private fun writeActionResult(
-        writer: BufferedWriter,
-        requestId: String,
-        action: String,
-        result: ActionExecutionResult,
-    ) {
-        val successful = result.isSuccessful()
-        val response = JSONObject()
-            .put("type", "action_result")
-            .put("requestId", requestId)
-            .put("action", action)
-            .put("ok", successful)
-        when (result) {
-            is ActionExecutionResult.TransportFinished -> {
-                when (val transportResult = result.result) {
-                    is TransportResult.Succeeded -> response.put("message", transportResult.message)
-                    is TransportResult.Rejected -> response
-                        .put("code", transportResult.code.name)
-                        .put("message", transportResult.message)
-                        .also { transportResult.details?.let { details -> addStaleDiagnostics(it, details) } }
-                    is TransportResult.Unsupported -> response.put("message", transportResult.message)
-                }
-            }
-
-            is ActionExecutionResult.PolicyRejected -> response
-                .put("code", "POLICY_REJECTED")
-                .put("message", result.message)
-                .also { result.details?.let { details -> addStaleDiagnostics(it, details) } }
-            ActionExecutionResult.SessionNotRunning -> response
-                .put("code", "SESSION_NOT_RUNNING")
-                .put("message", "The phone session is no longer running.")
-        }
-        write(writer, response)
+        reply.write(errorResponse(request.requestId, message))
     }
 
     private fun parseRequest(json: JSONObject): DemoRequest {
@@ -2732,55 +1716,6 @@ class DevBridgeServer internal constructor(
         )
     }
 
-    internal fun parseGuardRegions(array: JSONArray?): List<GuardRegion> {
-        if (array == null) return emptyList()
-        require(array.length() <= MAX_GUARD_REGIONS) { "At most $MAX_GUARD_REGIONS guard regions are supported." }
-        return buildList(array.length()) {
-            for (index in 0 until array.length()) {
-                val region = array.getJSONObject(index)
-                add(
-                    GuardRegion(
-                        left = region.getInt("left"),
-                        top = region.getInt("top"),
-                        right = region.getInt("right"),
-                        bottom = region.getInt("bottom"),
-                    ),
-                )
-            }
-        }
-    }
-
-    private fun errorResponse(requestId: String?, message: String): JSONObject = JSONObject()
-        .put("type", "error")
-        .put("requestId", requestId ?: JSONObject.NULL)
-        .put("ok", false)
-        .put("message", message)
-
-    private fun observationFailureCode(message: String): String =
-        if (message.contains("Wireless Debugging", ignoreCase = true) ||
-            message.contains("DHD could not execute", ignoreCase = true)
-        ) {
-            "DEVELOPER_MODE_UNAVAILABLE"
-        } else {
-            "OBSERVATION_FAILED"
-        }
-
-    private fun write(writer: BufferedWriter, json: JSONObject) {
-        writer.write(json.toString())
-        writer.newLine()
-        writer.flush()
-    }
-
-    internal fun isAuthorized(peerAddress: InetAddress, json: JSONObject): Boolean {
-        // adb forward presents the desktop peer as loopback. Keep this local
-        // development path compatible without requiring a token, while every
-        // actual LAN peer must prove possession of the paired token.
-        if (peerAddress.isLoopbackAddress) return true
-        val candidate = json.optString("authToken").trim().toByteArray(Charsets.UTF_8)
-        val expected = authenticationToken.toByteArray(Charsets.UTF_8)
-        return MessageDigest.isEqual(candidate, expected)
-    }
-
     /** Return currently usable IPv4 addresses that the desktop can dial. */
     fun lanIpv4Addresses(): List<String> = lanAddressProvider()
 
@@ -2794,51 +1729,11 @@ class DevBridgeServer internal constructor(
         val guardRegions: List<GuardRegion>,
     )
 
-    internal data class SequenceRequest(
-        val observationId: String,
-        val actions: List<PhoneAction>,
-        val displayRef: String? = null,
-    )
-
-    internal class InvalidSequencePayloadException(
-        val index: Int?,
-        message: String,
-    ) : IllegalArgumentException(message)
-
     internal companion object {
         const val TAG = "PhoneControlBridge"
         const val LAN_BIND_HOST = "0.0.0.0"
         const val DEFAULT_PORT = 8765
         const val PAIRING_DISCOVERY_PORT = 8766
-        const val PAIRING_PROTOCOL_VERSION = 1
-        const val PAIRING_APPROVAL_TIMEOUT_MS = 60_000L
-        const val DISCOVERY_NONCE_TTL_MS = 90_000L
-        const val MAX_DISCOVERY_NONCES = 32
-        const val COMPLETED_PAIRING_RESPONSE_TTL_MS = 10_000L
-        const val MAX_COMPLETED_PAIRING_RESPONSES = 16
-        const val MAX_DESKTOP_NAME_CHARS = 80
-        const val PREFERENCES_NAME = "dhd_companion_link"
-        const val KEY_AUTH_TOKEN = "bridge_auth_token"
-        const val KEY_DEVICE_ID = "device_id"
-        // The companion uses short-lived TCP polls. Allow several missed
-        // polls before showing a disconnect so one Wi-Fi/scheduler hiccup
-        // does not flap the phone UI offline.
-        const val COMPANION_PRESENCE_TIMEOUT_MS = 15_000L
-        const val COMPANION_PRESENCE_CHECK_INTERVAL_MS = 1_000L
-        const val MAX_REQUEST_CHARS = 16_384
-        const val MAX_TEXT_CHARS = 240
-        const val MAX_AGENT_FEEDBACK_CHARS = 4_000
-        const val MAX_APP_QUERY_CHARS = 120
-        const val MAX_APP_BROWSE_RESULTS = 25
-        const val MAX_GUARD_REGIONS = 8
-        const val MAX_SEQUENCE_ACTIONS = 16
-        const val MAX_OBSERVATIONS = 64
-        const val OPEN_SETTLE_DELAY_MS = 750L
-        const val POST_ACTION_SETTLE_DELAY_MS = 350L
-        const val CAPTURE_ATTEMPTS = 5
-        const val CAPTURE_RETRY_DELAY_MS = 250L
-        val PACKAGE_PATTERN = Regex("[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+")
-        val DISPLAY_REF_PATTERN = Regex("dsp_[a-f0-9]{14}")
     }
 }
 
@@ -2857,181 +1752,3 @@ internal fun systemLanIpv4Addresses(): List<String> = runCatching {
         ?.toList()
         ?: emptyList()
 }.getOrDefault(emptyList())
-
-internal fun buildAllowedAppsResponse(
-    requestId: String,
-    fullAccess: Boolean,
-    allowedPackages: Set<String>,
-    includeAll: Boolean = false,
-    apps: List<InstalledUserApp> = emptyList(),
-): JSONObject {
-    val response = JSONObject()
-        .put("type", "allowed_apps")
-        .put("requestId", requestId)
-        .put("ok", true)
-        .put("fullAccess", fullAccess)
-        .put("accessMode", if (fullAccess) "full_access" else "allowlist")
-        .put("canListAllApps", fullAccess)
-
-    if (includeAll) {
-        response
-            .put("apps", JSONArray(apps.map(::buildAppResponse)))
-            .put("count", apps.size)
-            .put(
-                "message",
-                if (fullAccess) {
-                    "Full Access is enabled. Returned all launchable apps on the phone."
-                } else {
-                    "Restricted access is enabled. Returned all launchable apps in the allowlist."
-                },
-            )
-    } else if (fullAccess) {
-        response.put("message", "Full Access is enabled. You can use any launchable app on the phone.")
-    } else {
-        val packages = allowedPackages.toList().sorted()
-        response
-            .put("allowedPackages", JSONArray(packages))
-            .put("count", packages.size)
-    }
-
-    return response
-}
-
-internal fun buildBrowseAppsResponse(
-    requestId: String,
-    query: String,
-    fullAccess: Boolean,
-    allowedPackages: Set<String> = emptySet(),
-    apps: List<InstalledUserApp>,
-    truncated: Boolean,
-): JSONObject = JSONObject()
-    .put("type", "browse_apps")
-    .put("requestId", requestId)
-    .put("ok", true)
-    .put("query", query)
-    .put("fullAccess", fullAccess)
-    .put("accessMode", if (fullAccess) "full_access" else "allowlist")
-    .put(
-        "apps",
-        JSONArray(
-            apps.map { app ->
-                buildAppResponse(
-                    app = app,
-                    canUse = fullAccess || app.packageName in allowedPackages,
-                )
-            },
-        ),
-    )
-    .put("count", apps.size)
-    .put("truncated", truncated)
-
-internal fun buildAppDisplayLayoutResponse(
-    requestId: String,
-    packageName: String,
-    appLabel: String,
-    layout: String,
-    changed: Boolean,
-): JSONObject {
-    val fullSize = layout == "full_size"
-    val layoutDescription = if (fullSize) "full-size" else "standard"
-    return JSONObject()
-        .put("type", "app_display_layout_updated")
-        .put("requestId", requestId)
-        .put("ok", true)
-        .put("appLabel", appLabel)
-        .put("packageName", packageName)
-        .put("layout", layout)
-        .put("fullSizeLayoutEnabled", fullSize)
-        .put("changed", changed)
-        .put("appliesNextOpen", true)
-        .put("requiresFreshDisplay", changed)
-        .put("currentDisplayUnchanged", true)
-        .put("displayGeometryUnchanged", true)
-        .put(
-            "message",
-            if (changed) {
-                "$layoutDescription app layout saved for $appLabel. The next dhd_open_app call without displayRef will use a fresh DHD task display with this layout."
-            } else {
-                "$layoutDescription app layout is already active for $appLabel. Future compatible opens may reuse the current DHD task display."
-            },
-        )
-}
-
-/**
- * Add an actionable display inventory to a session-limit failure. The list
- * intentionally contains only displayRefs and user-facing metadata so the
- * agent can close or reuse a display without receiving native display IDs or
- * coordinator/session keys.
- */
-internal fun addDisplayLimitRecovery(
-    response: JSONObject,
-    packageName: String?,
-    displays: List<JSONObject>,
-): JSONObject {
-    val target = packageName?.trim()?.takeIf(String::isNotEmpty) ?: "the requested app"
-    return response
-        .put(
-            "message",
-            "The DHD virtual-display session limit was reached while opening $target. " +
-                "The displays array lists the active and retained displays. " +
-                "Close an unused display with dhd_close_display using its exact displayRef " +
-                "(stop its active run first if needed), then retry dhd_open_app. " +
-                "To reuse a retained display instead, pass its displayRef to dhd_open_app.",
-        )
-        .put("displays", JSONArray(displays))
-        .put("count", displays.size)
-}
-
-private fun buildAppResponse(app: InstalledUserApp, canUse: Boolean? = null): JSONObject {
-    val response = JSONObject()
-        .put("appLabel", app.label)
-        .put("packageName", app.packageName)
-    if (canUse != null) response.put("canUse", canUse)
-    return response
-}
-
-private fun ActionExecutionResult.isSuccessful(): Boolean = this is ActionExecutionResult.TransportFinished &&
-    this.result is TransportResult.Succeeded
-
-private fun ActionExecutionResult.beforeScreenshotOrNull(): ByteArray? = when (this) {
-    is ActionExecutionResult.TransportFinished ->
-        (result as? TransportResult.Succeeded)?.beforeScreenshot
-    is ActionExecutionResult.PolicyRejected,
-    ActionExecutionResult.SessionNotRunning -> null
-}
-
-private fun ActionExecutionResult.staleDetailsOrNull(): StaleObservationDiagnostics? = when (this) {
-    is ActionExecutionResult.TransportFinished -> (result as? TransportResult.Rejected)?.details
-    is ActionExecutionResult.PolicyRejected -> details
-    ActionExecutionResult.SessionNotRunning -> null
-}
-
-private fun ActionExecutionResult.failureMessage(): String = when (this) {
-    is ActionExecutionResult.TransportFinished -> when (val result = result) {
-        is TransportResult.Rejected -> result.message
-        is TransportResult.Unsupported -> result.message
-        is TransportResult.Succeeded -> result.message
-    }
-    is ActionExecutionResult.PolicyRejected -> message
-    ActionExecutionResult.SessionNotRunning -> "The phone session is no longer running."
-}
-
-private fun ActionExecutionResult.successMessage(): String = when (this) {
-    is ActionExecutionResult.TransportFinished -> when (val result = result) {
-        is TransportResult.Succeeded -> result.message
-        is TransportResult.Rejected -> result.message
-        is TransportResult.Unsupported -> result.message
-    }
-    is ActionExecutionResult.PolicyRejected -> message
-    ActionExecutionResult.SessionNotRunning -> "The phone session is no longer running."
-}
-
-private fun ActionExecutionResult.failureCode(): String? = when (this) {
-    is ActionExecutionResult.TransportFinished -> when (val result = result) {
-        is TransportResult.Rejected -> result.code.name
-        is TransportResult.Unsupported -> "UNSUPPORTED_ACTION"
-        is TransportResult.Succeeded -> null
-    }
-    is ActionExecutionResult.PolicyRejected -> code
-    ActionExecutionResult.SessionNotRunning -> "SESSION_NOT_RUNNING"
-}
