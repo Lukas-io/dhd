@@ -6,7 +6,9 @@ import com.phonecontrol.assistant.bridge.DevBridgeServer
 import com.phonecontrol.assistant.data.AssistantDatabase
 import com.phonecontrol.assistant.data.CONVERSATION_DATABASE_NAME
 import com.phonecontrol.assistant.data.ConversationStore
+import com.phonecontrol.assistant.data.PermissionSetupRepository
 import com.phonecontrol.assistant.data.RunStatus
+import com.phonecontrol.assistant.data.UiPreferencesRepository
 import com.phonecontrol.assistant.data.activityStatus
 import com.phonecontrol.assistant.adb.PhoneAccessController
 import com.phonecontrol.assistant.adb.DhdAdbKey
@@ -19,7 +21,6 @@ import com.phonecontrol.assistant.domain.ActionType
 import com.phonecontrol.assistant.domain.ActivityEventKind
 import com.phonecontrol.assistant.execution.TaskDisplayLayoutPreferences
 import com.phonecontrol.assistant.execution.TaskDisplayStatus
-import com.phonecontrol.assistant.overlay.OverlayPreferences
 import com.phonecontrol.assistant.session.AssistantForegroundService
 import com.phonecontrol.assistant.ui.AppRoutes
 import java.io.File
@@ -38,26 +39,24 @@ class PersistedContractsTest {
 
     @Test
     fun `ui preference names and keys`() {
-        assertEquals("dhd_ui_preferences", com.phonecontrol.assistant.ui.PREFS_NAME)
-        assertEquals("pref_theme_mode", com.phonecontrol.assistant.ui.KEY_THEME_MODE)
-        assertEquals("pref_reasoning_effort", com.phonecontrol.assistant.ui.KEY_REASONING_EFFORT)
-        assertEquals("pref_visible_reasoning_efforts", com.phonecontrol.assistant.ui.KEY_VISIBLE_REASONING_EFFORTS)
-        assertEquals("pref_fast_mode", com.phonecontrol.assistant.ui.KEY_FAST_MODE)
-        assertEquals("dhd_ui_preferences", OverlayPreferences.PREFS_NAME)
-        assertEquals("pref_overlay_enabled", OverlayPreferences.KEY_OVERLAY_ENABLED)
-        assertEquals("pref_overlay_bubble_x", OverlayPreferences.KEY_BUBBLE_X)
-        assertEquals("pref_overlay_bubble_y", OverlayPreferences.KEY_BUBBLE_Y)
-        assertEquals("pref_reasoning_effort", OverlayPreferences.KEY_REASONING_EFFORT)
-        assertEquals("pref_visible_reasoning_efforts", OverlayPreferences.KEY_VISIBLE_REASONING_EFFORTS)
-        assertEquals("pref_fast_mode", OverlayPreferences.KEY_FAST_MODE)
-        assertEquals("pref_theme_mode", OverlayPreferences.KEY_THEME_MODE)
+        assertEquals("dhd_ui_preferences", UiPreferencesRepository.PREFS_NAME)
+        assertEquals("pref_theme_mode", UiPreferencesRepository.KEY_THEME_MODE)
+        assertEquals("pref_reasoning_effort", UiPreferencesRepository.KEY_REASONING_EFFORT)
+        assertEquals("pref_visible_reasoning_efforts", UiPreferencesRepository.KEY_VISIBLE_REASONING_EFFORTS)
+        assertEquals("pref_fast_mode", UiPreferencesRepository.KEY_FAST_MODE)
+        assertEquals("pref_overlay_enabled", UiPreferencesRepository.KEY_OVERLAY_ENABLED)
+        assertEquals("pref_overlay_bubble_x", UiPreferencesRepository.KEY_BUBBLE_X)
+        assertEquals("pref_overlay_bubble_y", UiPreferencesRepository.KEY_BUBBLE_Y)
     }
 
     @Test
     fun `permission setup preference and saved state keys`() {
-        assertEquals("dhd_permission_setup", PERMISSION_SETUP_PREFERENCES)
-        assertEquals("first_run_permission_onboarding_completed", KEY_FIRST_RUN_PERMISSION_ONBOARDING_COMPLETED)
-        assertEquals("notification_setup_step_handled", KEY_NOTIFICATION_SETUP_STEP_HANDLED)
+        assertEquals("dhd_permission_setup", PermissionSetupRepository.PREFERENCES_NAME)
+        assertEquals(
+            "first_run_permission_onboarding_completed",
+            PermissionSetupRepository.KEY_FIRST_RUN_PERMISSION_ONBOARDING_COMPLETED,
+        )
+        assertEquals("notification_setup_step_handled", PermissionSetupRepository.KEY_NOTIFICATION_SETUP_STEP_HANDLED)
         assertEquals("permission_setup_step", STATE_PERMISSION_SETUP_STEP)
         assertEquals("notification_setup_step_handled", STATE_NOTIFICATION_SETUP_HANDLED)
         assertEquals("pending_overlay_enable", STATE_PENDING_OVERLAY_ENABLE)

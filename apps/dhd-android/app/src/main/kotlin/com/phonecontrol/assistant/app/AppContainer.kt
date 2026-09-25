@@ -2,15 +2,24 @@ package com.phonecontrol.assistant.app
 
 import android.content.Context
 import android.view.Surface
+import com.phonecontrol.assistant.adb.DhdAdbKey
+import com.phonecontrol.assistant.adb.DhdAdbMdns
 import com.phonecontrol.assistant.adb.DhdAdbProcessRunner
 import com.phonecontrol.assistant.adb.PhoneAccessController
 import com.phonecontrol.assistant.apps.AppPermissionRepository
+import com.phonecontrol.assistant.apps.InstalledAppsRepository
+import com.phonecontrol.assistant.bridge.AndroidBridgePlatform
 import com.phonecontrol.assistant.bridge.DevBridgeServer
+import com.phonecontrol.assistant.data.ConversationRepository
 import com.phonecontrol.assistant.data.ConversationStore
 import com.phonecontrol.assistant.data.DHD_CONVERSATION_ID
+import com.phonecontrol.assistant.data.PermissionSetupRepository
+import com.phonecontrol.assistant.data.UiPreferencesRepository
 import com.phonecontrol.assistant.display.DhdTaskDisplayBackend
 import com.phonecontrol.assistant.display.DhdVirtualDisplayManager
 import com.phonecontrol.assistant.display.PreviewSurfaceDispatcher
+import com.phonecontrol.assistant.execution.TaskDisplayLayoutPreferences
+import com.phonecontrol.assistant.maintenance.DhdMaintenanceBootstrap
 import com.phonecontrol.assistant.execution.TaskDisplaySession
 import com.phonecontrol.assistant.execution.TypedPhoneActionTransport
 import com.phonecontrol.assistant.observation.PhoneObservationProvider
@@ -28,13 +37,22 @@ class AppContainer(context: Context) {
     private val previewScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     val notificationVisibility = DhdNotificationVisibility()
     val appPermissionRepository = AppPermissionRepository(context)
-    val phoneAccessController = PhoneAccessController(context).also { it.start() }
+    val phoneAccessController = buildPhoneAccessController(context).also { it.start() }
     val processRunner = DhdAdbProcessRunner(phoneAccessController)
     val conversationStore = ConversationStore(context)
+    val conversationRepository = ConversationRepository(conversationStore)
+    val uiPreferencesRepository = UiPreferencesRepository(
+        context.getSharedPreferences(UiPreferencesRepository.PREFS_NAME, Context.MODE_PRIVATE),
+    )
+    val permissionSetupRepository = PermissionSetupRepository(
+        context.getSharedPreferences(PermissionSetupRepository.PREFERENCES_NAME, Context.MODE_PRIVATE),
+    )
+    val taskDisplayLayoutPreferences = TaskDisplayLayoutPreferences(context)
     val taskDisplayBackend = DhdTaskDisplayBackend(
         context,
         DhdVirtualDisplayManager(context, phoneAccessController),
         processRunner,
+        taskDisplayLayoutPreferences,
         conversationStore,
     )
 
@@ -80,11 +98,19 @@ class AppContainer(context: Context) {
         },
     )
 
+    val installedAppsRepository = InstalledAppsRepository(context)
+
     // The bridge accepts paired LAN connections for the development
     // companion. adb forwarding remains compatible because forwarded
     // clients arrive as loopback and bypass the LAN token check.
     val devBridgeServer = DevBridgeServer(
-        context = context,
+        platform = AndroidBridgePlatform(
+            context = context,
+            preferencesName = DevBridgeServer.PREFERENCES_NAME,
+            installedAppsRepository = installedAppsRepository,
+            taskDisplayLayoutPreferences = taskDisplayLayoutPreferences,
+            overlayVisibilityGate = overlayVisibilityGate,
+        ),
         coordinator = sessionCoordinator,
         observationProvider = observationProvider,
         allowedPackagesProvider = { appPermissionRepository.enabledPackages() },
@@ -99,6 +125,18 @@ class AppContainer(context: Context) {
             attach = { session, surface -> taskDisplayBackend.attachLiveSurface(session, surface) },
             detach = { session, surface -> taskDisplayBackend.detachLiveSurface(session, surface) },
             onFailure = { error -> android.util.Log.w("DhdPreview", "Surface lifecycle failed", error) },
+        )
+    }
+
+    private fun buildPhoneAccessController(context: Context): PhoneAccessController {
+        val appContext = context.applicationContext
+        val preferences = appContext.getSharedPreferences(PhoneAccessController.PREFERENCES_NAME, Context.MODE_PRIVATE)
+        return PhoneAccessController(
+            context = appContext,
+            preferences = preferences,
+            mdns = DhdAdbMdns(appContext),
+            maintenanceBootstrap = DhdMaintenanceBootstrap(appContext, preferences),
+            keyFactory = { DhdAdbKey.from(appContext) },
         )
     }
 
@@ -155,7 +193,7 @@ class AppContainer(context: Context) {
      */
     fun startFresh() {
         sessionCoordinator.reset()
-        conversationStore.deleteConversation(DHD_CONVERSATION_ID)
+        conversationRepository.deleteConversation(DHD_CONVERSATION_ID)
         previewScope.launch {
             taskDisplayBackend.closeAllTaskDisplays(clearRecords = true)
         }
