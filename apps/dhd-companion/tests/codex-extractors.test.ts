@@ -4,21 +4,22 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { parsePollInterval } from "../src/assistant-companion.js";
+import { extractDynamicToolFailure, normalizeDynamicArguments } from "../src/codex/dynamic-tools.js";
 import {
-  disabledConfiguredMcpOverrides,
-  emptyToolAnswers,
   extractCompanionPlanUpdatedEvent,
-  extractDynamicToolFailure,
   extractText,
   extractThreadId,
   extractTurnError,
   extractTurnId,
-  normalizeCodexEffort,
-  normalizeDynamicArguments,
-  parsePollInterval,
+} from "../src/codex/extract.js";
+import {
+  disabledConfiguredMcpOverrides,
   quoteWindowsCommand,
   resolveCodexBin,
-} from "../src/assistant-companion.js";
+} from "../src/codex/process.js";
+import { emptyToolAnswers } from "../src/codex/server-requests.js";
+import { normalizeCodexEffort } from "../src/codex/settings.js";
 
 afterEach(() => {
   vi.unstubAllEnvs();
